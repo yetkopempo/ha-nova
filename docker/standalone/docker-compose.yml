@@ -1,0 +1,21 @@
+version: "3.8"
+services:
+  ha-nova-relay:
+    image: ha-nova-relay:standalone
+    # Alternatively build locally from the repo root with:
+    #   docker build -t ha-nova-relay:standalone -f docker/standalone/Dockerfile .
+    # Then run: docker compose -f docker/standalone/docker-compose.yml up -d
+    container_name: ha-nova-relay
+    restart: unless-stopped
+    ports:
+      - "8791:8791"
+    environment:
+      # REQUIRED: shared secret your clients use as Bearer token
+      RELAY_AUTH_TOKEN: "change-me-relay-secret"
+      # REQUIRED: Home Assistant Long-Lived Access Token
+      HA_LLAT: "paste-your-ha-long-lived-token"
+      # Optional: defaults to http://homeassistant:8123
+      HA_URL: "http://192.168.1.100:8123"
+      # Optional: defaults to 8791
+      RELAY_PORT: "8791"
+      LOG_LEVEL: "info"
