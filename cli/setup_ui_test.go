@@ -144,6 +144,41 @@ func TestPromptReadersCanBeReusedAcrossSequentialSetupQuestions(t *testing.T) {
 	}
 }
 
+func TestPromptSetupRelayModeDefaultsToAddon(t *testing.T) {
+	reader := bufio.NewReader(strings.NewReader("\n"))
+	output := &bytes.Buffer{}
+
+	got, err := promptSetupRelayModeFromReader(reader, output, "")
+	if err != nil {
+		t.Fatalf("promptSetupRelayModeFromReader() error: %v", err)
+	}
+	if got != relayModeAddon {
+		t.Fatalf("promptSetupRelayModeFromReader() = %q, want %q", got, relayModeAddon)
+	}
+	for _, want := range []string{
+		"How do you want to run NOVA Relay?",
+		"Install in Home Assistant (Supervisor add-on)",
+		"Use an existing standalone relay",
+	} {
+		if !strings.Contains(output.String(), want) {
+			t.Fatalf("relay-mode prompt missing %q:\n%s", want, output.String())
+		}
+	}
+}
+
+func TestPromptStandaloneRelayBaseURLNormalizesHostInput(t *testing.T) {
+	reader := bufio.NewReader(strings.NewReader("nas-box:8791\n"))
+	output := &bytes.Buffer{}
+
+	got, err := promptStandaloneRelayBaseURLFromReader(reader, output, "http://homeassistant.local:8791")
+	if err != nil {
+		t.Fatalf("promptStandaloneRelayBaseURLFromReader() error: %v", err)
+	}
+	if got != "http://nas-box:8791" {
+		t.Fatalf("promptStandaloneRelayBaseURLFromReader() = %q, want %q", got, "http://nas-box:8791")
+	}
+}
+
 func TestPromptLineFromReaderIndentsPromptLabel(t *testing.T) {
 	reader := bufio.NewReader(strings.NewReader("\n"))
 	output := &bytes.Buffer{}
@@ -458,6 +493,22 @@ func TestRenderSetupIncompleteBannerUsesIssueSpecificText(t *testing.T) {
 	} {
 		if !strings.Contains(rendered, want) {
 			t.Fatalf("incomplete banner missing %q:\n%s", want, rendered)
+		}
+	}
+}
+
+func TestRenderSetupIncompleteBannerStandaloneUsesContainerCopy(t *testing.T) {
+	output := &bytes.Buffer{}
+
+	renderSetupIncompleteBanner(output, setupIssueWSDegraded, runtimeConfig{RelayMode: relayModeStandalone})
+
+	rendered := output.String()
+	for _, want := range []string{
+		"Setup incomplete",
+		"relay container",
+	} {
+		if !strings.Contains(rendered, want) {
+			t.Fatalf("standalone incomplete banner missing %q:\n%s", want, rendered)
 		}
 	}
 }

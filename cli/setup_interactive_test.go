@@ -35,10 +35,10 @@ func setupStepIndex(output string, step int) int {
 
 func TestInteractiveSetupFreshInstallShowsWizardAndInstallsGeminiSkills(t *testing.T) {
 	home := t.TempDir()
-	t.Setenv("HOME", home)
+	setTestHomeEnv(t, home)
 	t.Setenv("HA_NOVA_NO_BROWSER", "1")
 	t.Setenv("HA_NOVA_ALLOW_INSECURE_TEST_KEYRING", "1")
-	t.Setenv("HA_NOVA_TEST_KEYRING_FILE", filepath.Join(home, ".config", "ha-nova", ".test-relay-auth-token"))
+	t.Setenv("HA_NOVA_TEST_KEYRING_FILE", setupTestKeyringPath(home))
 	t.Setenv("HA_NOVA_DEV_ROOT", repoRootForSetupTest(t))
 
 	haServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
@@ -133,15 +133,15 @@ func TestInteractiveSetupFreshInstallShowsWizardAndInstallsGeminiSkills(t *testi
 	}
 
 	if _, err := os.Stat(filepath.Join(home, ".gemini", "skills", "ha-nova", "SKILL.md")); err != nil {
-		t.Fatalf("expected gemini main skill to exist: %v", err)
+		t.Fatalf("expected gemini main skill to exist: %v\nstdout:\n%s\nstderr:\n%s", err, stdout, stderr)
 	}
 	if _, err := os.Stat(filepath.Join(home, ".gemini", "skills", "ha-nova-review", "SKILL.md")); err != nil {
-		t.Fatalf("expected gemini review skill to exist: %v", err)
+		t.Fatalf("expected gemini review skill to exist: %v\nstdout:\n%s\nstderr:\n%s", err, stdout, stderr)
 	}
-	if _, err := os.Stat(filepath.Join(home, ".config", "ha-nova", "config.json")); err != nil {
+	if _, err := os.Stat(paths.ConfigFile); err != nil {
 		t.Fatalf("expected config.json to exist: %v", err)
 	}
-	if _, err := os.Stat(filepath.Join(home, ".config", "ha-nova", ".test-relay-auth-token")); err != nil {
+	if _, err := os.Stat(setupTestKeyringPath(home)); err != nil {
 		t.Fatalf("expected test keyring file to exist: %v", err)
 	}
 
@@ -160,12 +160,92 @@ func TestInteractiveSetupFreshInstallShowsWizardAndInstallsGeminiSkills(t *testi
 	}
 }
 
-func TestInteractiveSetupFreshInstallCanPasteExistingRelayToken(t *testing.T) {
+func TestInteractiveSetupFreshInstallSupportsStandaloneRelayMode(t *testing.T) {
 	home := t.TempDir()
-	t.Setenv("HOME", home)
+	setTestHomeEnv(t, home)
 	t.Setenv("HA_NOVA_NO_BROWSER", "1")
 	t.Setenv("HA_NOVA_ALLOW_INSECURE_TEST_KEYRING", "1")
-	t.Setenv("HA_NOVA_TEST_KEYRING_FILE", filepath.Join(home, ".config", "ha-nova", ".test-relay-auth-token"))
+	t.Setenv("HA_NOVA_TEST_KEYRING_FILE", setupTestKeyringPath(home))
+	t.Setenv("HA_NOVA_DEV_ROOT", repoRootForSetupTest(t))
+
+	haServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte("ok"))
+	}))
+	defer haServer.Close()
+
+	relayServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/health" {
+			http.NotFound(w, r)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"status":"ok","data":{"ha_ws_connected":true}}`))
+	}))
+	defer relayServer.Close()
+
+	paths, err := detectPaths()
+	if err != nil {
+		t.Fatalf("detectPaths() error: %v", err)
+	}
+
+	input := joinSetupInputs(
+		[]string{"4", haServer.URL},
+		setupWizardStandaloneRelayPrompts(relayServer.URL),
+		setupWizardGenerateRelayTokenPrompts(),
+		setupWizardStandaloneLLATPrompts(),
+	)
+
+	exitCode := 0
+	stdout, stderr := captureInteractiveSetupIO(t, input, func() int {
+		exitCode = interactiveSetup(paths, runtimeConfig{}, loadStateOrDefault(paths), "", "", "", "", "")
+		return exitCode
+	})
+	if exitCode != 0 {
+		t.Fatalf("interactiveSetup() exit = %d, want 0\nstdout:\n%s\nstderr:\n%s", exitCode, stdout, stderr)
+	}
+
+	output := stdout + stderr
+	for _, want := range []string{
+		"Use an existing standalone relay",
+		"Relay base URL (for example http://nas-box:8791)",
+		"Standalone relay checklist:",
+		"Save this token in your standalone relay config:",
+		"Finish the standalone relay configuration:",
+		"Press Enter when the relay container is running",
+		"Setup complete!",
+	} {
+		if !strings.Contains(output, want) {
+			t.Fatalf("standalone wizard output missing %q:\n%s", want, output)
+		}
+	}
+	for _, unwanted := range []string{
+		"Once the repository is added:",
+		"Press Enter to open the relay settings",
+	} {
+		if strings.Contains(output, unwanted) {
+			t.Fatalf("did not expect add-on-specific text %q in standalone flow:\n%s", unwanted, output)
+		}
+	}
+
+	saved, err := loadRuntimeConfig(paths)
+	if err != nil {
+		t.Fatalf("loadRuntimeConfig() error: %v\nstdout:\n%s\nstderr:\n%s", err, stdout, stderr)
+	}
+	if saved.RelayBaseURL != relayServer.URL {
+		t.Fatalf("saved.RelayBaseURL = %q, want %q", saved.RelayBaseURL, relayServer.URL)
+	}
+	if saved.RelayMode != relayModeStandalone {
+		t.Fatalf("saved.RelayMode = %q, want %q", saved.RelayMode, relayModeStandalone)
+	}
+}
+
+func TestInteractiveSetupFreshInstallCanPasteExistingRelayToken(t *testing.T) {
+	home := t.TempDir()
+	setTestHomeEnv(t, home)
+	t.Setenv("HA_NOVA_NO_BROWSER", "1")
+	t.Setenv("HA_NOVA_ALLOW_INSECURE_TEST_KEYRING", "1")
+	t.Setenv("HA_NOVA_TEST_KEYRING_FILE", setupTestKeyringPath(home))
 	t.Setenv("HA_NOVA_DEV_ROOT", repoRootForSetupTest(t))
 
 	haServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
@@ -225,10 +305,10 @@ func TestInteractiveSetupFreshInstallCanPasteExistingRelayToken(t *testing.T) {
 
 func TestInteractiveSetupFreshInstallPastedTokenSkipsLLATWalkthroughWhenVerifySucceeds(t *testing.T) {
 	home := t.TempDir()
-	t.Setenv("HOME", home)
+	setTestHomeEnv(t, home)
 	t.Setenv("HA_NOVA_NO_BROWSER", "1")
 	t.Setenv("HA_NOVA_ALLOW_INSECURE_TEST_KEYRING", "1")
-	t.Setenv("HA_NOVA_TEST_KEYRING_FILE", filepath.Join(home, ".config", "ha-nova", ".test-relay-auth-token"))
+	t.Setenv("HA_NOVA_TEST_KEYRING_FILE", setupTestKeyringPath(home))
 	t.Setenv("HA_NOVA_DEV_ROOT", repoRootForSetupTest(t))
 
 	haServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
@@ -295,10 +375,10 @@ func TestInteractiveSetupFreshInstallPastedTokenSkipsLLATWalkthroughWhenVerifySu
 
 func TestInteractiveSetupWithHostAndRelayTokenFlagsSkipsLLATWalkthrough(t *testing.T) {
 	home := t.TempDir()
-	t.Setenv("HOME", home)
+	setTestHomeEnv(t, home)
 	t.Setenv("HA_NOVA_NO_BROWSER", "1")
 	t.Setenv("HA_NOVA_ALLOW_INSECURE_TEST_KEYRING", "1")
-	t.Setenv("HA_NOVA_TEST_KEYRING_FILE", filepath.Join(home, ".config", "ha-nova", ".test-relay-auth-token"))
+	t.Setenv("HA_NOVA_TEST_KEYRING_FILE", setupTestKeyringPath(home))
 	t.Setenv("HA_NOVA_DEV_ROOT", repoRootForSetupTest(t))
 
 	haServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
@@ -344,10 +424,10 @@ func TestInteractiveSetupWithHostAndRelayTokenFlagsSkipsLLATWalkthrough(t *testi
 
 func TestInteractiveSetupBackFromVerifyDoesNotPersistConfig(t *testing.T) {
 	home := t.TempDir()
-	t.Setenv("HOME", home)
+	setTestHomeEnv(t, home)
 	t.Setenv("HA_NOVA_NO_BROWSER", "1")
 	t.Setenv("HA_NOVA_ALLOW_INSECURE_TEST_KEYRING", "1")
-	t.Setenv("HA_NOVA_TEST_KEYRING_FILE", filepath.Join(home, ".config", "ha-nova", ".test-relay-auth-token"))
+	t.Setenv("HA_NOVA_TEST_KEYRING_FILE", setupTestKeyringPath(home))
 	t.Setenv("HA_NOVA_DEV_ROOT", repoRootForSetupTest(t))
 
 	haServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
@@ -397,10 +477,10 @@ func TestInteractiveSetupBackFromVerifyDoesNotPersistConfig(t *testing.T) {
 
 func TestInteractiveSetupBackFromRelayInstallLetsUserChangeHost(t *testing.T) {
 	home := t.TempDir()
-	t.Setenv("HOME", home)
+	setTestHomeEnv(t, home)
 	t.Setenv("HA_NOVA_NO_BROWSER", "1")
 	t.Setenv("HA_NOVA_ALLOW_INSECURE_TEST_KEYRING", "1")
-	t.Setenv("HA_NOVA_TEST_KEYRING_FILE", filepath.Join(home, ".config", "ha-nova", ".test-relay-auth-token"))
+	t.Setenv("HA_NOVA_TEST_KEYRING_FILE", setupTestKeyringPath(home))
 	t.Setenv("HA_NOVA_DEV_ROOT", repoRootForSetupTest(t))
 
 	firstHAServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
@@ -493,10 +573,10 @@ func TestApplySetupFlagOverridesFailsWhenHostCannotBeResolved(t *testing.T) {
 
 func TestInteractiveSetupRelayTokenFlagCanBackToHostAfterVerifyFailure(t *testing.T) {
 	home := t.TempDir()
-	t.Setenv("HOME", home)
+	setTestHomeEnv(t, home)
 	t.Setenv("HA_NOVA_NO_BROWSER", "1")
 	t.Setenv("HA_NOVA_ALLOW_INSECURE_TEST_KEYRING", "1")
-	t.Setenv("HA_NOVA_TEST_KEYRING_FILE", filepath.Join(home, ".config", "ha-nova", ".test-relay-auth-token"))
+	t.Setenv("HA_NOVA_TEST_KEYRING_FILE", setupTestKeyringPath(home))
 	t.Setenv("HA_NOVA_DEV_ROOT", repoRootForSetupTest(t))
 
 	firstHAServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
@@ -567,10 +647,10 @@ func TestInteractiveSetupRelayTokenFlagCanBackToHostAfterVerifyFailure(t *testin
 
 func TestInteractiveSetupExitAtTokenChoiceCancelsCleanly(t *testing.T) {
 	home := t.TempDir()
-	t.Setenv("HOME", home)
+	setTestHomeEnv(t, home)
 	t.Setenv("HA_NOVA_NO_BROWSER", "1")
 	t.Setenv("HA_NOVA_ALLOW_INSECURE_TEST_KEYRING", "1")
-	t.Setenv("HA_NOVA_TEST_KEYRING_FILE", filepath.Join(home, ".config", "ha-nova", ".test-relay-auth-token"))
+	t.Setenv("HA_NOVA_TEST_KEYRING_FILE", setupTestKeyringPath(home))
 
 	haServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		w.WriteHeader(http.StatusOK)
@@ -620,10 +700,10 @@ func TestInteractiveSetupExitAtTokenChoiceCancelsCleanly(t *testing.T) {
 
 func TestInteractiveSetupInitialClientPageAllowsRepeatedBack(t *testing.T) {
 	home := t.TempDir()
-	t.Setenv("HOME", home)
+	setTestHomeEnv(t, home)
 	t.Setenv("HA_NOVA_NO_BROWSER", "1")
 	t.Setenv("HA_NOVA_ALLOW_INSECURE_TEST_KEYRING", "1")
-	t.Setenv("HA_NOVA_TEST_KEYRING_FILE", filepath.Join(home, ".config", "ha-nova", ".test-relay-auth-token"))
+	t.Setenv("HA_NOVA_TEST_KEYRING_FILE", setupTestKeyringPath(home))
 
 	haServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		w.WriteHeader(http.StatusOK)
@@ -665,10 +745,10 @@ func TestInteractiveSetupInitialClientPageAllowsRepeatedBack(t *testing.T) {
 
 func TestInteractiveSetupAlreadyDoneUsesResumeBanner(t *testing.T) {
 	home := t.TempDir()
-	t.Setenv("HOME", home)
+	setTestHomeEnv(t, home)
 	t.Setenv("HA_NOVA_NO_BROWSER", "1")
 	t.Setenv("HA_NOVA_ALLOW_INSECURE_TEST_KEYRING", "1")
-	t.Setenv("HA_NOVA_TEST_KEYRING_FILE", filepath.Join(home, ".config", "ha-nova", ".test-relay-auth-token"))
+	t.Setenv("HA_NOVA_TEST_KEYRING_FILE", setupTestKeyringPath(home))
 
 	relayServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path != "/health" {
@@ -722,10 +802,10 @@ func TestInteractiveSetupAlreadyDoneUsesResumeBanner(t *testing.T) {
 
 func TestInteractiveSetupPartialResumeSkipsTokenChoiceAndVerifiesFirstWhenWSIsPending(t *testing.T) {
 	home := t.TempDir()
-	t.Setenv("HOME", home)
+	setTestHomeEnv(t, home)
 	t.Setenv("HA_NOVA_NO_BROWSER", "1")
 	t.Setenv("HA_NOVA_ALLOW_INSECURE_TEST_KEYRING", "1")
-	t.Setenv("HA_NOVA_TEST_KEYRING_FILE", filepath.Join(home, ".config", "ha-nova", ".test-relay-auth-token"))
+	t.Setenv("HA_NOVA_TEST_KEYRING_FILE", setupTestKeyringPath(home))
 
 	relayServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path != "/health" {
@@ -783,10 +863,10 @@ func TestInteractiveSetupPartialResumeSkipsTokenChoiceAndVerifiesFirstWhenWSIsPe
 
 func TestInteractiveSetupPartialResumeTTYShowsContinuePromptBeforeClearing(t *testing.T) {
 	home := t.TempDir()
-	t.Setenv("HOME", home)
+	setTestHomeEnv(t, home)
 	t.Setenv("HA_NOVA_NO_BROWSER", "1")
 	t.Setenv("HA_NOVA_ALLOW_INSECURE_TEST_KEYRING", "1")
-	t.Setenv("HA_NOVA_TEST_KEYRING_FILE", filepath.Join(home, ".config", "ha-nova", ".test-relay-auth-token"))
+	t.Setenv("HA_NOVA_TEST_KEYRING_FILE", setupTestKeyringPath(home))
 
 	originalTTY := writerSupportsTTYForSetup
 	originalInput := uiInputSupportsTTY
@@ -844,10 +924,10 @@ func TestInteractiveSetupPartialResumeTTYShowsContinuePromptBeforeClearing(t *te
 
 func TestInteractiveSetupRelayTokenFlagPersistsBeforeVerify(t *testing.T) {
 	home := t.TempDir()
-	t.Setenv("HOME", home)
+	setTestHomeEnv(t, home)
 	t.Setenv("HA_NOVA_NO_BROWSER", "1")
 	t.Setenv("HA_NOVA_ALLOW_INSECURE_TEST_KEYRING", "1")
-	t.Setenv("HA_NOVA_TEST_KEYRING_FILE", filepath.Join(home, ".config", "ha-nova", ".test-relay-auth-token"))
+	t.Setenv("HA_NOVA_TEST_KEYRING_FILE", setupTestKeyringPath(home))
 
 	relayServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path != "/health" {
@@ -890,10 +970,10 @@ func TestInteractiveSetupRelayTokenFlagPersistsBeforeVerify(t *testing.T) {
 
 func TestInteractiveSetupCompletedResumeRejectsBrokenHostOverride(t *testing.T) {
 	home := t.TempDir()
-	t.Setenv("HOME", home)
+	setTestHomeEnv(t, home)
 	t.Setenv("HA_NOVA_NO_BROWSER", "1")
 	t.Setenv("HA_NOVA_ALLOW_INSECURE_TEST_KEYRING", "1")
-	t.Setenv("HA_NOVA_TEST_KEYRING_FILE", filepath.Join(home, ".config", "ha-nova", ".test-relay-auth-token"))
+	t.Setenv("HA_NOVA_TEST_KEYRING_FILE", setupTestKeyringPath(home))
 
 	originalResolve := resolveHAURLBaseForSetup
 	originalFlagResolve := resolveHAURLBaseForFlags
@@ -973,10 +1053,10 @@ func TestInteractiveSetupWSDegradedEndsIncomplete(t *testing.T) {
 	withClientAttachmentPresence(t, map[string]bool{"claude": true})
 
 	home := t.TempDir()
-	t.Setenv("HOME", home)
+	setTestHomeEnv(t, home)
 	t.Setenv("HA_NOVA_NO_BROWSER", "1")
 	t.Setenv("HA_NOVA_ALLOW_INSECURE_TEST_KEYRING", "1")
-	t.Setenv("HA_NOVA_TEST_KEYRING_FILE", filepath.Join(home, ".config", "ha-nova", ".test-relay-auth-token"))
+	t.Setenv("HA_NOVA_TEST_KEYRING_FILE", setupTestKeyringPath(home))
 
 	originalProbeHTTP := probeHTTPForSetup
 	defer func() {
@@ -1044,10 +1124,10 @@ func TestInteractiveSetupWSDegradedMentionsLLATCause(t *testing.T) {
 	withClientAttachmentPresence(t, map[string]bool{"claude": true})
 
 	home := t.TempDir()
-	t.Setenv("HOME", home)
+	setTestHomeEnv(t, home)
 	t.Setenv("HA_NOVA_NO_BROWSER", "1")
 	t.Setenv("HA_NOVA_ALLOW_INSECURE_TEST_KEYRING", "1")
-	t.Setenv("HA_NOVA_TEST_KEYRING_FILE", filepath.Join(home, ".config", "ha-nova", ".test-relay-auth-token"))
+	t.Setenv("HA_NOVA_TEST_KEYRING_FILE", setupTestKeyringPath(home))
 
 	originalProbeHTTP := probeHTTPForSetup
 	defer func() {
@@ -1123,10 +1203,10 @@ func TestInteractiveSetupWSDegradedUsesWSPingSuccessAsReady(t *testing.T) {
 	withClientAttachmentPresence(t, map[string]bool{"claude": true})
 
 	home := t.TempDir()
-	t.Setenv("HOME", home)
+	setTestHomeEnv(t, home)
 	t.Setenv("HA_NOVA_NO_BROWSER", "1")
 	t.Setenv("HA_NOVA_ALLOW_INSECURE_TEST_KEYRING", "1")
-	t.Setenv("HA_NOVA_TEST_KEYRING_FILE", filepath.Join(home, ".config", "ha-nova", ".test-relay-auth-token"))
+	t.Setenv("HA_NOVA_TEST_KEYRING_FILE", setupTestKeyringPath(home))
 
 	originalProbeHTTP := probeHTTPForSetup
 	defer func() {
@@ -1233,10 +1313,10 @@ func TestInteractiveSetupCompletedResumePersistsExplicitEndpointOverrides(t *tes
 	withClientAttachmentPresence(t, map[string]bool{"claude": true})
 
 	home := t.TempDir()
-	t.Setenv("HOME", home)
+	setTestHomeEnv(t, home)
 	t.Setenv("HA_NOVA_NO_BROWSER", "1")
 	t.Setenv("HA_NOVA_ALLOW_INSECURE_TEST_KEYRING", "1")
-	t.Setenv("HA_NOVA_TEST_KEYRING_FILE", filepath.Join(home, ".config", "ha-nova", ".test-relay-auth-token"))
+	t.Setenv("HA_NOVA_TEST_KEYRING_FILE", setupTestKeyringPath(home))
 
 	haServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		w.WriteHeader(http.StatusOK)
@@ -1298,10 +1378,10 @@ func TestInteractiveSetupCompletedResumePersistsExplicitEndpointOverrides(t *tes
 
 func TestInteractiveSetupCompletedResumeUsesOverrideHealthInsteadOfOldHealthyState(t *testing.T) {
 	home := t.TempDir()
-	t.Setenv("HOME", home)
+	setTestHomeEnv(t, home)
 	t.Setenv("HA_NOVA_NO_BROWSER", "1")
 	t.Setenv("HA_NOVA_ALLOW_INSECURE_TEST_KEYRING", "1")
-	t.Setenv("HA_NOVA_TEST_KEYRING_FILE", filepath.Join(home, ".config", "ha-nova", ".test-relay-auth-token"))
+	t.Setenv("HA_NOVA_TEST_KEYRING_FILE", setupTestKeyringPath(home))
 
 	healthyRelay := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path != "/health" {
@@ -1404,10 +1484,10 @@ func TestPromptValidHAHostContinueAnywayPreservesExplicitURL(t *testing.T) {
 
 func TestInteractiveSetupContinueAnywayPersistsExplicitURL(t *testing.T) {
 	home := t.TempDir()
-	t.Setenv("HOME", home)
+	setTestHomeEnv(t, home)
 	t.Setenv("HA_NOVA_NO_BROWSER", "1")
 	t.Setenv("HA_NOVA_ALLOW_INSECURE_TEST_KEYRING", "1")
-	t.Setenv("HA_NOVA_TEST_KEYRING_FILE", filepath.Join(home, ".config", "ha-nova", ".test-relay-auth-token"))
+	t.Setenv("HA_NOVA_TEST_KEYRING_FILE", setupTestKeyringPath(home))
 	t.Setenv("HA_NOVA_DEV_ROOT", repoRootForSetupTest(t))
 
 	originalResolve := resolveHAURLBaseForSetup
@@ -1584,10 +1664,10 @@ func TestPromptValidHAHostIgnoresMultipleStaleBlanksAfterDiscoveryProgress(t *te
 
 func TestInteractiveSetupCompletedResumePersistsHostOnlyOverride(t *testing.T) {
 	home := t.TempDir()
-	t.Setenv("HOME", home)
+	setTestHomeEnv(t, home)
 	t.Setenv("HA_NOVA_NO_BROWSER", "1")
 	t.Setenv("HA_NOVA_ALLOW_INSECURE_TEST_KEYRING", "1")
-	t.Setenv("HA_NOVA_TEST_KEYRING_FILE", filepath.Join(home, ".config", "ha-nova", ".test-relay-auth-token"))
+	t.Setenv("HA_NOVA_TEST_KEYRING_FILE", setupTestKeyringPath(home))
 
 	originalResolve := resolveHAURLBaseForSetup
 	originalFlagResolve := resolveHAURLBaseForFlags

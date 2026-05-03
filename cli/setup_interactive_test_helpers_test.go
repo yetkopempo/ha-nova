@@ -14,12 +14,27 @@ func setupWizardRelayInstallPrompts() []string {
 	return []string{
 		"",
 		"",
+		"",
+	}
+}
+
+func setupWizardStandaloneRelayPrompts(relayURL string) []string {
+	return []string{
+		"2",
+		relayURL,
 	}
 }
 
 func setupWizardLLATPrompts() []string {
 	return []string{
 		"",
+		"",
+		"",
+	}
+}
+
+func setupWizardStandaloneLLATPrompts() []string {
+	return []string{
 		"",
 		"",
 	}

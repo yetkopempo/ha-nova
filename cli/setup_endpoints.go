@@ -171,7 +171,24 @@ func applySelectedSetupHost(cfg runtimeConfig, host, haURL, relayURLOverride str
 	return cfg
 }
 
-func applySetupFlagOverrides(cfg runtimeConfig, hostFlag, haURLFlag, relayURLFlag string) (runtimeConfig, error) {
+func applySetupFlagOverrides(cfg runtimeConfig, hostFlag, haURLFlag, relayURLFlag string, relayModeArgs ...string) (runtimeConfig, error) {
+	relayModeFlag := ""
+	if len(relayModeArgs) > 0 {
+		relayModeFlag = relayModeArgs[0]
+	}
+	var err error
+	cfg, err = applySetupRelayMode(cfg, relayModeFlag)
+	if err != nil {
+		return cfg, err
+	}
+	normalizedRelayURL := strings.TrimSpace(relayURLFlag)
+	if normalizedRelayURL != "" {
+		normalizedRelayURL, err = resolveRelayBaseURLInput(normalizedRelayURL)
+		if err != nil {
+			return cfg, err
+		}
+	}
+
 	switch {
 	case strings.TrimSpace(hostFlag) != "":
 		resolvedHAURL := strings.TrimSpace(haURLFlag)
@@ -182,11 +199,11 @@ func applySetupFlagOverrides(cfg runtimeConfig, hostFlag, haURLFlag, relayURLFla
 			}
 			resolvedHAURL = resolved
 		}
-		return applySelectedSetupHost(cfg, hostFlag, resolvedHAURL, relayURLFlag), nil
+		return applySelectedSetupHost(cfg, hostFlag, resolvedHAURL, normalizedRelayURL), nil
 	case strings.TrimSpace(haURLFlag) != "":
-		return applySelectedSetupHost(cfg, haURLFlag, haURLFlag, relayURLFlag), nil
-	case strings.TrimSpace(relayURLFlag) != "":
-		cfg.RelayBaseURL = strings.TrimSpace(relayURLFlag)
+		return applySelectedSetupHost(cfg, haURLFlag, haURLFlag, normalizedRelayURL), nil
+	case normalizedRelayURL != "":
+		cfg.RelayBaseURL = normalizedRelayURL
 		return cfg, nil
 	default:
 		return cfg, nil

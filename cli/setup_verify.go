@@ -59,7 +59,11 @@ func verifySetupConnectionOnce(out io.Writer, cfg runtimeConfig, token string) (
 	readiness := checkRelayReadinessWithProbes(cfg.RelayBaseURL, token, fetchRelayHealthForSetup, probeRelayWSPingForSetup)
 	if readiness.HealthErr != nil {
 		renderSetupErrorLine(out, "Relay health failed: %s", readiness.HealthErr)
-		fmt.Fprintln(out, "  Check NOVA Relay app status and the saved relay token in Home Assistant.")
+		if setupUsesStandaloneRelay(cfg) {
+			fmt.Fprintln(out, "  Check that the standalone relay container is running, reachable, and using the expected environment variables.")
+		} else {
+			fmt.Fprintln(out, "  Check NOVA Relay app status and the saved relay token in Home Assistant.")
+		}
 		return readiness, setupIssueRelayUnreachable, false
 	}
 
@@ -78,17 +82,33 @@ func verifySetupConnectionOnce(out io.Writer, cfg runtimeConfig, token string) (
 		switch {
 		case readiness.LLATIssue:
 			fmt.Fprintln(out, `  The Home Assistant Access Token in NOVA Relay still needs to be checked.`)
-			fmt.Fprintln(out, `  Set the "Home Assistant Access Token" field ("ha_llat") to a valid Long-Lived Access Token, save, and restart the App.`)
+			if setupUsesStandaloneRelay(cfg) {
+				fmt.Fprintln(out, `  Set the "HA_LLAT" environment variable to a valid Long-Lived Access Token, save, and restart the relay container.`)
+			} else {
+				fmt.Fprintln(out, `  Set the "Home Assistant Access Token" field ("ha_llat") to a valid Long-Lived Access Token, save, and restart the App.`)
+			}
 		case readiness.RelayAuthIssue:
 			fmt.Fprintln(out, `  The Relay Auth Token in NOVA Relay still needs to be checked.`)
-			fmt.Fprintln(out, `  Verify the "Relay Auth Token" field ("relay_auth_token"), save, and restart the App.`)
+			if setupUsesStandaloneRelay(cfg) {
+				fmt.Fprintln(out, `  Verify the "RELAY_AUTH_TOKEN" environment variable, save, and restart the relay container.`)
+			} else {
+				fmt.Fprintln(out, `  Verify the "Relay Auth Token" field ("relay_auth_token"), save, and restart the App.`)
+			}
 		default:
 			fmt.Fprintln(out, "  NOVA Relay is running, but it still can't finish the Home Assistant connection.")
-			fmt.Fprintln(out, "  Verify the app settings and restart the App if needed.")
+			if setupUsesStandaloneRelay(cfg) {
+				fmt.Fprintln(out, "  Verify the standalone relay environment and restart the relay container if needed.")
+			} else {
+				fmt.Fprintln(out, "  Verify the app settings and restart the App if needed.")
+			}
 		}
 	} else {
 		fmt.Fprintln(out, "  NOVA Relay is reachable, but the Home Assistant WebSocket probe failed before it could prove the exact cause.")
-		fmt.Fprintln(out, "  Verify the app settings and restart the App if needed.")
+		if setupUsesStandaloneRelay(cfg) {
+			fmt.Fprintln(out, "  Verify the standalone relay environment and restart the relay container if needed.")
+		} else {
+			fmt.Fprintln(out, "  Verify the app settings and restart the App if needed.")
+		}
 	}
 	return readiness, setupIssueWSDegraded, false
 }

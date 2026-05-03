@@ -36,6 +36,17 @@ func runSetupLLATWalkthrough(reader *bufio.Reader, out io.Writer, cfg runtimeCon
 		printHumanWarn("Browser launch skipped; open this URL manually if needed: %s/profile/security", cfg.HAURL)
 	}
 
+	if setupUsesStandaloneRelay(cfg) {
+		renderSetupParagraph(out, "Got it? Now update the standalone relay config with that Home Assistant token.")
+		renderSetupIndentedBlock(out, "Finish the standalone relay configuration:", "    ",
+			`5. Set the "HA_LLAT" value to the Home Assistant token you just created`,
+			"6. Save the container config",
+			"7. Restart the relay container",
+		)
+		_, err := promptWizardLineFromReader(reader, out, "Press Enter when the relay container is running", "")
+		return err
+	}
+
 	renderSetupParagraph(out, "Got it? Now I'll open the NOVA Relay settings so you can paste it.")
 	if _, err := promptWizardLineFromReader(reader, out, "Press Enter to open the relay settings", ""); err != nil {
 		return err

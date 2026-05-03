@@ -25,3 +25,6 @@ docs/internal/
 # Python cache artifacts from local validation harnesses
 __pycache__/
 *.py[cod]
+
+# Local Go test cache
+.gocache/

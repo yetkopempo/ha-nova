@@ -11,6 +11,7 @@ type runtimeConfig struct {
 	HAHost        string `json:"ha_host"`
 	HAURL         string `json:"ha_url"`
 	RelayBaseURL  string `json:"relay_base_url"`
+	RelayMode     string `json:"relay_mode,omitempty"`
 }
 
 type config = runtimeConfig

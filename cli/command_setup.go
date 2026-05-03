@@ -13,6 +13,7 @@ func runSetup(paths runtimePaths, args []string) int {
 	host := fs.String("host", "", "Home Assistant host")
 	haURL := fs.String("ha-url", "", "Home Assistant base URL")
 	relayURL := fs.String("relay-url", "", "Relay base URL")
+	relayMode := fs.String("relay-mode", "", "Relay deployment mode: addon or standalone")
 	relayToken := fs.String("relay-token", "", "Relay auth token")
 	nonInteractive := fs.Bool("non-interactive", false, "Disable prompts")
 	if err := fs.Parse(normalizeSetupArgs(args)); err != nil {
@@ -33,7 +34,7 @@ func runSetup(paths runtimePaths, args []string) int {
 	}
 
 	if !*nonInteractive {
-		return interactiveSetup(paths, cfg, state, target, *host, *haURL, *relayURL, *relayToken)
+		return interactiveSetup(paths, cfg, state, target, *host, *haURL, *relayURL, *relayToken, *relayMode)
 	}
 
 	if target == "" {
@@ -55,7 +56,7 @@ func runSetup(paths runtimePaths, args []string) int {
 		}
 	}
 
-	cfg, err = applySetupFlagOverrides(cfg, *host, *haURL, *relayURL)
+	cfg, err = applySetupFlagOverrides(cfg, *host, *haURL, *relayURL, *relayMode)
 	if err != nil {
 		printHumanErr("%s", err)
 		return 1
@@ -198,7 +199,7 @@ func runSetup(paths runtimePaths, args []string) int {
 			stateSnapshot,
 			hadStateSnapshot,
 		)
-		renderSetupIncompleteBanner(os.Stdout, issue)
+		renderSetupIncompleteBanner(os.Stdout, issue, cfg)
 		return 1
 	}
 

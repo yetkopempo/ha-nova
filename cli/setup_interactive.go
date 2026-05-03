@@ -91,7 +91,88 @@ func maskSecretHint(value string) string {
 	return "***" + value[len(value)-4:]
 }
 
-func interactiveSetup(paths runtimePaths, cfg runtimeConfig, state installState, target string, hostFlag, haURLFlag, relayURLFlag, relayTokenFlag string) int {
+func runSetupRelayInstallStep(reader *bufio.Reader, out io.Writer, cfg runtimeConfig, relayURLFlag, relayModeFlag string, steps setupWizardSteps) (runtimeConfig, error) {
+	lockedMode := normalizeRelayMode(relayModeFlag)
+	defaultMode := setupRelayMode(cfg)
+
+	for {
+		renderSetupStep(out, steps.RelayInstall, steps.Total, "Set up NOVA Relay")
+		mode := lockedMode
+		if mode == "" {
+			renderSetupParagraph(out,
+				"Choose where NOVA Relay should run for this Home Assistant.",
+				"Use the add-on for Home Assistant OS / Supervised, or the standalone relay for NAS / Docker / Home Assistant Container installs.",
+			)
+			selectedMode, err := promptSetupRelayModeInteractive(reader, out, defaultMode)
+			if err != nil {
+				return cfg, err
+			}
+			mode = selectedMode
+			defaultMode = selectedMode
+		}
+		cfg.RelayMode = mode
+
+		if mode == relayModeStandalone {
+			renderSetupParagraph(out,
+				"NOVA Relay can run outside Home Assistant Supervisor.",
+				"We'll verify the relay URL after you finish the token setup steps.",
+			)
+			relayURL := strings.TrimSpace(relayURLFlag)
+			if relayURL == "" {
+				selectedRelayURL, err := promptStandaloneRelayBaseURLFromReader(reader, out, defaultRelayBaseURLForSetup(cfg))
+				if err == errSetupBack {
+					if lockedMode != "" {
+						return cfg, errSetupBack
+					}
+					continue
+				}
+				if err != nil {
+					return cfg, err
+				}
+				relayURL = selectedRelayURL
+			} else {
+				resolvedRelayURL, err := resolveRelayBaseURLInput(relayURL)
+				if err != nil {
+					return cfg, err
+				}
+				relayURL = resolvedRelayURL
+			}
+			cfg.RelayBaseURL = relayURL
+			renderSetupIndentedBlock(out, "Standalone relay checklist:", "    ",
+				fmt.Sprintf("Relay URL: %s", cfg.RelayBaseURL),
+				`Keep your container config ready for "RELAY_AUTH_TOKEN" and "HA_LLAT"`,
+				fmt.Sprintf(`Make sure "HA_URL" points to %s`, cfg.HAURL),
+				"We'll fill in the token values in the next two steps.",
+			)
+			return cfg, nil
+		}
+
+		renderSetupParagraph(out,
+			"I'll open your browser to add the HA NOVA repository.",
+			`Just click "Open link" when prompted.`,
+		)
+		_, err := promptWizardLineFromReader(reader, out, "Press Enter to open your browser", "")
+		if err != nil {
+			return cfg, err
+		}
+		if err := openBrowserForSetup("https://my.home-assistant.io/redirect/supervisor_add_addon_repository/?repository_url=https%3A%2F%2Fgithub.com%2Fmarkusleben%2Fha-nova"); err != nil {
+			printHumanWarn("Browser launch skipped; open this URL manually if needed: %s", "https://my.home-assistant.io/redirect/supervisor_add_addon_repository/?repository_url=https%3A%2F%2Fgithub.com%2Fmarkusleben%2Fha-nova")
+		}
+		renderSetupIndentedBlock(out, "Once the repository is added:", "    ",
+			"1. Go to Settings > Apps > App Store",
+			`2. Search for "NOVA Relay"`,
+			"3. Click Install and wait for it to finish",
+			"(don't start the app yet — we'll set up the tokens first)",
+		)
+		_, err = promptWizardLineFromReader(reader, out, "Press Enter when the installation is complete", "")
+		if err != nil {
+			return cfg, err
+		}
+		return cfg, nil
+	}
+}
+
+func interactiveSetup(paths runtimePaths, cfg runtimeConfig, state installState, target string, hostFlag, haURLFlag, relayURLFlag, relayTokenFlag string, relayModeArgs ...string) int {
 	const (
 		setupStageClient = iota
 		setupStageSecureStorageRecovery
@@ -102,6 +183,10 @@ func interactiveSetup(paths runtimePaths, cfg runtimeConfig, state installState,
 		setupStageVerify
 		setupStageSkills
 	)
+	relayModeFlag := ""
+	if len(relayModeArgs) > 0 {
+		relayModeFlag = relayModeArgs[0]
+	}
 
 	reader := bufio.NewReader(os.Stdin)
 	renderSetupHeader(os.Stdout)
@@ -174,11 +259,11 @@ func interactiveSetup(paths runtimePaths, cfg runtimeConfig, state installState,
 		existingToken = savedTokenBeforeSetup
 	}
 
-	overrideApplied := strings.TrimSpace(hostFlag) != "" || strings.TrimSpace(haURLFlag) != "" || strings.TrimSpace(relayURLFlag) != ""
+	overrideApplied := strings.TrimSpace(hostFlag) != "" || strings.TrimSpace(haURLFlag) != "" || strings.TrimSpace(relayURLFlag) != "" || strings.TrimSpace(relayModeFlag) != ""
 	skipLLATWalkthrough := strings.TrimSpace(hostFlag) != "" && strings.TrimSpace(relayTokenFlag) != ""
 	if overrideApplied {
 		var err error
-		cfg, err = applySetupFlagOverrides(cfg, hostFlag, haURLFlag, relayURLFlag)
+		cfg, err = applySetupFlagOverrides(cfg, hostFlag, haURLFlag, relayURLFlag, relayModeFlag)
 		if err != nil {
 			printHumanErr("%s", err)
 			return 1
@@ -349,12 +434,7 @@ func interactiveSetup(paths runtimePaths, cfg runtimeConfig, state installState,
 
 		case setupStageRelayInstall:
 			steps := buildSetupWizardSteps(true)
-			renderSetupStep(os.Stdout, steps.RelayInstall, steps.Total, "Install NOVA Relay in Home Assistant")
-			renderSetupParagraph(os.Stdout,
-				"I'll open your browser to add the HA NOVA repository.",
-				`Just click "Open link" when prompted.`,
-			)
-			_, err := promptWizardLineFromReader(reader, os.Stdout, "Press Enter to open your browser", "")
+			updatedCfg, err := runSetupRelayInstallStep(reader, os.Stdout, cfg, relayURLFlag, relayModeFlag, steps)
 			if err == errSetupBack {
 				stage = setupStageHost
 				continue
@@ -367,28 +447,7 @@ func interactiveSetup(paths runtimePaths, cfg runtimeConfig, state installState,
 				printHumanErr("%s", err)
 				return 1
 			}
-			if err := openBrowserForSetup("https://my.home-assistant.io/redirect/supervisor_add_addon_repository/?repository_url=https%3A%2F%2Fgithub.com%2Fmarkusleben%2Fha-nova"); err != nil {
-				printHumanWarn("Browser launch skipped; open this URL manually if needed: %s", "https://my.home-assistant.io/redirect/supervisor_add_addon_repository/?repository_url=https%3A%2F%2Fgithub.com%2Fmarkusleben%2Fha-nova")
-			}
-			renderSetupIndentedBlock(os.Stdout, "Once the repository is added:", "    ",
-				"1. Go to Settings > Apps > App Store",
-				`2. Search for "NOVA Relay"`,
-				"3. Click Install and wait for it to finish",
-				"(don't start the app yet — we'll set up the tokens first)",
-			)
-			_, err = promptWizardLineFromReader(reader, os.Stdout, "Press Enter when the installation is complete", "")
-			if err == errSetupBack {
-				stage = setupStageHost
-				continue
-			}
-			if err == errSetupExit {
-				printHumanInfo("Setup cancelled")
-				return 0
-			}
-			if err != nil {
-				printHumanErr("%s", err)
-				return 1
-			}
+			cfg = updatedCfg
 			stage = setupStageToken
 
 		case setupStageToken:
@@ -479,20 +538,40 @@ func interactiveSetup(paths runtimePaths, cfg runtimeConfig, state installState,
 					if err := copyToClipboardForSetup(token); err == nil {
 						renderSetupSuccessLine(os.Stdout, "Copied to clipboard.")
 					}
-					if err := openBrowserForSetup(cfg.HAURL + "/hassio/addon/2368fcfa_ha_nova_relay/config"); err != nil {
-						printHumanWarn("Browser launch skipped; open this URL manually if needed: %s/hassio/addon/2368fcfa_ha_nova_relay/config", cfg.HAURL)
-					}
-					_, err := promptWizardLineFromReader(reader, os.Stdout, "Press Enter after you saved the Relay Auth Token in NOVA Relay", "")
-					if err == errSetupBack {
-						continue
-					}
-					if err == errSetupExit {
-						printHumanInfo("Setup cancelled")
-						return 0
-					}
-					if err != nil {
-						printHumanErr("%s", err)
-						return 1
+					if setupUsesStandaloneRelay(cfg) {
+						renderSetupIndentedBlock(os.Stdout, "Save this token in your standalone relay config:", "    ",
+							`Set "RELAY_AUTH_TOKEN" to the relay token shown above`,
+							"Save the container config",
+							"Restart the relay container",
+						)
+						_, err := promptWizardLineFromReader(reader, os.Stdout, "Press Enter after you updated the standalone relay config", "")
+						if err == errSetupBack {
+							continue
+						}
+						if err == errSetupExit {
+							printHumanInfo("Setup cancelled")
+							return 0
+						}
+						if err != nil {
+							printHumanErr("%s", err)
+							return 1
+						}
+					} else {
+						if err := openBrowserForSetup(cfg.HAURL + "/hassio/addon/2368fcfa_ha_nova_relay/config"); err != nil {
+							printHumanWarn("Browser launch skipped; open this URL manually if needed: %s/hassio/addon/2368fcfa_ha_nova_relay/config", cfg.HAURL)
+						}
+						_, err := promptWizardLineFromReader(reader, os.Stdout, "Press Enter after you saved the Relay Auth Token in NOVA Relay", "")
+						if err == errSetupBack {
+							continue
+						}
+						if err == errSetupExit {
+							printHumanInfo("Setup cancelled")
+							return 0
+						}
+						if err != nil {
+							printHumanErr("%s", err)
+							return 1
+						}
 					}
 				}
 			}
@@ -562,7 +641,7 @@ func interactiveSetup(paths runtimePaths, cfg runtimeConfig, state installState,
 					printHumanErr("%s", err)
 					return 1
 				}
-				renderSetupIncompleteBanner(os.Stdout, issue)
+				renderSetupIncompleteBanner(os.Stdout, issue, cfg)
 				return 1
 			}
 			if err := persistInteractiveSetupStateWithRecovery(reader, os.Stdout, paths, cfg, &state, savedTokenBeforeSetup, hadSavedTokenBeforeSetup, token, &secureStorageRecovery); err != nil {
@@ -584,7 +663,7 @@ func interactiveSetup(paths runtimePaths, cfg runtimeConfig, state installState,
 				return installClients(paths, &state, selectedClients)
 			}); err != nil {
 				printHumanErr("client installation failed: %s", err)
-				renderSetupIncompleteBanner(os.Stdout, setupIssueSkillsInstall)
+				renderSetupIncompleteBanner(os.Stdout, setupIssueSkillsInstall, cfg)
 				return 1
 			}
 			if err := saveState(paths, state); err != nil {

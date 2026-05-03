@@ -3,15 +3,14 @@ package main
 import (
 	"errors"
 	"os"
-	"path/filepath"
 	"testing"
 )
 
 func TestPersistInteractiveSetupStateRollsBackConfigAndTokenWhenStateSaveFails(t *testing.T) {
 	home := t.TempDir()
-	t.Setenv("HOME", home)
+	setTestHomeEnv(t, home)
 	t.Setenv("HA_NOVA_ALLOW_INSECURE_TEST_KEYRING", "1")
-	t.Setenv("HA_NOVA_TEST_KEYRING_FILE", filepath.Join(home, ".config", "ha-nova", ".test-relay-auth-token"))
+	t.Setenv("HA_NOVA_TEST_KEYRING_FILE", setupTestKeyringPath(home))
 
 	paths, err := detectPaths()
 	if err != nil {
@@ -98,9 +97,9 @@ func TestPersistInteractiveSetupStateRollsBackConfigAndTokenWhenStateSaveFails(t
 
 func TestPersistInteractiveSetupStateRestoresSnapshotWhenConfigSaveFails(t *testing.T) {
 	home := t.TempDir()
-	t.Setenv("HOME", home)
+	setTestHomeEnv(t, home)
 	t.Setenv("HA_NOVA_ALLOW_INSECURE_TEST_KEYRING", "1")
-	t.Setenv("HA_NOVA_TEST_KEYRING_FILE", filepath.Join(home, ".config", "ha-nova", ".test-relay-auth-token"))
+	t.Setenv("HA_NOVA_TEST_KEYRING_FILE", setupTestKeyringPath(home))
 
 	paths, err := detectPaths()
 	if err != nil {

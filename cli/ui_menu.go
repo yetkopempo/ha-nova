@@ -38,7 +38,7 @@ type terminalSetupMenuRunner struct{}
 func promptSetupClientInteractive(reader *bufio.Reader, out io.Writer, choices []setupClientChoice, defaultClient string) (string, error) {
 	spec := setupMenuSpec{
 		Title:        "Which AI client do you use?",
-		Prompt:       "Use ↑/↓ or j/k, Enter to select, Ctrl+C to exit",
+		Prompt:       "Use up/down or j/k, Enter to select, Ctrl+C to exit",
 		DefaultValue: defaultClient,
 	}
 	for _, choice := range choices {
@@ -57,7 +57,7 @@ func promptSetupClientInteractive(reader *bufio.Reader, out io.Writer, choices [
 func promptSetupTokenChoiceInteractive(reader *bufio.Reader, out io.Writer, hasExistingLocal bool) (string, error) {
 	spec := setupMenuSpec{
 		Title:        "Choose how to set up the Relay Auth Token:",
-		Prompt:       "Use ↑/↓ or j/k, Enter to select, Esc to go back, Ctrl+C to exit",
+		Prompt:       "Use up/down or j/k, Enter to select, Esc to go back, Ctrl+C to exit",
 		AllowBack:    true,
 		DefaultValue: "generate",
 	}
@@ -79,11 +79,30 @@ func promptSetupTokenChoiceInteractive(reader *bufio.Reader, out io.Writer, hasE
 	})
 }
 
-func promptSetupRepairActionInteractive(reader *bufio.Reader, out io.Writer, mode setupRepairMode, allowRelayTokenStep bool) (setupRepairAction, error) {
-	choices, defaultChoice := setupRepairChoices(mode, allowRelayTokenStep)
+func promptSetupRelayModeInteractive(reader *bufio.Reader, out io.Writer, defaultMode string) (string, error) {
+	spec := setupMenuSpec{
+		Title:        "How do you want to run NOVA Relay?",
+		Prompt:       "Use up/down or j/k, Enter to select, Esc to go back, Ctrl+C to exit",
+		AllowBack:    true,
+		DefaultValue: relayModeAddon,
+		Options: []setupMenuOption{
+			{Value: relayModeAddon, Label: "Install in Home Assistant (Supervisor add-on)"},
+			{Value: relayModeStandalone, Label: "Use an existing standalone relay (Docker / NAS / Home Assistant Container)"},
+		},
+	}
+	if normalized := normalizeRelayMode(defaultMode); normalized != "" {
+		spec.DefaultValue = normalized
+	}
+	return promptSetupMenu(reader, out, spec, func() (string, error) {
+		return promptSetupRelayModeFromReader(reader, out, defaultMode)
+	})
+}
+
+func promptSetupRepairActionInteractive(reader *bufio.Reader, out io.Writer, mode setupRepairMode, allowRelayTokenStep bool, cfg runtimeConfig) (setupRepairAction, error) {
+	choices, defaultChoice := setupRepairChoices(mode, allowRelayTokenStep, cfg)
 	spec := setupMenuSpec{
 		Title:        "Next step:",
-		Prompt:       "Use ↑/↓ or j/k, Enter to select, Esc to go back, Ctrl+C to exit",
+		Prompt:       "Use up/down or j/k, Enter to select, Esc to go back, Ctrl+C to exit",
 		AllowBack:    true,
 		DefaultValue: defaultChoice,
 	}
@@ -94,7 +113,7 @@ func promptSetupRepairActionInteractive(reader *bufio.Reader, out io.Writer, mod
 		})
 	}
 	answer, err := promptSetupMenu(reader, out, spec, func() (string, error) {
-		action, err := promptSetupRepairActionFromReader(reader, out, mode, allowRelayTokenStep)
+		action, err := promptSetupRepairActionFromReader(reader, out, mode, allowRelayTokenStep, cfg)
 		return string(action), err
 	})
 	if err != nil {
@@ -186,7 +205,7 @@ func setupMenuBlockWidth(spec setupMenuSpec) int {
 	}
 	for _, option := range spec.Options {
 		prefix := "    "
-		if selectedWidth := len("  › " + option.Label); selectedWidth > maxWidth {
+		if selectedWidth := len("  > " + option.Label); selectedWidth > maxWidth {
 			maxWidth = selectedWidth
 		}
 		if width := len(prefix + option.Label); width > maxWidth {
@@ -212,7 +231,7 @@ func renderSetupMenuBlock(out io.Writer, session uiSession, spec setupMenuSpec, 
 	for idx, option := range spec.Options {
 		prefix := "    "
 		if idx == selected {
-			prefix = "  " + session.style("accent", "› ")
+			prefix = "  " + session.style("accent", "> ")
 		}
 		label := option.Label
 		if option.Disabled {

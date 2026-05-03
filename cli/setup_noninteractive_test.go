@@ -13,10 +13,10 @@ import (
 func TestRunSetupNonInteractiveVerifiesBeforeInstallingClients(t *testing.T) {
 	withClientRuntimeAvailability(t, map[string]bool{"gemini": true})
 	home := t.TempDir()
-	t.Setenv("HOME", home)
+	setTestHomeEnv(t, home)
 	t.Setenv("HA_NOVA_NO_BROWSER", "1")
 	t.Setenv("HA_NOVA_ALLOW_INSECURE_TEST_KEYRING", "1")
-	t.Setenv("HA_NOVA_TEST_KEYRING_FILE", filepath.Join(home, ".config", "ha-nova", ".test-relay-auth-token"))
+	t.Setenv("HA_NOVA_TEST_KEYRING_FILE", setupTestKeyringPath(home))
 	t.Setenv("HA_NOVA_DEV_ROOT", repoRootForSetupTest(t))
 
 	haServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
@@ -68,7 +68,7 @@ func TestRunSetupNonInteractiveVerifiesBeforeInstallingClients(t *testing.T) {
 	if _, err := os.Stat(paths.StateFile); !isNotExist(err) {
 		t.Fatalf("expected failed non-interactive setup to roll state back, err=%v", err)
 	}
-	if _, err := os.Stat(filepath.Join(home, ".config", "ha-nova", ".test-relay-auth-token")); !isNotExist(err) {
+	if _, err := os.Stat(setupTestKeyringPath(home)); !isNotExist(err) {
 		t.Fatalf("expected failed non-interactive setup to roll token back, err=%v", err)
 	}
 }
@@ -76,9 +76,9 @@ func TestRunSetupNonInteractiveVerifiesBeforeInstallingClients(t *testing.T) {
 func TestRunSetupNonInteractiveSkipsClipboardAndBrowserSideEffects(t *testing.T) {
 	withClientRuntimeAvailability(t, map[string]bool{"gemini": true})
 	home := t.TempDir()
-	t.Setenv("HOME", home)
+	setTestHomeEnv(t, home)
 	t.Setenv("HA_NOVA_ALLOW_INSECURE_TEST_KEYRING", "1")
-	t.Setenv("HA_NOVA_TEST_KEYRING_FILE", filepath.Join(home, ".config", "ha-nova", ".test-relay-auth-token"))
+	t.Setenv("HA_NOVA_TEST_KEYRING_FILE", setupTestKeyringPath(home))
 	t.Setenv("HA_NOVA_DEV_ROOT", repoRootForSetupTest(t))
 
 	haServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
@@ -154,9 +154,9 @@ func TestRunSetupNonInteractiveSkipsClipboardAndBrowserSideEffects(t *testing.T)
 func TestRunSetupNonInteractiveRollsBackWhenInitialStateSaveFails(t *testing.T) {
 	withClientRuntimeAvailability(t, map[string]bool{"claude": true})
 	home := t.TempDir()
-	t.Setenv("HOME", home)
+	setTestHomeEnv(t, home)
 	t.Setenv("HA_NOVA_ALLOW_INSECURE_TEST_KEYRING", "1")
-	t.Setenv("HA_NOVA_TEST_KEYRING_FILE", filepath.Join(home, ".config", "ha-nova", ".test-relay-auth-token"))
+	t.Setenv("HA_NOVA_TEST_KEYRING_FILE", setupTestKeyringPath(home))
 
 	haServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		w.WriteHeader(http.StatusOK)
@@ -204,7 +204,7 @@ func TestRunSetupNonInteractiveRollsBackWhenInitialStateSaveFails(t *testing.T) 
 	if _, err := os.Stat(paths.StateFile); !isNotExist(err) {
 		t.Fatalf("expected state rollback on state save failure, err=%v", err)
 	}
-	if _, err := os.Stat(filepath.Join(home, ".config", "ha-nova", ".test-relay-auth-token")); !isNotExist(err) {
+	if _, err := os.Stat(setupTestKeyringPath(home)); !isNotExist(err) {
 		t.Fatalf("expected token rollback on state save failure, err=%v", err)
 	}
 }

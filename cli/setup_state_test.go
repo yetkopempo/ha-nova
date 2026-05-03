@@ -99,9 +99,9 @@ func TestRenderSetupStatusSummaryShowsAuthFailureWhenTokenExistsButRelayFails(t 
 
 func TestDetectSetupStateUsesWSPingFallbackForResume(t *testing.T) {
 	home := t.TempDir()
-	t.Setenv("HOME", home)
+	setTestHomeEnv(t, home)
 	t.Setenv("HA_NOVA_ALLOW_INSECURE_TEST_KEYRING", "1")
-	t.Setenv("HA_NOVA_TEST_KEYRING_FILE", filepath.Join(home, ".config", "ha-nova", ".test-relay-auth-token"))
+	t.Setenv("HA_NOVA_TEST_KEYRING_FILE", setupTestKeyringPath(home))
 
 	paths, err := detectPaths()
 	if err != nil {
@@ -151,7 +151,7 @@ func TestDetectSetupStateUsesWSPingFallbackForResume(t *testing.T) {
 
 func TestClientAppearsInstalledForClaudeIgnoresStaleStateWithoutPluginRecord(t *testing.T) {
 	home := t.TempDir()
-	t.Setenv("HOME", home)
+	setTestHomeEnv(t, home)
 
 	paths, err := detectPaths()
 	if err != nil {
@@ -173,7 +173,7 @@ func TestClientAppearsInstalledForClaudeIgnoresStaleStateWithoutPluginRecord(t *
 
 func TestClientAppearsInstalledForClaudeIgnoresBrokenInstallPathRecord(t *testing.T) {
 	home := t.TempDir()
-	t.Setenv("HOME", home)
+	setTestHomeEnv(t, home)
 
 	paths, err := detectPaths()
 	if err != nil {
@@ -209,7 +209,7 @@ func TestClientAppearsInstalledForClaudeIgnoresBrokenInstallPathRecord(t *testin
 
 func TestClientAppearsInstalledForClaudeIgnoresBlankInstallPathRecord(t *testing.T) {
 	home := t.TempDir()
-	t.Setenv("HOME", home)
+	setTestHomeEnv(t, home)
 
 	paths, err := detectPaths()
 	if err != nil {
@@ -248,7 +248,7 @@ func TestClientAppearsInstalledForClaudeIgnoresBlankInstallPathRecord(t *testing
 
 func TestClientAppearsInstalledForClaudeIgnoresUnparseableRegistry(t *testing.T) {
 	home := t.TempDir()
-	t.Setenv("HOME", home)
+	setTestHomeEnv(t, home)
 
 	paths, err := detectPaths()
 	if err != nil {
@@ -277,7 +277,7 @@ func TestClientAppearsInstalledForClaudeIgnoresUnparseableRegistry(t *testing.T)
 
 func TestClientAppearsInstalledForClaudeRequiresMarketplaceRecord(t *testing.T) {
 	home := t.TempDir()
-	t.Setenv("HOME", home)
+	setTestHomeEnv(t, home)
 
 	paths, err := detectPaths()
 	if err != nil {
@@ -303,7 +303,7 @@ func TestClientAppearsInstalledForClaudeRequiresMarketplaceRecord(t *testing.T) 
 
 func TestClientAppearsInstalledForClaudeRejectsLegacyFlatMarketplaceRoot(t *testing.T) {
 	home := t.TempDir()
-	t.Setenv("HOME", home)
+	setTestHomeEnv(t, home)
 
 	paths, err := detectPaths()
 	if err != nil {
@@ -334,7 +334,7 @@ func TestClientAppearsInstalledForClaudeRejectsLegacyFlatMarketplaceRoot(t *test
 
 func TestClientAppearsInstalledForClaudeIgnoresForeignPluginArrayEntries(t *testing.T) {
 	home := t.TempDir()
-	t.Setenv("HOME", home)
+	setTestHomeEnv(t, home)
 
 	paths, err := detectPaths()
 	if err != nil {

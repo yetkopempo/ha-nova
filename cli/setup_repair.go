@@ -60,8 +60,8 @@ func relayHealthIssueLooksLikeRelayAuth(err error) bool {
 func runSetupRepairFlow(reader *bufio.Reader, out io.Writer, cfg runtimeConfig, readiness relayReadiness, issue string, allowRelayTokenStep bool) (setupRepairAction, error) {
 	mode := detectSetupRepairMode(readiness, issue)
 	for {
-		renderSetupRepairPage(out, mode)
-		action, err := promptSetupRepairActionInteractive(reader, out, mode, allowRelayTokenStep)
+		renderSetupRepairPage(out, mode, cfg)
+		action, err := promptSetupRepairActionInteractive(reader, out, mode, allowRelayTokenStep, cfg)
 		if err != nil {
 			return "", err
 		}
@@ -72,6 +72,10 @@ func runSetupRepairFlow(reader *bufio.Reader, out io.Writer, cfg runtimeConfig, 
 				printHumanWarn("Browser launch skipped; open this URL manually if needed: %s/profile/security", cfg.HAURL)
 			}
 		case setupRepairActionOpenRelaySettings:
+			if setupUsesStandaloneRelay(cfg) {
+				renderStandaloneRelayChecklist(out, cfg)
+				continue
+			}
 			if err := openBrowserForSetup(cfg.HAURL + "/hassio/addon/2368fcfa_ha_nova_relay/config"); err != nil {
 				printHumanWarn("Browser launch skipped; open this URL manually if needed: %s/hassio/addon/2368fcfa_ha_nova_relay/config", cfg.HAURL)
 			}
@@ -81,7 +85,7 @@ func runSetupRepairFlow(reader *bufio.Reader, out io.Writer, cfg runtimeConfig, 
 	}
 }
 
-func renderSetupRepairPage(out io.Writer, mode setupRepairMode) {
+func renderSetupRepairPage(out io.Writer, mode setupRepairMode, cfg runtimeConfig) {
 	renderSetupSectionTitle(out, "Repair this connection step")
 	switch mode {
 	case setupRepairModeConnection:
@@ -100,15 +104,19 @@ func renderSetupRepairPage(out io.Writer, mode setupRepairMode) {
 			"NOVA Relay needs the Relay Auth Token on this device checked next.",
 		)
 	default:
+		fixTarget := "app-side"
+		if setupUsesStandaloneRelay(cfg) {
+			fixTarget = "relay-side"
+		}
 		renderSetupParagraph(out,
 			"Home Assistant and NOVA Relay are reachable.",
-			"Setup still needs one more app-side fix before this device can finish connecting.",
+			fmt.Sprintf("Setup still needs one more %s fix before this device can finish connecting.", fixTarget),
 		)
 	}
 }
 
-func promptSetupRepairActionFromReader(reader *bufio.Reader, out io.Writer, mode setupRepairMode, allowRelayTokenStep bool) (setupRepairAction, error) {
-	choices, defaultChoice := setupRepairChoices(mode, allowRelayTokenStep)
+func promptSetupRepairActionFromReader(reader *bufio.Reader, out io.Writer, mode setupRepairMode, allowRelayTokenStep bool, cfg runtimeConfig) (setupRepairAction, error) {
+	choices, defaultChoice := setupRepairChoices(mode, allowRelayTokenStep, cfg)
 
 	fmt.Fprintln(out)
 	fmt.Fprintln(out, "  Next step:")
@@ -139,10 +147,11 @@ func promptSetupRepairActionFromReader(reader *bufio.Reader, out io.Writer, mode
 		}
 	}
 	renderSetupErrorLine(out, "Invalid choice. Please enter one of the listed options.")
-	return promptSetupRepairActionFromReader(reader, out, mode, allowRelayTokenStep)
+	return promptSetupRepairActionFromReader(reader, out, mode, allowRelayTokenStep, cfg)
 }
 
-func setupRepairChoices(mode setupRepairMode, allowRelayTokenStep bool) ([]setupRepairChoice, string) {
+func setupRepairChoices(mode setupRepairMode, allowRelayTokenStep bool, cfg runtimeConfig) ([]setupRepairChoice, string) {
+	relaySettingsLabel := relaySettingsChoiceLabel(cfg)
 	switch mode {
 	case setupRepairModeConnection:
 		return []setupRepairChoice{
@@ -152,27 +161,27 @@ func setupRepairChoices(mode setupRepairMode, allowRelayTokenStep bool) ([]setup
 	case setupRepairModeLLAT:
 		return []setupRepairChoice{
 			{Number: "1", Value: setupRepairActionOpenSecurity, Label: "Open Home Assistant Security page"},
-			{Number: "2", Value: setupRepairActionOpenRelaySettings, Label: "Open NOVA Relay settings"},
+			{Number: "2", Value: setupRepairActionOpenRelaySettings, Label: relaySettingsLabel},
 			{Number: "3", Value: setupRepairActionRetry, Label: "Retry now"},
 			{Number: "4", Value: setupRepairActionBack, Label: "Back"},
 		}, "3"
 	case setupRepairModeRelayAuth:
 		if !allowRelayTokenStep {
 			return []setupRepairChoice{
-				{Number: "1", Value: setupRepairActionOpenRelaySettings, Label: "Open NOVA Relay settings"},
+				{Number: "1", Value: setupRepairActionOpenRelaySettings, Label: relaySettingsLabel},
 				{Number: "2", Value: setupRepairActionRetry, Label: "Retry now"},
 				{Number: "3", Value: setupRepairActionBack, Label: "Back"},
 			}, "2"
 		}
 		return []setupRepairChoice{
 			{Number: "1", Value: setupRepairActionBackToRelayToken, Label: "Back to Relay token step"},
-			{Number: "2", Value: setupRepairActionOpenRelaySettings, Label: "Open NOVA Relay settings"},
+			{Number: "2", Value: setupRepairActionOpenRelaySettings, Label: relaySettingsLabel},
 			{Number: "3", Value: setupRepairActionRetry, Label: "Retry now"},
 		}, "1"
 	default:
 		return []setupRepairChoice{
 			{Number: "1", Value: setupRepairActionOpenSecurity, Label: "Open Home Assistant Security page"},
-			{Number: "2", Value: setupRepairActionOpenRelaySettings, Label: "Open NOVA Relay settings"},
+			{Number: "2", Value: setupRepairActionOpenRelaySettings, Label: relaySettingsLabel},
 			{Number: "3", Value: setupRepairActionRetry, Label: "Retry now"},
 			{Number: "4", Value: setupRepairActionBack, Label: "Back"},
 		}, "3"

@@ -90,6 +90,49 @@ func TestVerifySetupConnectionReuseTokenLLATIssueOffersRepairActions(t *testing.
 	}
 }
 
+func TestVerifySetupConnectionReuseTokenStandaloneLLATIssueUsesChecklistLabel(t *testing.T) {
+	originalProbeHTTP := probeHTTPForSetup
+	originalFetchRelayHealth := fetchRelayHealthForSetup
+	originalProbeRelayWSPing := probeRelayWSPingForSetup
+	defer func() {
+		probeHTTPForSetup = originalProbeHTTP
+		fetchRelayHealthForSetup = originalFetchRelayHealth
+		probeRelayWSPingForSetup = originalProbeRelayWSPing
+	}()
+
+	probeHTTPForSetup = func(string) error { return nil }
+	fetchRelayHealthForSetup = func(string, string) ([]byte, error) {
+		return []byte(`{"status":"ok","data":{"ha_ws_connected":false}}`), nil
+	}
+	probeRelayWSPingForSetup = func(string, string) (relayWSPingResponse, error) {
+		return relayWSPingResponse{StatusCode: 502, Body: []byte("LLAT is required")}, nil
+	}
+
+	output := &bytes.Buffer{}
+	issue, ok, err := verifySetupConnection(bufio.NewReader(strings.NewReader("back\n")), output, runtimeConfig{
+		HAURL:        "http://ha",
+		RelayBaseURL: "http://relay",
+		RelayMode:    relayModeStandalone,
+	}, "token", true, true)
+	if err != errSetupBack {
+		t.Fatalf("expected errSetupBack, got %v", err)
+	}
+	if ok {
+		t.Fatal("did not expect ready state")
+	}
+	if issue != setupIssueWSDegraded {
+		t.Fatalf("expected ws degraded issue, got %q", issue)
+	}
+	for _, want := range []string{
+		`Set the "HA_LLAT" environment variable`,
+		"Show standalone relay config checklist",
+	} {
+		if !strings.Contains(output.String(), want) {
+			t.Fatalf("expected standalone repair guidance %q in output:\n%s", want, output.String())
+		}
+	}
+}
+
 func TestVerifySetupConnectionReuseTokenRelayAuthIssueCanRouteBackToTokenStep(t *testing.T) {
 	originalProbeHTTP := probeHTTPForSetup
 	originalFetchRelayHealth := fetchRelayHealthForSetup

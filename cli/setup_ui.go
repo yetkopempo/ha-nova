@@ -206,18 +206,30 @@ func renderSetupAlreadyDoneBanner(out io.Writer) {
 	fmt.Fprintln(out)
 }
 
-func renderSetupIncompleteBanner(out io.Writer, issue string) {
+func renderSetupIncompleteBanner(out io.Writer, issue string, cfgArgs ...runtimeConfig) {
 	session := resolveSetupUISession(out)
+	cfg := runtimeConfig{}
+	if len(cfgArgs) > 0 {
+		cfg = cfgArgs[0]
+	}
 	fmt.Fprintln(out)
 	fmt.Fprintf(out, "  %s Setup incomplete\n", session.style("error", session.errorMarker()))
 	fmt.Fprintln(out)
 	switch issue {
 	case setupIssueWSDegraded:
 		fmt.Fprintln(out, "  NOVA Relay is reachable, but Home Assistant WebSocket is not connected yet.")
-		fmt.Fprintln(out, "  Open Home Assistant > Settings > Apps > NOVA Relay, verify the app settings, and restart the App.")
+		if setupUsesStandaloneRelay(cfg) {
+			fmt.Fprintln(out, "  Verify the standalone relay environment, then restart the relay container and try again.")
+		} else {
+			fmt.Fprintln(out, "  Open Home Assistant > Settings > Apps > NOVA Relay, verify the app settings, and restart the App.")
+		}
 	case setupIssueRelayUnreachable:
 		fmt.Fprintln(out, "  HA NOVA saved your local setup, but the relay could not be verified yet.")
-		fmt.Fprintln(out, "  Open Home Assistant > Settings > Apps > NOVA Relay, start the app, then try again.")
+		if setupUsesStandaloneRelay(cfg) {
+			fmt.Fprintln(out, "  Start or restart the standalone relay container, then try again.")
+		} else {
+			fmt.Fprintln(out, "  Open Home Assistant > Settings > Apps > NOVA Relay, start the app, then try again.")
+		}
 	case setupIssueSkillsInstall:
 		fmt.Fprintln(out, "  The Home Assistant connection is configured, but local skill installation still needs another run.")
 		fmt.Fprintln(out, "  Re-run setup or install the HA NOVA skills again for your client.")
