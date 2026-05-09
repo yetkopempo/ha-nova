@@ -474,4 +474,145 @@ describe("home automation simulation", () => {
     expect(result.state.cooldownActive).toBe(true);
     expect(new Set(windowModes(result.state))).toEqual(new Set(["flap"]));
   });
+
+  it("does not reopen from flap during cooldown even if heat-airing demand still holds on the next tick", () => {
+    const cooledToFlap = runVeluxNoRequestClose(
+      createBaseState({
+        officeWindow: "open",
+        bathroomWindow: "open",
+        bathroomUpstairsWindow: "open",
+        guestRoomWindow: "open",
+        insideTemp: 24,
+        outsideTemp: 18,
+      }),
+      "no_request",
+    );
+
+    const nextTick = runVeluxHeatAiringOpen({
+      ...cooledToFlap.state,
+      summerConditions: true,
+      coolingNeeded: true,
+      heatingWelcome: false,
+      insideTemp: 27,
+      outsideTemp: 22,
+      globalRadiation: 80,
+    });
+
+    expect(nextTick.actions).toEqual([]);
+    expect(nextTick.state.coolingRequest).toBe(false);
+    expect(nextTick.state.cooldownActive).toBe(true);
+    expect(new Set(windowModes(nextTick.state))).toEqual(new Set(["flap"]));
+  });
+
+  it("does not reopen from fully closed during cooldown even if heat-airing demand still holds on the next tick", () => {
+    const fullyClosed = runVeluxHeatStop(
+      createBaseState({
+        coolingRequest: true,
+        insideTemp: 24.5,
+        outsideTemp: 24,
+        officeWindow: "open",
+        bathroomWindow: "open",
+        bathroomUpstairsWindow: "open",
+        guestRoomWindow: "open",
+      }),
+    );
+
+    const nextTick = runVeluxHeatAiringOpen({
+      ...fullyClosed.state,
+      summerConditions: true,
+      coolingNeeded: true,
+      heatingWelcome: false,
+      insideTemp: 27,
+      outsideTemp: 22,
+      globalRadiation: 80,
+    });
+
+    expect(nextTick.actions).toEqual([]);
+    expect(nextTick.state.coolingRequest).toBe(false);
+    expect(nextTick.state.cooldownActive).toBe(true);
+    expect(new Set(windowModes(nextTick.state))).toEqual(new Set(["closed"]));
+  });
+
+  it.fails("does not spam repeated flap commands and cooldown restarts on repeated no-request close ticks", () => {
+    const firstClose = runVeluxNoRequestClose(
+      createBaseState({
+        officeWindow: "open",
+        bathroomWindow: "open",
+        bathroomUpstairsWindow: "open",
+        guestRoomWindow: "open",
+        insideTemp: 24,
+        outsideTemp: 18,
+      }),
+      "no_request",
+    );
+
+    const secondClose = runVeluxNoRequestClose(firstClose.state, "no_request");
+
+    expect(secondClose.actions).toEqual([]);
+    expect(secondClose.state.cooldownActive).toBe(true);
+    expect(new Set(windowModes(secondClose.state))).toEqual(new Set(["flap"]));
+  });
+
+  it.fails("does not spam repeated flap commands on repeated unsafe-weather close ticks", () => {
+    const firstClose = runVeluxNoRequestClose(
+      createBaseState({
+        officeWindow: "open",
+        bathroomWindow: "open",
+        bathroomUpstairsWindow: "open",
+        guestRoomWindow: "open",
+        insideTemp: 24,
+        outsideTemp: 18,
+      }),
+      "unsafe_weather",
+    );
+
+    const secondClose = runVeluxNoRequestClose(firstClose.state, "unsafe_weather");
+
+    expect(secondClose.actions).toEqual([]);
+    expect(new Set(windowModes(secondClose.state))).toEqual(new Set(["flap"]));
+  });
+
+  it.fails("does not spam repeated open commands on heat-airing ticks when the cooling cycle is already active", () => {
+    const result = runVeluxHeatAiringOpen(
+      createBaseState({
+        summerConditions: true,
+        coolingNeeded: true,
+        heatingWelcome: false,
+        coolingRequest: true,
+        insideTemp: 27.2,
+        outsideTemp: 22.4,
+        globalRadiation: 80,
+        officeWindow: "open",
+        bathroomWindow: "open",
+        bathroomUpstairsWindow: "open",
+        guestRoomWindow: "open",
+      }),
+    );
+
+    expect(result.actions).toEqual([]);
+    expect(result.state.coolingRequest).toBe(true);
+    expect(new Set(windowModes(result.state))).toEqual(new Set(["open"]));
+  });
+
+  it.fails("does not spam repeated open commands on scheduled-airing ticks when the ventilation cycle is already active", () => {
+    const result = runVeluxScheduledAiringOpen(
+      createBaseState({
+        co2: 980,
+        insideTemp: 23.8,
+        outsideTemp: 20.1,
+        ventilationRequest: true,
+        airingTimerActive: true,
+        intervalAiringToggle: true,
+        officeWindow: "open",
+        bathroomWindow: "open",
+        bathroomUpstairsWindow: "open",
+        guestRoomWindow: "open",
+      }),
+    );
+
+    expect(result.actions).toEqual([]);
+    expect(result.state.ventilationRequest).toBe(true);
+    expect(result.state.airingTimerActive).toBe(true);
+    expect(new Set(windowModes(result.state))).toEqual(new Set(["open"]));
+  });
 });
