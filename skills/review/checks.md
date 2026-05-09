@@ -39,6 +39,7 @@ Load this catalog from `skills/review/SKILL.md` Step 1 before evaluating finding
 - R-17 [MEDIUM → HIGH]: Intra-config overwrite/rebound risk — the same entity/helper is written in 2+ distinct control-flow branches and the write basis is mixed. Typical risk shape: one branch advances live state incrementally, another branch later recomputes or resets from snapshot/start value/timer/fallback/baseline. Default to MEDIUM. Escalate to HIGH only when a later branch can plausibly overwrite/reset value already advanced by an earlier branch.
 - R-18 [HIGH]: Same-block sibling variable dependency with alphabetically later target — within one `variables:` mapping, variable A references sibling variable B from that same `variables:` mapping and B sorts alphabetically after A. HA storage/API writes may reorder mapping keys, so the saved variable order can evaluate A before B. Apply to top-level and local `variables:` blocks only when at least one concrete fragile pair exists. Report the block context plus at least one concrete pair (for example `check_flag -> reading`). For draft or pasted YAML, frame this as future write fragility. For HA read-back or post-write review, frame it as a persisted runtime risk.
 - R-19 [MEDIUM]: Unreachable `trigger.id` in bare `else` branch — a Jinja2 `if` + `elif` chain uses entity-state-style guards, and the terminal bare `else` contains a direct `trigger.id` comparison. final else branch is only reached when the earlier entity-state branches are false. Move the `trigger.id` check into an explicit `elif`. Or refactor to `choose` + `condition: trigger`.
+- R-20 [HIGH]: Contradictory fixed state conditions in one conjunction — the same `entity_id` is required to be in mutually exclusive fixed `condition: state` values inside one implicit or explicit `AND` scope, making that branch unreachable. Example: the same binary sensor must be both `on` and `off`. Merge the alternatives under one `condition: or` block or remove the contradictory branch.
 
 ## R-17 Evidence Boundary
 
@@ -82,6 +83,20 @@ Load this catalog from `skills/review/SKILL.md` Step 1 before evaluating finding
 - Preferred fixes:
   - move the `trigger.id` check into an explicit `elif`
   - or refactor to `choose` + `condition: trigger`
+
+## R-20 Evidence Boundary
+
+- Apply only within one conjunction scope:
+  - the root `conditions:` list on an automation or script (implicit `AND`)
+  - or one explicit `condition: and` block
+- First collect native `condition: state` checks with exact `entity_id` matches inside that one scope.
+- Then flag only mutually exclusive fixed `state` requirements for the same entity, such as `on` versus `off`, or incompatible single literal states.
+- Skip `condition: or` scopes entirely; alternatives there are intentional.
+- Skip `numeric_state`, `template`, `device`, and other non-fixed-state condition types.
+- Skip contradictions separated across different `choose` branches, different triggers, or different nested scopes that do not have to be true at the same time.
+- Preferred fixes:
+  - merge alternative branches under one `condition: or`
+  - or keep only one fixed state requirement per entity inside the conjunction
 
 ## Performance (Medium)
 

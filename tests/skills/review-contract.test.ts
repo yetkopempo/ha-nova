@@ -101,9 +101,9 @@ describe("review contract", () => {
     expect(reviewChecks).toContain("R-16 [HIGH]");
     expect(reviewChecks).toContain("Templated event name");
     expect(reviewChecks).toContain("`event_type:` does not evaluate templates");
-    expect(reviewSkill).toContain("R-01..R-19");
-    expect(reviewAgent).toContain("R-01..R-19");
-    expect(architectureDoc).toContain("R-01..R-19");
+    expect(reviewSkill).toContain("R-01..R-20");
+    expect(reviewAgent).toContain("R-01..R-20");
+    expect(architectureDoc).toContain("R-01..R-20");
     expect(templateGuidelines).toContain("Event trigger names must be literal strings");
     expect(templateGuidelines).toContain("do not template `event_type:`");
   });
@@ -154,6 +154,23 @@ describe("review contract", () => {
     expect(reviewAgent).toContain("terminal bare `else` that contains a direct `trigger.id` comparison");
     expect(architectureDoc).toContain("`R-19` is branch-structure reachability only");
     expect(templateGuidelines).toContain("Direct `trigger.id` check in a terminal bare `else`");
+  });
+
+  it("documents contradictory conjunction state checks as R-20", () => {
+    expect(reviewChecks).toContain("R-20 [HIGH]");
+    expect(reviewChecks).toContain("Contradictory fixed state conditions in one conjunction");
+    expect(reviewChecks).toContain("same `entity_id`");
+    expect(reviewChecks).toContain("both `on` and `off`");
+    expect(reviewChecks).toContain("root `conditions:` list");
+    expect(reviewChecks).toContain("explicit `condition: and` block");
+    expect(reviewChecks).toContain("Skip `condition: or` scopes entirely");
+    expect(reviewChecks).toContain("Merge the alternatives under one `condition: or` block");
+    expect(reviewSkill).toContain("R-20 applies only to contradictory fixed `condition: state` checks on the same `entity_id`");
+    expect(reviewSkill).toContain("the same entity is required to be both `on` and `off` in one conjunction");
+    expect(reviewAgent).toContain("`R-20` applies only to contradictory fixed `condition: state` checks on the same `entity_id`");
+    expect(reviewAgent).toContain("the same entity is required to be both `on` and `off` in one conjunction");
+    expect(architectureDoc).toContain("`R-20` is conjunction-scope contradiction only");
+    expect(templateGuidelines).toContain("Contradictory fixed `condition: state` checks on the same entity inside one conjunction");
   });
 
   it("documents the standalone questions-versus-suggestions split", () => {

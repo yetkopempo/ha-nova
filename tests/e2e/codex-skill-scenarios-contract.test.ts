@@ -334,6 +334,34 @@ describe("codex skill scenario e2e contract", () => {
     expect(chooseTrigger?.must_not_contain_text).toEqual(expect.arrayContaining(["R-19", "R19"]));
   });
 
+  it("ships focused R-20 contradiction scenarios without changing the scenario schema", () => {
+    const content = readFileSync("scripts/e2e/codex-ha-nova-scenarios.json", "utf8");
+    const scenarios = JSON.parse(content) as ScenarioDefinition[];
+
+    const byId = new Map(scenarios.map((scenario) => [scenario.id, scenario]));
+
+    const flagged = byId.get("r20-contradictory-top-level-state-conditions");
+    expect(flagged).toBeDefined();
+    expect(flagged?.expect.type).toBe("json_array_values");
+    expect(flagged?.must_contain_text).toContain(
+      "the same entity is required to be both `on` and `off` in one conjunction"
+    );
+    expect(flagged?.must_contain_text).toContain(
+      "Merge the alternatives under one `condition: or` block or remove the contradictory branch"
+    );
+    expect(flagged?.must_not_contain_text).toEqual(expect.arrayContaining(["R-20", "R20"]));
+
+    const safe = byId.get("r20-safe-seasonal-or-branch");
+    expect(safe).toBeDefined();
+    expect(safe?.expect.type).toBe("json_array_values");
+    expect(safe?.must_contain_text).toContain("No issues found in this review.");
+    expect(safe?.must_contain_text).toContain("Safe pattern: seasonal alternatives grouped under condition or.");
+    expect(safe?.must_not_contain_text).toContain(
+      "the same entity is required to be both `on` and `off` in one conjunction"
+    );
+    expect(safe?.must_not_contain_text).toEqual(expect.arrayContaining(["R-20", "R20"]));
+  });
+
   it("keeps user-facing scenario expectations free of rule-code markers", () => {
     const content = readFileSync("scripts/e2e/codex-ha-nova-scenarios.json", "utf8");
     const scenarios = JSON.parse(content) as ScenarioDefinition[];

@@ -276,5 +276,55 @@
       "Instant help"
     ],
     "max_duration_sec": 240
+  },
+  {
+    "id": "review-r20-contradictory-top-level-state-conditions",
+    "prompt": "Use ha nova review skill on this pasted YAML only. Explain the result in English. Keep the stable single-target review structure. If you detect the issue, include these exact phrases: the same entity is required to be both `on` and `off` in one conjunction. Merge the alternatives under one `condition: or` block or remove the contradictory branch. Do not use internal rule codes in the user-facing text. YAML: automation:\n  - alias: Review contradictory top level states\n    mode: single\n    triggers:\n      - trigger: time_pattern\n        minutes: '/15'\n    conditions:\n      - condition: state\n        entity_id: binary_sensor.summer_conditions\n        state: 'on'\n      - condition: state\n        entity_id: binary_sensor.cooling_needed\n        state: 'on'\n      - condition: state\n        entity_id: binary_sensor.summer_conditions\n        state: 'off'\n    actions:\n      - action: cover.open_cover\n        target:\n          entity_id: cover.demo",
+    "must_contain_text": [
+      "Findings",
+      "Why:",
+      "Fix:",
+      "the same entity is required to be both `on` and `off` in one conjunction",
+      "Merge the alternatives under one `condition: or` block or remove the contradictory branch"
+    ],
+    "must_not_contain_text": [
+      "R-20",
+      "R20"
+    ],
+    "section_order": [
+      "Review target",
+      "Findings",
+      "Collision check",
+      "Conflicts",
+      "Questions to consider",
+      "Suggestions",
+      "Summary",
+      "Instant help"
+    ],
+    "max_duration_sec": 240
+  },
+  {
+    "id": "review-r20-safe-seasonal-or-branch",
+    "prompt": "Use ha nova review skill on this pasted YAML only. Explain the result in English. Keep the stable single-target review structure. If the config is safe, include both exact substrings: No issues found in this review. Safe pattern: seasonal alternatives grouped under condition or. Do not use internal rule codes in the user-facing text. YAML: automation:\n  - alias: Review safe seasonal alternatives\n    mode: single\n    triggers:\n      - trigger: time_pattern\n        minutes: '/15'\n    conditions:\n      - condition: or\n        conditions:\n          - condition: and\n            conditions:\n              - condition: state\n                entity_id: binary_sensor.summer_conditions\n                state: 'on'\n              - condition: state\n                entity_id: binary_sensor.cooling_needed\n                state: 'on'\n          - condition: and\n            conditions:\n              - condition: state\n                entity_id: binary_sensor.summer_conditions\n                state: 'off'\n              - condition: state\n                entity_id: binary_sensor.heating_welcome\n                state: 'off'\n    actions:\n      - action: cover.open_cover\n        target:\n          entity_id: cover.demo",
+    "must_contain_text": [
+      "No issues found in this review.",
+      "Safe pattern: seasonal alternatives grouped under condition or."
+    ],
+    "must_not_contain_text": [
+      "the same entity is required to be both `on` and `off` in one conjunction",
+      "R-20",
+      "R20"
+    ],
+    "section_order": [
+      "Review target",
+      "Findings",
+      "Collision check",
+      "Conflicts",
+      "Questions to consider",
+      "Suggestions",
+      "Summary",
+      "Instant help"
+    ],
+    "max_duration_sec": 240
   }
 ]

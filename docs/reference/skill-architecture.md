@@ -208,7 +208,7 @@ Rules:
 ## Review Architecture
 
 `ha-nova:review` is a self-contained read-only reviewer:
-- Config quality: safety (S-01..S-03), reliability (R-01..R-19), performance (P-01..P-05), style (M-01..M-04), script-specific (F-01..F-08), helper-specific (H-01..H-10)
+- Config quality: safety (S-01..S-03), reliability (R-01..R-20), performance (P-01..P-05), style (M-01..M-04), script-specific (F-01..F-08), helper-specific (H-01..H-10)
 - Collision scan: `search/related` on top 3 target entities
 - Conflict analysis: 3-step test (polarity → temporal → guard conditions)
 - Explorative questions: standalone automation/script reviews add a gated edge-case pass for complex behavior
@@ -219,6 +219,7 @@ Rules:
 - `R-17` is intra-config only; collision scan stays cross-item conflict work, not overwrite/rebound detection
 - `R-18` is same-mapping only; it checks storage-sensitive sibling-variable references inside one `variables:` block, not cross-scope references
 - `R-19` is branch-structure reachability only; it covers direct `trigger.id` checks in a terminal bare `else` after entity-state `if` / `elif` guards, without intent inference
+- `R-20` is conjunction-scope contradiction only; it covers mutually exclusive fixed `condition: state` requirements on the same entity inside one implicit or explicit `AND` scope
 - Known safe/problem pattern matching from `skills/review/checks.md`
 - resolved targets `== 1`: stable 8-section single-target output (`Review target`, `Findings`, `Collision check`, `Conflicts`, `Questions to consider`, `Suggestions`, `Summary`, `Instant help`)
 - resolved targets `> 1`: switch to aggregate multi-target mode automatically, materialize and trim the current workset before any per-item reads, audit max 5 items in stable order, aggregate findings by pattern, and report `matched / audited / remaining`

@@ -96,7 +96,7 @@ describe("codex review live e2e contract", () => {
     const scenarios = JSON.parse(content) as ReviewScenarioDefinition[];
 
     expect(Array.isArray(scenarios)).toBe(true);
-    expect(scenarios.length).toBeGreaterThanOrEqual(11);
+    expect(scenarios.length).toBeGreaterThanOrEqual(13);
 
     const byId = new Map(scenarios.map((scenario) => [scenario.id, scenario]));
 
@@ -209,6 +209,29 @@ describe("codex review live e2e contract", () => {
     expect(r19SafeChooseTrigger?.must_not_contain_text).toContain(
       "final else branch is only reached when the earlier entity-state branches are false"
     );
+
+    const r20Flagged = byId.get("review-r20-contradictory-top-level-state-conditions");
+    expect(r20Flagged).toBeDefined();
+    expect(r20Flagged?.must_contain_text).toEqual(
+      expect.arrayContaining([
+        "Findings",
+        "Why:",
+        "Fix:",
+        "the same entity is required to be both `on` and `off` in one conjunction",
+        "Merge the alternatives under one `condition: or` block or remove the contradictory branch",
+      ])
+    );
+    expect(r20Flagged?.must_not_contain_text).toEqual(expect.arrayContaining(["R-20", "R20"]));
+
+    const r20Safe = byId.get("review-r20-safe-seasonal-or-branch");
+    expect(r20Safe).toBeDefined();
+    expect(r20Safe?.must_contain_text).toEqual(
+      expect.arrayContaining([cleanReviewText, "Safe pattern: seasonal alternatives grouped under condition or."])
+    );
+    expect(r20Safe?.must_not_contain_text).toContain(
+      "the same entity is required to be both `on` and `off` in one conjunction"
+    );
+    expect(r20Safe?.must_not_contain_text).toEqual(expect.arrayContaining(["R-20", "R20"]));
   });
 
   it("does not treat dotted entity-id suffixes as rule-code markers", () => {
