@@ -53,6 +53,11 @@ Rules:
 - Prefer `--jq` or `--jq-file` over shell pipes when filtering relay output.
 - Prefer `ha-nova relay jq --file <result-file> length` for simple counts and `--jq-file <filter-file>` for non-trivial follow-up transforms.
 - On Windows PowerShell, never chain commands with `&&` or `||`; run separate shell commands instead.
+- On Windows PowerShell, payload-file encoding is a real interoperability risk:
+  - prefer ASCII when the JSON is ASCII-safe
+  - otherwise write **UTF-8 without BOM**
+  - avoid Windows PowerShell 5.1 `Set-Content -Encoding utf8` for relay JSON payloads because it writes a BOM and can trigger `INVALID_JSON`
+  - safe pattern: `[System.IO.File]::WriteAllText(<path>, <json>, [System.Text.UTF8Encoding]::new($false))`
 - Never call external `jq`; use relay-native `--jq` / `--jq-file` or `ha-nova relay jq`.
 - When a filter contains `select`, `test`, `startswith`, or more than one pipeline stage, default to `--jq-file` even if inline quoting might work.
 - Use native file-writing and file-reading tools for temp files. Do not teach `cat`, heredocs, Python, or Node as the primary JSON path.

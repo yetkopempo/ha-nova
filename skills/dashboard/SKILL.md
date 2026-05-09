@@ -48,6 +48,15 @@ Use file-based WS requests only:
 - `ha-nova relay ws --data-file <payload-file> --out <result-file>`
 - `ha-nova relay ws --data-file <payload-file> --jq-file <filter-file>`
 
+On Windows PowerShell, JSON payload encoding matters:
+- prefer ASCII when the payload contains only ASCII characters
+- otherwise write UTF-8 **without BOM**
+- avoid `Set-Content -Encoding utf8` for `lovelace/*` relay payloads on Windows PowerShell 5.1 because the BOM can cause `INVALID_JSON`
+- safe pattern:
+  ```powershell
+  [System.IO.File]::WriteAllText($path, $jsonText, [System.Text.UTF8Encoding]::new($false))
+  ```
+
 Relevant WS types:
 - `lovelace/dashboards/list`
 - `lovelace/dashboards/create`
@@ -67,6 +76,7 @@ Critical behavior:
 - `lovelace/dashboards/list` is the source of truth for `dashboard_id`, `url_path`, and `mode`
 - `lovelace/config/delete` is not the dashboard delete path for this skill
 - `lovelace/resources` shows installed Lovelace resources, but that alone is not proof that a custom-card schema is safe to invent
+- `lovelace/config/save` may return success with `data:null`; that is not sufficient proof that the write landed
 
 ## Flow
 
@@ -99,6 +109,7 @@ Critical behavior:
      - build a compact inventory of views, cards, badges, and header cards
      - resolve the exact target by view, title/heading text, entity reference, card type, or explicit position
      - merge the requested change in memory
+     - validate the final save payload as JSON before sending it on Windows PowerShell when you had to write the payload file manually
      - preview a concise diff/excerpt
      - save the full merged config with `lovelace/config/save`
      - new cards may be created only from this built-in allowlist:
@@ -114,6 +125,7 @@ Critical behavior:
    - create / metadata update / delete: verify through `lovelace/dashboards/list`
    - resource create/update/delete: verify through `lovelace/resources`
    - content update: verify through `lovelace/config`
+   - treat relay save success, including `{"ok":true,"data":null}`, as provisional only until the read-back matches
    - content update must confirm both the intended field change and unrelated-view survival
 6. If verification fails, stop and report the mismatch. Do not retry by guessing.
 

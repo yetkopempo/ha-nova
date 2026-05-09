@@ -59,6 +59,8 @@
     "smoke:app:run": "bash scripts/smoke/app-local-run.sh",
     "smoke:app:http": "bash scripts/smoke/app-http-smoke.sh",
     "test": "npm run test:safe",
+    "test:automation-sim": "vitest run tests/automation-sim/home-automation-sim.test.ts",
+    "test:automation-sim:coverage": "vitest run tests/automation-sim/home-automation-sim.test.ts --coverage.enabled true --coverage.provider v8",
     "test:cli": "cd cli && go test ./...",
     "test:desktop:macos": "bash scripts/dev/macos-private-rc-suite.sh",
     "test:desktop:windows:headless": "powershell -NoProfile -ExecutionPolicy Bypass -Command \"& { if (-not $env:HA_NOVA_BUNDLE_URL) { throw 'HA_NOVA_BUNDLE_URL is required' }; if (-not $env:HA_NOVA_BUNDLE_SHA256_URL) { throw 'HA_NOVA_BUNDLE_SHA256_URL is required' }; & './scripts/dev/windows-private-rc-install.ps1' -BundleUrl $env:HA_NOVA_BUNDLE_URL -BundleSha256Url $env:HA_NOVA_BUNDLE_SHA256_URL }\"",
@@ -96,6 +98,7 @@
   },
   "devDependencies": {
     "@types/node": "^25.5.0",
+    "@vitest/coverage-v8": "^4.0.7",
     "husky": "^9.1.7",
     "tsx": "^4.21.0",
     "typescript": "^5.9.3",
