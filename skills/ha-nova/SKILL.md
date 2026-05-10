@@ -28,6 +28,21 @@ Before HA operations in this session:
 
 Do not ask user to paste tokens in chat.
 
+## Relay-First Config Safety (Critical)
+
+When Relay is healthy and a dedicated HA NOVA skill exists for the requested operation, use Relay and that skill. Do not patch `/config/*.yaml` directly as a substitute for a covered Relay operation.
+
+Rules:
+- Prefer Relay-backed skills for automations, scripts, helpers, dashboards, service calls, entity metadata, and device/entity organization.
+- Treat direct live YAML edits as an exception path only for features that Relay does not own yet.
+- If direct YAML editing is unavoidable:
+  - work on a local copy first, never the live file as the first write target
+  - validate the candidate file before copy-back
+  - on this repo, run `python D:\\github\\yetkopempo\\home_assistant\\tools\\validate_ha_yaml_text.py <file> --strict-warnings`
+  - reject copy-back if the validator reports errors; investigate warnings before proceeding
+  - keep a timestamped backup of the live file before overwrite
+- After any manual YAML copy-back, require the user to run Home Assistant config check and reload/restart before treating the change as live.
+
 ## Self-Update
 
 Before the first HA task in a session:
@@ -69,6 +84,7 @@ Rules:
 - Correct invalid Home Assistant premises explicitly.
 - Do it briefly and technically.
 - Preview every write payload.
+- Do not bypass Relay by editing live YAML for an operation already covered by a HA NOVA skill.
 - Confirmation tiers:
   - `create`/`update`: natural confirmation bound to active preview.
   - `delete`/destructive: token confirmation `confirm:<token>`.

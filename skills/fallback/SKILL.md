@@ -249,6 +249,11 @@ Define custom sensors using Jinja2 templates, REST endpoints, or shell commands.
 
 **Status:** Coming in Phase 3. Blocked by: No filesystem access in Relay (sensors defined in YAML files).
 **Workaround:** Create via HA UI: Settings > Devices & Services > Helpers (for template helpers) or add YAML manually.
+If YAML editing is unavoidable:
+- work on a local copy first, not the live file
+- validate before copy-back with `python D:\\github\\yetkopempo\\home_assistant\\tools\\validate_ha_yaml_text.py <file> --strict-warnings`
+- keep a timestamped backup before overwrite
+- after copy-back, require Home Assistant config check plus reload/restart before treating the change as live
 
 ### Configuration Backups -- ROADMAP (Phase 2)
 
@@ -298,6 +303,7 @@ Rules for all experimental relay calls in this skill:
 - One resource at a time (no batch writes)
 - Delete requires tokenized confirmation (`confirm:<token>`)
 - Never guess IDs: resolve via list/search first
+- If a fallback task still requires manual YAML because Relay does not own that surface yet, use the same local-copy + validator + backup flow instead of editing live YAML first.
 - Experimental results may be unexpected — verify data-target match before presenting conclusions (see `skills/ha-nova/SKILL.md` → Claim-Evidence Binding)
 
 ### Write Safety by Endpoint Type

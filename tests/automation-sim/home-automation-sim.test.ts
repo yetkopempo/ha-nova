@@ -533,7 +533,7 @@ describe("home automation simulation", () => {
     expect(new Set(windowModes(nextTick.state))).toEqual(new Set(["closed"]));
   });
 
-  it.fails("does not spam repeated flap commands and cooldown restarts on repeated no-request close ticks", () => {
+  it("does not spam repeated flap commands and cooldown restarts on repeated no-request close ticks", () => {
     const firstClose = runVeluxNoRequestClose(
       createBaseState({
         officeWindow: "open",
@@ -553,7 +553,7 @@ describe("home automation simulation", () => {
     expect(new Set(windowModes(secondClose.state))).toEqual(new Set(["flap"]));
   });
 
-  it.fails("does not spam repeated flap commands on repeated unsafe-weather close ticks", () => {
+  it("does not spam repeated flap commands on repeated unsafe-weather close ticks", () => {
     const firstClose = runVeluxNoRequestClose(
       createBaseState({
         officeWindow: "open",
@@ -572,7 +572,7 @@ describe("home automation simulation", () => {
     expect(new Set(windowModes(secondClose.state))).toEqual(new Set(["flap"]));
   });
 
-  it.fails("does not spam repeated open commands on heat-airing ticks when the cooling cycle is already active", () => {
+  it("does not spam repeated open commands on heat-airing ticks when the cooling cycle is already active", () => {
     const result = runVeluxHeatAiringOpen(
       createBaseState({
         summerConditions: true,
@@ -594,7 +594,7 @@ describe("home automation simulation", () => {
     expect(new Set(windowModes(result.state))).toEqual(new Set(["open"]));
   });
 
-  it.fails("does not spam repeated open commands on scheduled-airing ticks when the ventilation cycle is already active", () => {
+  it("does not spam repeated open commands on scheduled-airing ticks when the ventilation cycle is already active", () => {
     const result = runVeluxScheduledAiringOpen(
       createBaseState({
         co2: 980,

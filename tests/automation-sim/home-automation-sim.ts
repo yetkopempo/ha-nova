@@ -153,14 +153,30 @@ export function runVeluxScheduledAiringOpen(
   if (!next.timeWithinScheduledWindow) return { state: next, actions };
   if (!(next.co2 > 800)) return { state: next, actions };
 
-  setAllAiringWindows(next, "open");
-  next.airingTimerActive = true;
-  next.intervalAiringToggle = true;
-  next.ventilationRequest = true;
-  actions.push("cover.open_cover:velux_airing_windows");
-  actions.push("timer.start:timer.airing_timer");
-  actions.push("input_boolean.turn_on:input_boolean.interval_airing_toggle");
-  actions.push("input_boolean.turn_on:input_boolean.velux_request_ventilation");
+  const allOpen = allWindowsMatch(next, "open");
+  const ventilationCycleAlreadyActive =
+    next.ventilationRequest && next.airingTimerActive && next.intervalAiringToggle;
+
+  if (ventilationCycleAlreadyActive && allOpen) {
+    return { state: next, actions };
+  }
+
+  if (!allOpen) {
+    setAllAiringWindows(next, "open");
+    actions.push("cover.open_cover:velux_airing_windows");
+  }
+  if (!next.airingTimerActive) {
+    next.airingTimerActive = true;
+    actions.push("timer.start:timer.airing_timer");
+  }
+  if (!next.intervalAiringToggle) {
+    next.intervalAiringToggle = true;
+    actions.push("input_boolean.turn_on:input_boolean.interval_airing_toggle");
+  }
+  if (!next.ventilationRequest) {
+    next.ventilationRequest = true;
+    actions.push("input_boolean.turn_on:input_boolean.velux_request_ventilation");
+  }
 
   return { state: next, actions };
 }
@@ -190,10 +206,19 @@ export function runVeluxHeatAiringOpen(
     return { state: next, actions };
   }
 
-  setAllAiringWindows(next, "open");
-  next.coolingRequest = true;
-  actions.push("cover.open_cover:velux_airing_windows");
-  actions.push("input_boolean.turn_on:input_boolean.velux_request_cooling");
+  const allOpen = allWindowsMatch(next, "open");
+  if (next.coolingRequest && allOpen) {
+    return { state: next, actions };
+  }
+
+  if (!allOpen) {
+    setAllAiringWindows(next, "open");
+    actions.push("cover.open_cover:velux_airing_windows");
+  }
+  if (!next.coolingRequest) {
+    next.coolingRequest = true;
+    actions.push("input_boolean.turn_on:input_boolean.velux_request_cooling");
+  }
 
   return { state: next, actions };
 }
@@ -312,8 +337,12 @@ export function runVeluxNoRequestClose(
     return { state: next, actions };
   }
 
+  if (allWindowsMatch(next, "flap")) {
+    return { state: next, actions };
+  }
+
   setAllAiringWindows(next, "flap");
-  if (trigger === "no_request") {
+  if (trigger === "no_request" && !next.cooldownActive) {
     next.cooldownActive = true;
     actions.push("timer.start:timer.velux_airing_cooldown");
   }
@@ -337,6 +366,10 @@ function setAllAiringWindows(state: AutomationSimState, mode: WindowMode): void 
 
 function anyWindowAboveClosed(state: AutomationSimState): boolean {
   return AIRING_WINDOWS.some((key) => state[key] !== "closed");
+}
+
+function allWindowsMatch(state: AutomationSimState, mode: WindowMode): boolean {
+  return AIRING_WINDOWS.every((key) => state[key] === mode);
 }
 
 function temperatureDelta(state: AutomationSimState): number {
