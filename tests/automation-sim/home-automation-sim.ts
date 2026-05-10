@@ -1,5 +1,5 @@
 export type ShadeMode = "open" | "closed";
-export type WindowMode = "closed" | "flap" | "open";
+export type WindowMode = "closed" | "flap" | "half" | "open";
 export type VeluxCloseTrigger =
   | "outside_warmer"
   | "no_request"
@@ -147,13 +147,13 @@ export function runVeluxScheduledAiringOpen(
   if (next.cooldownActive) return { state: next, actions };
   if (next.weatherUnsafeForShades) return { state: next, actions };
   if (next.severeWeather) return { state: next, actions };
-  if (next.precipitation >= 0.1) return { state: next, actions };
   if (!(next.insideTemp > next.outsideTemp)) return { state: next, actions };
   if (!(next.outsideTemp < 24)) return { state: next, actions };
   if (!next.timeWithinScheduledWindow) return { state: next, actions };
   if (!(next.co2 > 800)) return { state: next, actions };
 
-  const allOpen = allWindowsMatch(next, "open");
+  const targetMode: WindowMode = next.precipitation > 0.1 ? "half" : "open";
+  const allOpen = allWindowsMatch(next, targetMode);
   const ventilationCycleAlreadyActive =
     next.ventilationRequest && next.airingTimerActive && next.intervalAiringToggle;
 
@@ -162,8 +162,12 @@ export function runVeluxScheduledAiringOpen(
   }
 
   if (!allOpen) {
-    setAllAiringWindows(next, "open");
-    actions.push("cover.open_cover:velux_airing_windows");
+    setAllAiringWindows(next, targetMode);
+    actions.push(
+      targetMode === "half"
+        ? "cover.set_cover_position:velux_airing_windows:50"
+        : "cover.open_cover:velux_airing_windows",
+    );
   }
   if (!next.airingTimerActive) {
     next.airingTimerActive = true;
@@ -193,7 +197,6 @@ export function runVeluxHeatAiringOpen(
   if (!seasonGate) return { state: next, actions };
   if (next.cooldownActive) return { state: next, actions };
   if (next.weatherUnsafeForShades) return { state: next, actions };
-  if (next.precipitation >= 0.1) return { state: next, actions };
   if (next.severeWeather) return { state: next, actions };
   if (!(next.insideTemp > next.outsideTemp)) return { state: next, actions };
   if (!(next.insideTemp > 23.5)) return { state: next, actions };
@@ -206,14 +209,19 @@ export function runVeluxHeatAiringOpen(
     return { state: next, actions };
   }
 
-  const allOpen = allWindowsMatch(next, "open");
+  const targetMode: WindowMode = next.precipitation > 0.1 ? "half" : "open";
+  const allOpen = allWindowsMatch(next, targetMode);
   if (next.coolingRequest && allOpen) {
     return { state: next, actions };
   }
 
   if (!allOpen) {
-    setAllAiringWindows(next, "open");
-    actions.push("cover.open_cover:velux_airing_windows");
+    setAllAiringWindows(next, targetMode);
+    actions.push(
+      targetMode === "half"
+        ? "cover.set_cover_position:velux_airing_windows:50"
+        : "cover.open_cover:velux_airing_windows",
+    );
   }
   if (!next.coolingRequest) {
     next.coolingRequest = true;
@@ -334,6 +342,16 @@ export function runVeluxNoRequestClose(
     actions.push("input_boolean.turn_off:input_boolean.interval_airing_toggle");
     actions.push("input_boolean.turn_off:input_boolean.velux_request_ventilation");
     actions.push("input_boolean.turn_off:input_boolean.velux_request_cooling");
+    return { state: next, actions };
+  }
+
+  if (trigger === "rain" && (next.ventilationRequest || next.coolingRequest)) {
+    if (allWindowsMatch(next, "half")) {
+      return { state: next, actions };
+    }
+
+    setAllAiringWindows(next, "half");
+    actions.push("cover.set_cover_position:velux_airing_windows:50");
     return { state: next, actions };
   }
 
