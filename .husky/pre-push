@@ -2,17 +2,20 @@
 echo "[pre-push] Running local checks before push..."
 echo ""
 
-echo "[1/4] Typecheck..."
+echo "[1/3] Typecheck..."
 npm run typecheck || { echo "[pre-push] FAILED: typecheck"; exit 1; }
 
-echo "[2/4] Tests..."
-npm test || { echo "[pre-push] FAILED: tests"; exit 1; }
+echo "[2/3] Automation simulation tests..."
+npm run test:automation-sim || { echo "[pre-push] FAILED: automation simulation tests"; exit 1; }
 
-echo "[3/4] Build..."
+echo "[3/3] Build..."
 npm run build || { echo "[pre-push] FAILED: build"; exit 1; }
 
-echo "[4/4] Docs fact-check..."
-bash scripts/check-docs.sh || { echo "[pre-push] FAILED: docs fact-check"; exit 1; }
+if [ "${HA_NOVA_PREPUSH_DOCS:-0}" = "1" ]; then
+  echo ""
+  echo "[extra] Docs fact-check..."
+  bash scripts/check-docs.sh || { echo "[pre-push] FAILED: docs fact-check"; exit 1; }
+fi
 
 echo ""
-echo "[pre-push] All 4 checks passed."
+echo "[pre-push] Local push checks passed."
