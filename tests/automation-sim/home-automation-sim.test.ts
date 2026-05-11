@@ -93,6 +93,7 @@ describe("home automation simulation", () => {
 
     expect(result.actions).toContain("cover.open_cover:velux_airing_windows");
     expect(result.actions).toContain("timer.start:timer.airing_timer");
+    expect(result.actions).toContain("timer.duration:timer.airing_timer:90");
     expect(result.state.ventilationRequest).toBe(true);
     expect(result.state.airingTimerActive).toBe(true);
     expect(new Set(windowModes(result.state))).toEqual(new Set(["open"]));
@@ -113,6 +114,20 @@ describe("home automation simulation", () => {
     expect(result.actions).toContain("cover.set_cover_position:velux_airing_windows:50");
     expect(new Set(windowModes(result.state))).toEqual(new Set(["half"]));
     expect(result.state.ventilationRequest).toBe(true);
+  });
+
+  it("does not start scheduled airing in heavier rain above the partial-open limit", () => {
+    const result = runVeluxScheduledAiringOpen(
+      createBaseState({
+        co2: 980,
+        insideTemp: 23.8,
+        outsideTemp: 20.1,
+        precipitation: 3.2,
+        rainPartialOpenMax: 3,
+      }),
+    );
+
+    expect(result.actions).toEqual([]);
   });
 
   it("does nothing when a rainy ventilation cycle is already active at 50%", () => {
@@ -176,6 +191,7 @@ describe("home automation simulation", () => {
 
     expect(result.actions).not.toContain("cover.open_cover:velux_airing_windows");
     expect(result.actions).toContain("timer.start:timer.airing_timer");
+    expect(result.actions).toContain("timer.duration:timer.airing_timer:90");
     expect(result.actions).toContain("input_boolean.turn_on:input_boolean.velux_request_ventilation");
     expect(result.state.airingTimerActive).toBe(true);
     expect(result.state.ventilationRequest).toBe(true);
@@ -233,6 +249,41 @@ describe("home automation simulation", () => {
     expect(heatStop.state.ventilationRequest).toBe(true);
     expect(new Set(windowModes(heatStop.state))).toEqual(new Set(["open"]));
     expect(heatStop.actions).not.toContain("cover.close_cover:velux_airing_windows");
+  });
+
+  it("uses the shorter ventilation cap when outside air is already cold", () => {
+    const result = runVeluxScheduledAiringOpen(
+      createBaseState({
+        co2: 1200,
+        insideTemp: 23.8,
+        outsideTemp: 6,
+      }),
+    );
+
+    expect(result.actions).toContain("timer.duration:timer.airing_timer:45");
+  });
+
+  it("keeps shoulder cooling active below 22C when tomorrow is forecast to be hot", () => {
+    const result = runVeluxHeatStop(
+      createBaseState({
+        coolingRequest: true,
+        summerConditions: false,
+        coolingNeeded: true,
+        heatingWelcome: false,
+        tomorrowMaxTemp: 30,
+        precoolTomorrowMaxTrigger: 26,
+        insideTemp: 21.8,
+        outsideTemp: 18,
+        officeWindow: "open",
+        bathroomWindow: "open",
+        bathroomUpstairsWindow: "open",
+        guestRoomWindow: "open",
+      }),
+    );
+
+    expect(result.actions).toEqual([]);
+    expect(result.state.coolingRequest).toBe(true);
+    expect(new Set(windowModes(result.state))).toEqual(new Set(["open"]));
   });
 
   it("moves windows to flap after pure ventilation when outside is still cooler", () => {
@@ -326,6 +377,23 @@ describe("home automation simulation", () => {
     expect(result.actions).toContain("cover.set_cover_position:velux_airing_windows:50");
     expect(result.state.coolingRequest).toBe(true);
     expect(new Set(windowModes(result.state))).toEqual(new Set(["half"]));
+  });
+
+  it("does not start heat purge in heavier rain above the partial-open limit", () => {
+    const result = runVeluxHeatAiringOpen(
+      createBaseState({
+        summerConditions: true,
+        coolingNeeded: true,
+        heatingWelcome: false,
+        insideTemp: 27.2,
+        outsideTemp: 22.4,
+        globalRadiation: 80,
+        precipitation: 3.2,
+        rainPartialOpenMax: 3,
+      }),
+    );
+
+    expect(result.actions).toEqual([]);
   });
 
   it("does nothing when a rainy heat-purge cycle is already active at 50%", () => {
@@ -527,6 +595,27 @@ describe("home automation simulation", () => {
     expect(result.state.coolingRequest).toBe(false);
   });
 
+  it("stops ventilation by CO2 target without waiting for the cold-weather time cap", () => {
+    const result = runVeluxScheduledAiringClose(
+      createBaseState({
+        ventilationRequest: true,
+        intervalAiringToggle: true,
+        airingTimerActive: true,
+        co2: 480,
+        ventilationTargetCo2: 500,
+        insideTemp: 22.5,
+        outsideTemp: 14,
+        officeWindow: "open",
+        bathroomWindow: "open",
+        bathroomUpstairsWindow: "open",
+        guestRoomWindow: "open",
+      }),
+    );
+
+    expect(result.actions).toContain("cover.set_cover_position:velux_airing_windows:11");
+    expect(result.state.ventilationRequest).toBe(false);
+  });
+
   it("forces full close from flap mode when outside gets warmer later", () => {
     const result = runVeluxNoRequestClose(
       createBaseState({
@@ -559,6 +648,25 @@ describe("home automation simulation", () => {
 
     expect(result.actions).toContain("cover.close_cover:velux_airing_windows");
     expect(new Set(windowModes(result.state))).toEqual(new Set(["closed"]));
+  });
+
+  it("drops startup leftovers to flap when there is no request and outside is still cooler", () => {
+    const result = runVeluxNoRequestClose(
+      createBaseState({
+        officeWindow: "open",
+        bathroomWindow: "open",
+        bathroomUpstairsWindow: "open",
+        guestRoomWindow: "open",
+        ventilationRequest: false,
+        coolingRequest: false,
+        insideTemp: 23,
+        outsideTemp: 18,
+      }),
+      "startup",
+    );
+
+    expect(result.actions).toContain("cover.set_cover_position:velux_airing_windows:11");
+    expect(new Set(windowModes(result.state))).toEqual(new Set(["flap"]));
   });
 
   it("drops wide-open windows to flap on storm instead of forcing full close", () => {
@@ -614,6 +722,33 @@ describe("home automation simulation", () => {
     expect(new Set(windowModes(rain.state))).toEqual(new Set(["half"]));
   });
 
+  it("keeps windows at 50% when rainy ventilation transitions into rainy heat purge", () => {
+    const ventilationRain = runVeluxScheduledAiringOpen(
+      createBaseState({
+        co2: 980,
+        insideTemp: 24,
+        outsideTemp: 20,
+        precipitation: 0.3,
+        severeWeather: false,
+        weatherUnsafeForShades: false,
+      }),
+    );
+
+    const heatRain = runVeluxHeatAiringOpen({
+      ...ventilationRain.state,
+      summerConditions: true,
+      coolingNeeded: true,
+      heatingWelcome: false,
+      globalRadiation: 80,
+      insideTemp: 27,
+      outsideTemp: 22,
+    });
+
+    expect(new Set(windowModes(heatRain.state))).toEqual(new Set(["half"]));
+    expect(heatRain.actions).not.toContain("cover.open_cover:velux_airing_windows");
+    expect(heatRain.actions).toContain("input_boolean.turn_on:input_boolean.velux_request_cooling");
+  });
+
   it("does nothing on rain if request-driven windows are already at 50%", () => {
     const rain = runVeluxNoRequestClose(
       createBaseState({
@@ -629,6 +764,52 @@ describe("home automation simulation", () => {
     );
 
     expect(rain.actions).toEqual([]);
+  });
+
+  it("falls back to flap on heavier rain once precipitation exceeds the partial-open limit", () => {
+    const rain = runVeluxNoRequestClose(
+      createBaseState({
+        coolingRequest: true,
+        precipitation: 3.2,
+        rainPartialOpenMax: 3,
+        officeWindow: "open",
+        bathroomWindow: "open",
+        bathroomUpstairsWindow: "open",
+        guestRoomWindow: "open",
+        insideTemp: 24,
+        outsideTemp: 18,
+      }),
+      "rain",
+    );
+
+    expect(rain.actions).toContain("cover.set_cover_position:velux_airing_windows:11");
+    expect(new Set(windowModes(rain.state))).toEqual(new Set(["flap"]));
+  });
+
+  it("blocks immediate reopen while cooldown is active even if demand is otherwise strong", () => {
+    const scheduled = runVeluxScheduledAiringOpen(
+      createBaseState({
+        cooldownActive: true,
+        co2: 980,
+        insideTemp: 24,
+        outsideTemp: 20,
+      }),
+    );
+
+    const heat = runVeluxHeatAiringOpen(
+      createBaseState({
+        cooldownActive: true,
+        summerConditions: true,
+        coolingNeeded: true,
+        heatingWelcome: false,
+        insideTemp: 27,
+        outsideTemp: 22,
+        globalRadiation: 80,
+      }),
+    );
+
+    expect(scheduled.actions).toEqual([]);
+    expect(heat.actions).toEqual([]);
   });
 
   it("still drops windows to flap on rain when no ventilation request is active", () => {

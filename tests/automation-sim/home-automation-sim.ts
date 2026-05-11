@@ -21,11 +21,16 @@ export interface AutomationSimState {
   summerConditions: boolean;
   coolingNeeded: boolean;
   heatingWelcome: boolean;
+  tomorrowMaxTemp: number;
+  precoolTomorrowMaxTrigger: number;
   insideTemp: number;
   outsideTemp: number;
   precipitation: number;
+  rainPartialOpenMax: number;
   globalRadiation: number;
   co2: number;
+  ventilationTargetCo2: number;
+  ventilationColdOutdoorLimit: number;
   timeWithinScheduledWindow: boolean;
   cooldownActive: boolean;
   airingTimerActive: boolean;
@@ -73,11 +78,16 @@ export function createBaseState(
     summerConditions: true,
     coolingNeeded: false,
     heatingWelcome: false,
+    tomorrowMaxTemp: 28,
+    precoolTomorrowMaxTrigger: 26,
     insideTemp: 24,
     outsideTemp: 20,
     precipitation: 0,
+    rainPartialOpenMax: 3,
     globalRadiation: 120,
     co2: 450,
+    ventilationTargetCo2: 500,
+    ventilationColdOutdoorLimit: 8,
     timeWithinScheduledWindow: true,
     cooldownActive: false,
     airingTimerActive: false,
@@ -152,7 +162,14 @@ export function runVeluxScheduledAiringOpen(
   if (!next.timeWithinScheduledWindow) return { state: next, actions };
   if (!(next.co2 > 800)) return { state: next, actions };
 
-  const targetMode: WindowMode = next.precipitation > 0.1 ? "half" : "open";
+  const lightRain =
+    next.precipitation > 0.1 && next.precipitation < next.rainPartialOpenMax;
+  const dryEnough = next.precipitation <= 0.1;
+  if (!dryEnough && !lightRain) {
+    return { state: next, actions };
+  }
+
+  const targetMode: WindowMode = lightRain ? "half" : "open";
   const allOpen = allWindowsMatch(next, targetMode);
   const ventilationCycleAlreadyActive =
     next.ventilationRequest && next.airingTimerActive && next.intervalAiringToggle;
@@ -170,8 +187,10 @@ export function runVeluxScheduledAiringOpen(
     );
   }
   if (!next.airingTimerActive) {
+    const timerMinutes = next.outsideTemp < next.ventilationColdOutdoorLimit ? 45 : 90;
     next.airingTimerActive = true;
     actions.push("timer.start:timer.airing_timer");
+    actions.push(`timer.duration:timer.airing_timer:${timerMinutes}`);
   }
   if (!next.intervalAiringToggle) {
     next.intervalAiringToggle = true;
@@ -209,7 +228,14 @@ export function runVeluxHeatAiringOpen(
     return { state: next, actions };
   }
 
-  const targetMode: WindowMode = next.precipitation > 0.1 ? "half" : "open";
+  const lightRain =
+    next.precipitation > 0.1 && next.precipitation < next.rainPartialOpenMax;
+  const dryEnough = next.precipitation <= 0.1;
+  if (!dryEnough && !lightRain) {
+    return { state: next, actions };
+  }
+
+  const targetMode: WindowMode = lightRain ? "half" : "open";
   const allOpen = allWindowsMatch(next, targetMode);
   if (next.coolingRequest && allOpen) {
     return { state: next, actions };
@@ -239,7 +265,8 @@ export function runVeluxHeatStop(state: AutomationSimState): SimulationResult {
 
   const stopBecauseDeltaSmall = temperatureDelta(next) < 1;
   const stopBecauseHeatingWelcome = next.heatingWelcome;
-  const stopBecauseShoulderFloor = !next.summerConditions && next.insideTemp <= 22;
+  const stopBecauseShoulderFloor =
+    !next.summerConditions && !precoolingWorthIt(next) && next.insideTemp <= 22;
 
   if (
     !stopBecauseDeltaSmall &&
@@ -345,7 +372,11 @@ export function runVeluxNoRequestClose(
     return { state: next, actions };
   }
 
-  if (trigger === "rain" && (next.ventilationRequest || next.coolingRequest)) {
+  if (
+    trigger === "rain" &&
+    next.precipitation < next.rainPartialOpenMax &&
+    (next.ventilationRequest || next.coolingRequest)
+  ) {
     if (allWindowsMatch(next, "half")) {
       return { state: next, actions };
     }
@@ -396,4 +427,8 @@ function temperatureDelta(state: AutomationSimState): number {
 
 function outsideWarmerOrEqual(state: AutomationSimState): boolean {
   return state.outsideTemp >= state.insideTemp;
+}
+
+function precoolingWorthIt(state: AutomationSimState): boolean {
+  return state.coolingNeeded && state.tomorrowMaxTemp >= state.precoolTomorrowMaxTrigger;
 }
