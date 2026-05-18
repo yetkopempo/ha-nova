@@ -1,6 +1,8 @@
 import { describe, expect, it } from "vitest";
 
 import {
+  computeDreameBudgetOnStop,
+  computeDreameRemainingBudget,
   createBaseState,
   runEastVeluxFollowSun,
   runVeluxHeatAiringOpen,
@@ -8,6 +10,7 @@ import {
   runVeluxNoRequestClose,
   runVeluxScheduledAiringClose,
   runVeluxScheduledAiringOpen,
+  runWestInternalBlindFollowSun,
   runWeatherSafetyRetractSensitive,
   windowModes,
 } from "./home-automation-sim.js";
@@ -82,6 +85,180 @@ describe("home automation simulation", () => {
     }
   });
 
+  it("does not move west internal blinds when local guards block the automation", () => {
+    const guardedStates = [
+      createBaseState({ shadeAutoEnabled: false, sunOnWestGeom: true }),
+      createBaseState({ shadeManualOverride: true, sunOnWestGeom: true }),
+      createBaseState({ westInternalShadeEnabled: false, sunOnWestGeom: true }),
+    ];
+
+    for (const state of guardedStates) {
+      const result = runWestInternalBlindFollowSun(state);
+      expect(result.actions).toEqual([]);
+      expect(result.state.westInternalBlinds).toBe(state.westInternalBlinds);
+    }
+  });
+
+  it("does not close west internal blinds below the base-plus-offset irradiance threshold", () => {
+    const result = runWestInternalBlindFollowSun(
+      createBaseState({
+        sunOnWestGeom: true,
+        summerConditions: true,
+        coolingNeeded: true,
+        weatherState: "sunny",
+        precipitation: 0,
+        irrThreshold: 250,
+        irrThresholdInternalOffset: 500,
+        globalRadiation: 350,
+        westInternalBlinds: "open",
+      }),
+    );
+
+    expect(result.actions).toEqual([]);
+    expect(result.state.westInternalBlinds).toBe("open");
+  });
+
+  it("closes west internal blinds only after the internal offset threshold is exceeded", () => {
+    const result = runWestInternalBlindFollowSun(
+      createBaseState({
+        sunOnWestGeom: true,
+        summerConditions: true,
+        coolingNeeded: true,
+        weatherState: "sunny",
+        precipitation: 0,
+        irrThreshold: 250,
+        irrThresholdInternalOffset: 500,
+        globalRadiation: 800,
+        westInternalBlinds: "open",
+      }),
+    );
+
+    expect(result.actions).toEqual(["cover.close_cover:cover.west_internal_blinds"]);
+    expect(result.state.westInternalBlinds).toBe("closed");
+  });
+
+  it("does not spam repeated internal close commands when the blind is already closed", () => {
+    const result = runWestInternalBlindFollowSun(
+      createBaseState({
+        sunOnWestGeom: true,
+        summerConditions: true,
+        coolingNeeded: true,
+        weatherState: "sunny",
+        precipitation: 0,
+        irrThreshold: 250,
+        irrThresholdInternalOffset: 500,
+        globalRadiation: 800,
+        westInternalBlinds: "closed",
+      }),
+    );
+
+    expect(result.actions).toEqual([]);
+    expect(result.state.westInternalBlinds).toBe("closed");
+  });
+
+  it("allows cloudy weather to close west internal blinds when irradiance is above the internal threshold", () => {
+    const result = runWestInternalBlindFollowSun(
+      createBaseState({
+        sunOnWestGeom: true,
+        summerConditions: true,
+        coolingNeeded: true,
+        weatherState: "cloudy",
+        precipitation: 0,
+        irrThreshold: 250,
+        irrThresholdInternalOffset: 500,
+        globalRadiation: 800,
+        westInternalBlinds: "open",
+      }),
+    );
+
+    expect(result.actions).toEqual(["cover.close_cover:cover.west_internal_blinds"]);
+    expect(result.state.westInternalBlinds).toBe("closed");
+  });
+
+  it("does not close west internal blinds in rain even when irradiance is high", () => {
+    const result = runWestInternalBlindFollowSun(
+      createBaseState({
+        sunOnWestGeom: true,
+        summerConditions: true,
+        coolingNeeded: true,
+        weatherState: "rainy",
+        precipitation: 1.2,
+        irrThreshold: 250,
+        irrThresholdInternalOffset: 500,
+        globalRadiation: 1000,
+        westInternalBlinds: "open",
+      }),
+    );
+
+    expect(result.actions).toEqual([]);
+    expect(result.state.westInternalBlinds).toBe("open");
+  });
+
+  it("does not close west internal blinds when west geometry is not active even if irradiance is high", () => {
+    const result = runWestInternalBlindFollowSun(
+      createBaseState({
+        sunOnWestGeom: false,
+        summerConditions: true,
+        coolingNeeded: true,
+        weatherState: "sunny",
+        precipitation: 0,
+        irrThreshold: 250,
+        irrThresholdInternalOffset: 500,
+        globalRadiation: 1000,
+        westInternalBlinds: "open",
+      }),
+    );
+
+    expect(result.actions).toEqual([]);
+    expect(result.state.westInternalBlinds).toBe("open");
+  });
+
+  it("does not close west internal blinds off-season even if irradiance is high", () => {
+    const result = runWestInternalBlindFollowSun(
+      createBaseState({
+        sunOnWestGeom: true,
+        summerConditions: false,
+        coolingNeeded: true,
+        heatingWelcome: false,
+        weatherState: "sunny",
+        precipitation: 0,
+        irrThreshold: 250,
+        irrThresholdInternalOffset: 500,
+        globalRadiation: 1000,
+        westInternalBlinds: "open",
+      }),
+    );
+
+    expect(result.actions).toEqual([]);
+    expect(result.state.westInternalBlinds).toBe("open");
+  });
+
+  it("reopens west internal blinds immediately when weather or precipitation gate turns shading off", () => {
+    const initial = createBaseState({
+      sunOnWestGeom: true,
+      summerConditions: true,
+      coolingNeeded: true,
+      weatherState: "sunny",
+      precipitation: 0,
+      irrThreshold: 250,
+      irrThresholdInternalOffset: 500,
+      globalRadiation: 900,
+      westInternalBlinds: "open",
+    });
+
+    const closed = runWestInternalBlindFollowSun(initial);
+    expect(closed.state.westInternalBlinds).toBe("closed");
+
+    const reopenedByRain = runWestInternalBlindFollowSun({
+      ...closed.state,
+      weatherState: "rainy",
+      precipitation: 1.0,
+    });
+
+    expect(reopenedByRain.actions).toEqual(["cover.open_cover:cover.west_internal_blinds"]);
+    expect(reopenedByRain.state.westInternalBlinds).toBe("open");
+  });
+
   it("opens scheduled airing on high CO2 and leaves a clear trace of the request state", () => {
     const result = runVeluxScheduledAiringOpen(
       createBaseState({
@@ -99,7 +276,7 @@ describe("home automation simulation", () => {
     expect(new Set(windowModes(result.state))).toEqual(new Set(["open"]));
   });
 
-  it("opens scheduled airing only to 50% in plain rain when weather is not severe", () => {
+  it("does not start scheduled airing in rain even when weather is otherwise non-severe", () => {
     const result = runVeluxScheduledAiringOpen(
       createBaseState({
         co2: 980,
@@ -111,95 +288,46 @@ describe("home automation simulation", () => {
       }),
     );
 
-    expect(result.actions).toContain("cover.set_cover_position:velux_airing_windows:50");
-    expect(new Set(windowModes(result.state))).toEqual(new Set(["half"]));
-    expect(result.state.ventilationRequest).toBe(true);
+    expect(result.actions).toEqual([]);
   });
 
-  it("does not start scheduled airing in heavier rain above the partial-open limit", () => {
+  it("does not start scheduled airing in heavier rain either", () => {
     const result = runVeluxScheduledAiringOpen(
       createBaseState({
         co2: 980,
         insideTemp: 23.8,
         outsideTemp: 20.1,
         precipitation: 3.2,
-        rainPartialOpenMax: 3,
       }),
     );
 
     expect(result.actions).toEqual([]);
   });
 
-  it("does nothing when a rainy ventilation cycle is already active at 50%", () => {
+  it("does not restart scheduled airing while any airing request is already active", () => {
     const result = runVeluxScheduledAiringOpen(
       createBaseState({
         co2: 980,
         insideTemp: 23.8,
         outsideTemp: 20.1,
-        precipitation: 0.3,
         ventilationRequest: true,
         airingTimerActive: true,
         intervalAiringToggle: true,
-        officeWindow: "half",
-        bathroomWindow: "half",
-        bathroomUpstairsWindow: "half",
-        guestRoomWindow: "half",
+        officeWindow: "open",
+        bathroomWindow: "open",
+        bathroomUpstairsWindow: "open",
+        guestRoomWindow: "open",
       }),
     );
 
     expect(result.actions).toEqual([]);
-  });
-
-  it("repairs scheduled-airing flags when windows are already fully open", () => {
-    const result = runVeluxScheduledAiringOpen(
-      createBaseState({
-        co2: 980,
-        insideTemp: 23.8,
-        outsideTemp: 20.1,
-        officeWindow: "open",
-        bathroomWindow: "open",
-        bathroomUpstairsWindow: "open",
-        guestRoomWindow: "open",
-        airingTimerActive: true,
-        intervalAiringToggle: false,
-        ventilationRequest: true,
-      }),
-    );
-
-    expect(result.actions).not.toContain("cover.open_cover:velux_airing_windows");
-    expect(result.actions).toContain("input_boolean.turn_on:input_boolean.interval_airing_toggle");
-    expect(result.state.airingTimerActive).toBe(true);
-    expect(result.state.intervalAiringToggle).toBe(true);
-    expect(result.state.ventilationRequest).toBe(true);
-  });
-
-  it("repairs scheduled-airing timer and request when windows are already open", () => {
-    const result = runVeluxScheduledAiringOpen(
-      createBaseState({
-        co2: 980,
-        insideTemp: 23.8,
-        outsideTemp: 20.1,
-        officeWindow: "open",
-        bathroomWindow: "open",
-        bathroomUpstairsWindow: "open",
-        guestRoomWindow: "open",
-        airingTimerActive: false,
-        intervalAiringToggle: true,
-        ventilationRequest: false,
-      }),
-    );
-
-    expect(result.actions).not.toContain("cover.open_cover:velux_airing_windows");
-    expect(result.actions).toContain("timer.start:timer.airing_timer");
-    expect(result.actions).toContain("timer.duration:timer.airing_timer:90");
-    expect(result.actions).toContain("input_boolean.turn_on:input_boolean.velux_request_ventilation");
-    expect(result.state.airingTimerActive).toBe(true);
-    expect(result.state.ventilationRequest).toBe(true);
   });
 
   it("blocks scheduled airing when any prerequisite gate fails", () => {
     const blockedStates = [
       createBaseState({ cooldownActive: true, co2: 980 }),
+      createBaseState({ ventilationRequest: true, co2: 980 }),
+      createBaseState({ coolingRequest: true, co2: 980 }),
       createBaseState({ weatherUnsafeForShades: true, co2: 980 }),
       createBaseState({ severeWeather: true, co2: 980 }),
       createBaseState({ insideTemp: 20, outsideTemp: 21, co2: 980 }),
@@ -211,9 +339,7 @@ describe("home automation simulation", () => {
     for (const state of blockedStates) {
       const result = runVeluxScheduledAiringOpen(state);
       expect(result.actions).toEqual([]);
-      expect(result.state.ventilationRequest).toBe(false);
-      expect(result.state.airingTimerActive).toBe(false);
-      expect(new Set(windowModes(result.state))).toEqual(new Set(["closed"]));
+      expect(result.state).toEqual(state);
     }
   });
 
@@ -359,7 +485,7 @@ describe("home automation simulation", () => {
     expect(blocked.state.coolingRequest).toBe(false);
   });
 
-  it("opens heat purge only to 50% in plain rain when weather is not severe", () => {
+  it("does not start heat purge in rain even when weather is otherwise non-severe", () => {
     const result = runVeluxHeatAiringOpen(
       createBaseState({
         summerConditions: true,
@@ -374,12 +500,10 @@ describe("home automation simulation", () => {
       }),
     );
 
-    expect(result.actions).toContain("cover.set_cover_position:velux_airing_windows:50");
-    expect(result.state.coolingRequest).toBe(true);
-    expect(new Set(windowModes(result.state))).toEqual(new Set(["half"]));
+    expect(result.actions).toEqual([]);
   });
 
-  it("does not start heat purge in heavier rain above the partial-open limit", () => {
+  it("does not start heat purge in heavier rain either", () => {
     const result = runVeluxHeatAiringOpen(
       createBaseState({
         summerConditions: true,
@@ -389,14 +513,13 @@ describe("home automation simulation", () => {
         outsideTemp: 22.4,
         globalRadiation: 80,
         precipitation: 3.2,
-        rainPartialOpenMax: 3,
       }),
     );
 
     expect(result.actions).toEqual([]);
   });
 
-  it("does nothing when a rainy heat-purge cycle is already active at 50%", () => {
+  it("does not try to reopen heat purge during rain when cooling is already active", () => {
     const result = runVeluxHeatAiringOpen(
       createBaseState({
         summerConditions: true,
@@ -407,10 +530,10 @@ describe("home automation simulation", () => {
         globalRadiation: 80,
         precipitation: 0.3,
         coolingRequest: true,
-        officeWindow: "half",
-        bathroomWindow: "half",
-        bathroomUpstairsWindow: "half",
-        guestRoomWindow: "half",
+        officeWindow: "flap",
+        bathroomWindow: "flap",
+        bathroomUpstairsWindow: "flap",
+        guestRoomWindow: "flap",
       }),
     );
 
@@ -686,7 +809,7 @@ describe("home automation simulation", () => {
     expect(new Set(windowModes(storm.state))).toEqual(new Set(["flap"]));
   });
 
-  it("drops windows to 50% on rain while a pure ventilation request is still active", () => {
+  it("drops windows to flap on rain while a pure ventilation request is still active", () => {
     const rain = runVeluxNoRequestClose(
       createBaseState({
         ventilationRequest: true,
@@ -700,11 +823,11 @@ describe("home automation simulation", () => {
       "rain",
     );
 
-    expect(rain.actions).toContain("cover.set_cover_position:velux_airing_windows:50");
-    expect(new Set(windowModes(rain.state))).toEqual(new Set(["half"]));
+    expect(rain.actions).toContain("cover.set_cover_position:velux_airing_windows:11");
+    expect(new Set(windowModes(rain.state))).toEqual(new Set(["flap"]));
   });
 
-  it("drops windows to 50% on rain while a pure cooling request is still active", () => {
+  it("drops windows to flap on rain while a pure cooling request is still active", () => {
     const rain = runVeluxNoRequestClose(
       createBaseState({
         coolingRequest: true,
@@ -718,11 +841,11 @@ describe("home automation simulation", () => {
       "rain",
     );
 
-    expect(rain.actions).toContain("cover.set_cover_position:velux_airing_windows:50");
-    expect(new Set(windowModes(rain.state))).toEqual(new Set(["half"]));
+    expect(rain.actions).toContain("cover.set_cover_position:velux_airing_windows:11");
+    expect(new Set(windowModes(rain.state))).toEqual(new Set(["flap"]));
   });
 
-  it("keeps windows at 50% when rainy ventilation transitions into rainy heat purge", () => {
+  it("does not switch rainy ventilation into rainy heat purge", () => {
     const ventilationRain = runVeluxScheduledAiringOpen(
       createBaseState({
         co2: 980,
@@ -744,19 +867,18 @@ describe("home automation simulation", () => {
       outsideTemp: 22,
     });
 
-    expect(new Set(windowModes(heatRain.state))).toEqual(new Set(["half"]));
-    expect(heatRain.actions).not.toContain("cover.open_cover:velux_airing_windows");
-    expect(heatRain.actions).toContain("input_boolean.turn_on:input_boolean.velux_request_cooling");
+    expect(ventilationRain.actions).toEqual([]);
+    expect(heatRain.actions).toEqual([]);
   });
 
-  it("does nothing on rain if request-driven windows are already at 50%", () => {
+  it("does nothing on rain if request-driven windows are already at flap", () => {
     const rain = runVeluxNoRequestClose(
       createBaseState({
         coolingRequest: true,
-        officeWindow: "half",
-        bathroomWindow: "half",
-        bathroomUpstairsWindow: "half",
-        guestRoomWindow: "half",
+        officeWindow: "flap",
+        bathroomWindow: "flap",
+        bathroomUpstairsWindow: "flap",
+        guestRoomWindow: "flap",
         insideTemp: 24,
         outsideTemp: 18,
       }),
@@ -764,26 +886,6 @@ describe("home automation simulation", () => {
     );
 
     expect(rain.actions).toEqual([]);
-  });
-
-  it("falls back to flap on heavier rain once precipitation exceeds the partial-open limit", () => {
-    const rain = runVeluxNoRequestClose(
-      createBaseState({
-        coolingRequest: true,
-        precipitation: 3.2,
-        rainPartialOpenMax: 3,
-        officeWindow: "open",
-        bathroomWindow: "open",
-        bathroomUpstairsWindow: "open",
-        guestRoomWindow: "open",
-        insideTemp: 24,
-        outsideTemp: 18,
-      }),
-      "rain",
-    );
-
-    expect(rain.actions).toContain("cover.set_cover_position:velux_airing_windows:11");
-    expect(new Set(windowModes(rain.state))).toEqual(new Set(["flap"]));
   });
 
   it("blocks immediate reopen while cooldown is active even if demand is otherwise strong", () => {
@@ -1009,5 +1111,62 @@ describe("home automation simulation", () => {
     expect(result.state.ventilationRequest).toBe(true);
     expect(result.state.airingTimerActive).toBe(true);
     expect(new Set(windowModes(result.state))).toEqual(new Set(["open"]));
+  });
+
+  it("consumes the shared Dreame drying budget from wall-clock time after a fresh start", () => {
+    const result = computeDreameBudgetOnStop({
+      doneOffset: 0,
+      freshStartTimestamp: 0,
+      resumeStartTimestamp: 0,
+      nowTimestamp: 0,
+    });
+    expect(result.newOffset).toBe(0);
+    expect(result.remainingSeconds).toBe(10800);
+
+    const ninetyMinutes = computeDreameBudgetOnStop({
+      doneOffset: 0,
+      freshStartTimestamp: 1_000,
+      nowTimestamp: 1_000 + 5_400,
+    });
+
+    expect(ninetyMinutes.elapsedSeconds).toBe(5400);
+    expect(ninetyMinutes.elapsedPercent).toBe(50);
+    expect(ninetyMinutes.newOffset).toBe(50);
+    expect(ninetyMinutes.remainingPercent).toBe(50);
+    expect(ninetyMinutes.remainingSeconds).toBe(5400);
+    expect(ninetyMinutes.remainingHms).toBe("01:30:00");
+  });
+
+  it("continues spending the same Dreame budget after resume and clamps at 100 percent", () => {
+    const resumed = computeDreameBudgetOnStop({
+      doneOffset: 50,
+      resumeStartTimestamp: 2_000,
+      nowTimestamp: 2_000 + 1_800,
+    });
+
+    expect(resumed.elapsedPercent).toBe(17);
+    expect(resumed.newOffset).toBe(67);
+    expect(resumed.remainingPercent).toBe(33);
+    expect(resumed.remainingHms).toBe("00:59:24");
+
+    const overrun = computeDreameBudgetOnStop({
+      doneOffset: 80,
+      resumeStartTimestamp: 3_000,
+      nowTimestamp: 3_000 + 10_800,
+    });
+
+    expect(overrun.newOffset).toBe(100);
+    expect(overrun.remainingPercent).toBe(0);
+    expect(overrun.remainingSeconds).toBe(0);
+    expect(overrun.remainingHms).toBe("00:00:00");
+  });
+
+  it("computes the remaining Dreame drying budget directly from the shared offset", () => {
+    const result = computeDreameRemainingBudget(67);
+
+    expect(result.newOffset).toBe(67);
+    expect(result.remainingPercent).toBe(33);
+    expect(result.remainingSeconds).toBe(3564);
+    expect(result.remainingHms).toBe("00:59:24");
   });
 });

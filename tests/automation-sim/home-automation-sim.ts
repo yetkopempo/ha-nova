@@ -1,5 +1,16 @@
 export type ShadeMode = "open" | "closed";
 export type WindowMode = "closed" | "flap" | "half" | "open";
+export type WeatherState =
+  | "sunny"
+  | "partlycloudy"
+  | "cloudy"
+  | "rainy"
+  | "pouring"
+  | "windy"
+  | "lightning"
+  | "hail"
+  | "snowy"
+  | "other";
 export type VeluxCloseTrigger =
   | "outside_warmer"
   | "no_request"
@@ -11,13 +22,17 @@ export interface AutomationSimState {
   shadeAutoEnabled: boolean;
   shadeManualOverride: boolean;
   shadeEastEnabled: boolean;
+  westInternalShadeEnabled: boolean;
   weatherSafetyEnabled: boolean;
   directSunEast: boolean;
   directSunWest: boolean;
+  sunOnWestGeom: boolean;
   weatherUnsafeForShades: boolean;
   severeWeather: boolean;
+  weatherState: WeatherState;
   eastShades: ShadeMode;
   westVeluxShades: ShadeMode;
+  westInternalBlinds: ShadeMode;
   summerConditions: boolean;
   coolingNeeded: boolean;
   heatingWelcome: boolean;
@@ -26,8 +41,9 @@ export interface AutomationSimState {
   insideTemp: number;
   outsideTemp: number;
   precipitation: number;
-  rainPartialOpenMax: number;
   globalRadiation: number;
+  irrThreshold: number;
+  irrThresholdInternalOffset: number;
   co2: number;
   ventilationTargetCo2: number;
   ventilationColdOutdoorLimit: number;
@@ -46,6 +62,22 @@ export interface AutomationSimState {
 export interface SimulationResult {
   state: AutomationSimState;
   actions: string[];
+}
+
+export interface DreameDryingBudgetInput {
+  doneOffset: number;
+  nowTimestamp: number;
+  freshStartTimestamp?: number;
+  resumeStartTimestamp?: number;
+}
+
+export interface DreameDryingBudgetSnapshot {
+  elapsedSeconds: number;
+  elapsedPercent: number;
+  newOffset: number;
+  remainingPercent: number;
+  remainingSeconds: number;
+  remainingHms: string;
 }
 
 type WindowKey =
@@ -68,13 +100,17 @@ export function createBaseState(
     shadeAutoEnabled: true,
     shadeManualOverride: false,
     shadeEastEnabled: true,
+    westInternalShadeEnabled: true,
     weatherSafetyEnabled: true,
     directSunEast: false,
     directSunWest: false,
+    sunOnWestGeom: false,
     weatherUnsafeForShades: false,
     severeWeather: false,
+    weatherState: "sunny",
     eastShades: "open",
     westVeluxShades: "open",
+    westInternalBlinds: "open",
     summerConditions: true,
     coolingNeeded: false,
     heatingWelcome: false,
@@ -83,8 +119,9 @@ export function createBaseState(
     insideTemp: 24,
     outsideTemp: 20,
     precipitation: 0,
-    rainPartialOpenMax: 3,
     globalRadiation: 120,
+    irrThreshold: 250,
+    irrThresholdInternalOffset: 500,
     co2: 450,
     ventilationTargetCo2: 500,
     ventilationColdOutdoorLimit: 8,
@@ -148,6 +185,33 @@ export function runWeatherSafetyRetractSensitive(
   return { state: next, actions };
 }
 
+export function runWestInternalBlindFollowSun(
+  state: AutomationSimState,
+): SimulationResult {
+  const next = cloneState(state);
+  const actions: string[] = [];
+
+  if (!next.shadeAutoEnabled || next.shadeManualOverride || !next.westInternalShadeEnabled) {
+    return { state: next, actions };
+  }
+
+  const shouldClose = directSunWestInternalFinal(next);
+  if (shouldClose) {
+    if (next.westInternalBlinds !== "closed") {
+      next.westInternalBlinds = "closed";
+      actions.push("cover.close_cover:cover.west_internal_blinds");
+    }
+    return { state: next, actions };
+  }
+
+  if (next.westInternalBlinds !== "open") {
+    next.westInternalBlinds = "open";
+    actions.push("cover.open_cover:cover.west_internal_blinds");
+  }
+
+  return { state: next, actions };
+}
+
 export function runVeluxScheduledAiringOpen(
   state: AutomationSimState,
 ): SimulationResult {
@@ -155,36 +219,22 @@ export function runVeluxScheduledAiringOpen(
   const actions: string[] = [];
 
   if (next.cooldownActive) return { state: next, actions };
+  if (next.ventilationRequest || next.coolingRequest) return { state: next, actions };
   if (next.weatherUnsafeForShades) return { state: next, actions };
   if (next.severeWeather) return { state: next, actions };
   if (!(next.insideTemp > next.outsideTemp)) return { state: next, actions };
   if (!(next.outsideTemp < 24)) return { state: next, actions };
   if (!next.timeWithinScheduledWindow) return { state: next, actions };
   if (!(next.co2 > 800)) return { state: next, actions };
-
-  const lightRain =
-    next.precipitation > 0.1 && next.precipitation < next.rainPartialOpenMax;
-  const dryEnough = next.precipitation <= 0.1;
-  if (!dryEnough && !lightRain) {
+  if (!(next.precipitation <= 0.1)) {
     return { state: next, actions };
   }
 
-  const targetMode: WindowMode = lightRain ? "half" : "open";
-  const allOpen = allWindowsMatch(next, targetMode);
-  const ventilationCycleAlreadyActive =
-    next.ventilationRequest && next.airingTimerActive && next.intervalAiringToggle;
-
-  if (ventilationCycleAlreadyActive && allOpen) {
-    return { state: next, actions };
-  }
+  const allOpen = allWindowsMatch(next, "open");
 
   if (!allOpen) {
-    setAllAiringWindows(next, targetMode);
-    actions.push(
-      targetMode === "half"
-        ? "cover.set_cover_position:velux_airing_windows:50"
-        : "cover.open_cover:velux_airing_windows",
-    );
+    setAllAiringWindows(next, "open");
+    actions.push("cover.open_cover:velux_airing_windows");
   }
   if (!next.airingTimerActive) {
     const timerMinutes = next.outsideTemp < next.ventilationColdOutdoorLimit ? 45 : 90;
@@ -228,26 +278,18 @@ export function runVeluxHeatAiringOpen(
     return { state: next, actions };
   }
 
-  const lightRain =
-    next.precipitation > 0.1 && next.precipitation < next.rainPartialOpenMax;
-  const dryEnough = next.precipitation <= 0.1;
-  if (!dryEnough && !lightRain) {
+  if (!(next.precipitation <= 0.1)) {
     return { state: next, actions };
   }
 
-  const targetMode: WindowMode = lightRain ? "half" : "open";
-  const allOpen = allWindowsMatch(next, targetMode);
+  const allOpen = allWindowsMatch(next, "open");
   if (next.coolingRequest && allOpen) {
     return { state: next, actions };
   }
 
   if (!allOpen) {
-    setAllAiringWindows(next, targetMode);
-    actions.push(
-      targetMode === "half"
-        ? "cover.set_cover_position:velux_airing_windows:50"
-        : "cover.open_cover:velux_airing_windows",
-    );
+    setAllAiringWindows(next, "open");
+    actions.push("cover.open_cover:velux_airing_windows");
   }
   if (!next.coolingRequest) {
     next.coolingRequest = true;
@@ -372,20 +414,6 @@ export function runVeluxNoRequestClose(
     return { state: next, actions };
   }
 
-  if (
-    trigger === "rain" &&
-    next.precipitation < next.rainPartialOpenMax &&
-    (next.ventilationRequest || next.coolingRequest)
-  ) {
-    if (allWindowsMatch(next, "half")) {
-      return { state: next, actions };
-    }
-
-    setAllAiringWindows(next, "half");
-    actions.push("cover.set_cover_position:velux_airing_windows:50");
-    return { state: next, actions };
-  }
-
   if (allWindowsMatch(next, "flap")) {
     return { state: next, actions };
   }
@@ -401,6 +429,28 @@ export function runVeluxNoRequestClose(
 
 export function windowModes(state: AutomationSimState): WindowMode[] {
   return AIRING_WINDOWS.map((key) => state[key]);
+}
+
+export function computeDreameBudgetOnStop(
+  input: DreameDryingBudgetInput,
+): DreameDryingBudgetSnapshot {
+  const totalSeconds = 3 * 60 * 60;
+  const offset = clamp(input.doneOffset, 0, 100);
+  const startedTs = Math.max(input.freshStartTimestamp ?? 0, input.resumeStartTimestamp ?? 0);
+  const elapsedSecondsRaw = startedTs > 0 ? input.nowTimestamp - startedTs : 0;
+  const elapsedSeconds = clamp(elapsedSecondsRaw, 0, totalSeconds);
+  const elapsedPercent = Math.round((elapsedSeconds / totalSeconds) * 100);
+  const remainingPercentBefore = Math.max(0, 100 - offset);
+  const consumedPercent = Math.min(remainingPercentBefore, elapsedPercent);
+  const newOffset = clamp(offset + consumedPercent, 0, 100);
+
+  return buildDreameBudgetSnapshot(newOffset, elapsedSeconds, elapsedPercent);
+}
+
+export function computeDreameRemainingBudget(
+  doneOffset: number,
+): DreameDryingBudgetSnapshot {
+  return buildDreameBudgetSnapshot(clamp(doneOffset, 0, 100), 0, 0);
 }
 
 function cloneState(state: AutomationSimState): AutomationSimState {
@@ -431,4 +481,57 @@ function outsideWarmerOrEqual(state: AutomationSimState): boolean {
 
 function precoolingWorthIt(state: AutomationSimState): boolean {
   return state.coolingNeeded && state.tomorrowMaxTemp >= state.precoolTomorrowMaxTrigger;
+}
+
+function weatherSupportsSunShading(state: AutomationSimState): boolean {
+  return ["sunny", "partlycloudy", "cloudy"].includes(state.weatherState);
+}
+
+function precipitationAllowsSunShading(state: AutomationSimState): boolean {
+  return state.precipitation <= 0.1;
+}
+
+function irradianceAboveInternalThreshold(state: AutomationSimState): boolean {
+  return state.globalRadiation >= state.irrThreshold + state.irrThresholdInternalOffset;
+}
+
+function directSunWestInternalFinal(state: AutomationSimState): boolean {
+  return (
+    state.sunOnWestGeom &&
+    irradianceAboveInternalThreshold(state) &&
+    weatherSupportsSunShading(state) &&
+    precipitationAllowsSunShading(state) &&
+    state.summerConditions &&
+    state.coolingNeeded
+  );
+}
+
+function buildDreameBudgetSnapshot(
+  newOffset: number,
+  elapsedSeconds: number,
+  elapsedPercent: number,
+): DreameDryingBudgetSnapshot {
+  const totalSeconds = 3 * 60 * 60;
+  const remainingPercent = Math.max(0, 100 - newOffset);
+  const remainingSeconds = Math.round(totalSeconds * (remainingPercent / 100));
+  const hh = Math.floor(remainingSeconds / 3600);
+  const mm = Math.floor((remainingSeconds % 3600) / 60);
+  const ss = Math.floor(remainingSeconds % 60);
+
+  return {
+    elapsedSeconds,
+    elapsedPercent,
+    newOffset,
+    remainingPercent,
+    remainingSeconds,
+    remainingHms: `${pad2(hh)}:${pad2(mm)}:${pad2(ss)}`,
+  };
+}
+
+function clamp(value: number, min: number, max: number): number {
+  return Math.min(max, Math.max(min, value));
+}
+
+function pad2(value: number): string {
+  return value.toString().padStart(2, "0");
 }
