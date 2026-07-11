@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 
 import {
+  computeIrradianceGateWithHysteresis,
   computeDreameBudgetOnStop,
   computeDreameRemainingBudget,
   createBaseState,
@@ -1168,5 +1169,47 @@ describe("home automation simulation", () => {
     expect(result.remainingPercent).toBe(33);
     expect(result.remainingSeconds).toBe(3564);
     expect(result.remainingHms).toBe("00:59:24");
+  });
+
+  it("keeps the irradiance gate on through a small dip once the gate is already active", () => {
+    const result = computeIrradianceGateWithHysteresis({
+      currentIrradiance: 430,
+      onThreshold: 500,
+      offDelta: 150,
+      wasOn: true,
+    });
+
+    expect(result.offThreshold).toBe(350);
+    expect(result.isOn).toBe(true);
+  });
+
+  it("turns the irradiance gate off only once irradiance falls below the lower off threshold", () => {
+    const result = computeIrradianceGateWithHysteresis({
+      currentIrradiance: 323,
+      onThreshold: 500,
+      offDelta: 150,
+      wasOn: true,
+    });
+
+    expect(result.offThreshold).toBe(350);
+    expect(result.isOn).toBe(false);
+  });
+
+  it("still requires the full on threshold to activate from an off state", () => {
+    const belowOn = computeIrradianceGateWithHysteresis({
+      currentIrradiance: 430,
+      onThreshold: 500,
+      offDelta: 150,
+      wasOn: false,
+    });
+    const aboveOn = computeIrradianceGateWithHysteresis({
+      currentIrradiance: 733,
+      onThreshold: 500,
+      offDelta: 150,
+      wasOn: false,
+    });
+
+    expect(belowOn.isOn).toBe(false);
+    expect(aboveOn.isOn).toBe(true);
   });
 });

@@ -80,6 +80,13 @@ export interface DreameDryingBudgetSnapshot {
   remainingHms: string;
 }
 
+export interface IrradianceHysteresisInput {
+  currentIrradiance: number;
+  onThreshold: number;
+  offDelta: number;
+  wasOn: boolean;
+}
+
 type WindowKey =
   | "officeWindow"
   | "bathroomWindow"
@@ -451,6 +458,19 @@ export function computeDreameRemainingBudget(
   doneOffset: number,
 ): DreameDryingBudgetSnapshot {
   return buildDreameBudgetSnapshot(clamp(doneOffset, 0, 100), 0, 0);
+}
+
+export function computeIrradianceGateWithHysteresis(
+  input: IrradianceHysteresisInput,
+): { isOn: boolean; offThreshold: number } {
+  const offThreshold = Math.max(0, input.onThreshold - input.offDelta);
+
+  return {
+    isOn: input.wasOn
+      ? input.currentIrradiance >= offThreshold
+      : input.currentIrradiance >= input.onThreshold,
+    offThreshold,
+  };
 }
 
 function cloneState(state: AutomationSimState): AutomationSimState {
