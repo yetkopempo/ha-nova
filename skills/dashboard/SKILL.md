@@ -69,6 +69,7 @@ Critical behavior:
 - `lovelace/dashboards/list` is the source of truth for `dashboard_id`, `url_path`, and `mode`
 - `lovelace/config/delete` is not the dashboard delete path for this skill
 - `lovelace/resources` shows installed Lovelace resources, but that alone is not proof that a custom-card schema is safe to invent
+- `lovelace/config/save` success, including `data: null`, is provisional until read-back matches
 
 ## Flow
 
@@ -103,6 +104,7 @@ Critical behavior:
      - jq filters must null-guard absent structure keys: empty dashboards have no `views` — iterate `(.views // [])[]`, never bare `.views[]`; same for `.cards` and `.badges`
      - resolve the exact target by view, title/heading text, entity reference, card type, or explicit position
      - merge the requested change in memory
+     - validate the final JSON payload before sending it
      - preview a concise diff/excerpt
      - confirm this exact preview
      - save the full merged config with `lovelace/config/save`
@@ -120,6 +122,7 @@ Critical behavior:
    - create / metadata update / delete: verify through `lovelace/dashboards/list`
    - resource create/update/delete: verify through `lovelace/resources`
    - content update: verify through `lovelace/config`
+   - never treat the save response alone as proof that dashboard content landed
    - content update must confirm both the intended field change and unrelated-view survival
 6. If verification fails, stop and report the mismatch. Do not retry by guessing.
 

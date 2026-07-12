@@ -30,6 +30,23 @@ Before HA operations in this session:
 
 Do not ask user to paste tokens in chat.
 
+If the CLI works in the user's interactive terminal but fails in the agent shell
+with an executable/platform or permission error, treat that as an execution-
+context problem first. Do not repeatedly reinstall HA NOVA or declare the Relay
+broken; ask the user to run the exact relay command in the known-good terminal.
+
+## Relay-First Config Safety (Critical)
+
+When Relay is healthy and a dedicated HA NOVA skill covers the operation, use
+that skill and Relay. Do not patch live `/config/*.yaml` as a substitute.
+
+If direct YAML editing is unavoidable for an unsupported surface:
+- work on a local copy first
+- validate the candidate before copy-back
+- keep a timestamped backup of the live file
+- require Home Assistant config check plus reload or restart
+- treat the change as live only after read-back or runtime verification
+
 ## Self-Update
 
 Before the first HA task in a session:
@@ -64,6 +81,10 @@ Rules:
 - Prefer `--jq` or `--jq-file` over shell pipes when filtering relay output.
 - Prefer `ha-nova relay jq --file <result-file> length` for simple counts and `--jq-file <filter-file>` for non-trivial follow-up transforms.
 - On Windows PowerShell, never chain commands with `&&` or `||`; run separate shell commands instead.
+- On Windows PowerShell, write relay JSON payloads as ASCII when possible or
+  UTF-8 without BOM. Windows PowerShell 5.1 `Set-Content -Encoding utf8` writes
+  a BOM and can cause `INVALID_JSON`; use
+  `[System.IO.File]::WriteAllText($path, $json, [System.Text.UTF8Encoding]::new($false))`.
 - Never call external `jq`; use relay-native `--jq` / `--jq-file` or `ha-nova relay jq`.
 - When a filter contains `select`, `test`, `startswith`, or more than one pipeline stage, default to `--jq-file` even if inline quoting might work.
 - Use native file-writing and file-reading tools for temp files. Do not teach `cat`, heredocs, Python, or Node as the primary JSON path.
@@ -78,6 +99,7 @@ Rules:
 - Correct invalid Home Assistant premises explicitly.
 - Do it briefly and technically.
 - Preview every write payload.
+- Do not bypass Relay with a live YAML edit when a dedicated HA NOVA skill owns the operation.
 - Ask exactly one blocking question only if ambiguity remains.
 - Failure format must include:
   - what failed

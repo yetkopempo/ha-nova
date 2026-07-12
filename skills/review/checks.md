@@ -22,7 +22,7 @@ Self-contained catalog: load this file before evaluating findings — from `skil
 ## Application (family matrix + evidence boundaries)
 
 **Apply these families by domain:**
-- Automation: S-01..S-03, R-01..R-28, P-01..P-05, M-01..M-05
+- Automation: S-01..S-03, R-01..R-29, P-01..P-05, M-01..M-05
 - Script: automation families plus F-01..F-08
 - Helper (storage-based family): H-01..H-10
 - Helper (config-entry family): minimal config-entry review
@@ -42,6 +42,7 @@ Self-contained catalog: load this file before evaluating findings — from `skil
 - R-23 applies only to boolean-like templates compared to string boolean literals (`'True'`, `'true'`, `'False'`, `'false'`) in either comparison direction. Do not flag bare boolean checks such as `is true` or `== true`.
 - R-24 is advisory only and applies only when a capacity-like variable reads an `available_energy` source. Do not hard-code integration-specific replacement entities.
 - R-25 applies only to pasted or draft YAML containing `platform: template` entity definitions (domain-level blocks or bare `!include`-file lists); configs read back from HA never carry this syntax. When it fires, fetch the HA version via `/api/config` on demand and phrase the finding version-sensitively (removed as of HA 2026.6; deprecated 2025.12–2026.5; still current earlier — see the R-25 Evidence Boundary in `skills/review/checks.md`).
+- R-29 applies only to contradictory fixed `condition: state` checks on the same `entity_id` inside one implicit or explicit AND scope. Skip OR scopes and checks separated across distinct branches.
 - M-05 is a modernize advisory for legacy automation keys (`platform:` in triggers, singular `trigger:`/`condition:`/`action:` blocks). Mention once, never as an error, never rewrite just to modernize.
 
 **Live helper evidence for H-09/H-10:**
@@ -87,6 +88,7 @@ Self-contained catalog: load this file before evaluating findings — from `skil
 - R-26 [MEDIUM → HIGH]: Exact-state equality narrower than the stated intent — a condition/trigger pins one literal state (classic: `== 'not_home'`) on a domain whose runtime states exceed a simple pair (person/device_tracker report named zones as states; media_player, vacuum, climate carry multi-state enums), while the user's stated intent is the broader category ("nobody home", "the TV is off" — which `standby`/`idle` also satisfy). The config is valid, saves, reloads, and read-back matches — it just never matches legitimate runtime states (a person at zone `work` has state `work`, not `not_home`). Fix: express the category (`!= 'home'` for away-semantics, `zone.home` person count for nobody-home, negations over enumerations). Default MEDIUM; escalate to HIGH when the narrow comparison gates the automation's core purpose. See R-26 Evidence Boundary.
 - R-27 [MEDIUM]: Fixed `delay:` standing in for asynchronous completion — an action starts an asynchronous operation (non-blocking `script.turn_on`, a device command that takes variable time) and a following fixed `delay:` is the only thing "guaranteeing" completion before dependent actions run. The delay documents a hope, not a fact. Fix: `wait_template`/`wait_for_trigger` on the actual completion signal, with `timeout:` (R-04) and a defined timeout path. Do not flag delays that are themselves the intent (light on for 5 minutes).
 - R-28 [MEDIUM]: Startup race — a `trigger: homeassistant` / `event: start` path immediately reads integration-backed entity states in conditions or actions. Right after startup those states can be `unknown`, `unavailable`, or stale-restored before their integration first updates. Fix: guard with an availability wait (`wait_template` on `has_value(...)` with timeout) or accept-and-document the race. Helpers restore their own state and rarely need the guard; template sensors inherit the race from their integration-backed dependencies.
+- R-29 [HIGH]: Contradictory fixed state conditions in one conjunction — the same `entity_id` is required to have mutually exclusive literal states inside one implicit or explicit AND scope, making the branch unreachable. Example: one branch requires the same binary sensor to be both `on` and `off`. Fix: put intentional alternatives under one `condition: or` block, or remove the contradictory requirement. See R-29 Evidence Boundary.
 
 ## R-02 Evidence Boundary
 
@@ -254,6 +256,19 @@ Self-trigger / feedback loop = the automation triggers on an entity that it also
 - This is a static check: it cannot prove which zones exist. Phrase it as "this
   comparison misses valid states like named zones" and show the category-safe
   form; never claim the automation is currently broken.
+
+## R-29 Evidence Boundary
+
+- Evaluate one conjunction scope at a time: the root `conditions:` list or one
+  explicit `condition: and` block.
+- Collect only native `condition: state` checks with exact `entity_id` matches
+  and fixed literal state values inside that scope.
+- Flag only mutually exclusive requirements for the same entity, such as `on`
+  and `off`. Skip numeric, template, device, and other condition types.
+- Skip `condition: or` scopes and contradictions separated across different
+  `choose` branches or other scopes that do not have to be true together.
+- Recommend moving intentional alternatives under `condition: or` or retaining
+  only the intended fixed state requirement.
 
 ## Performance (Medium)
 

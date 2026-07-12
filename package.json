@@ -61,6 +61,8 @@
     "smoke:app:run": "bash scripts/smoke/app-local-run.sh",
     "smoke:app:http": "bash scripts/smoke/app-http-smoke.sh",
     "test": "npm run test:safe",
+    "test:automation-sim": "vitest run tests/automation-sim/home-automation-sim.test.ts",
+    "test:automation-sim:coverage": "vitest run tests/automation-sim/home-automation-sim.test.ts --coverage.enabled true --coverage.provider v8",
     "test:cli": "cd cli && go test ./...",
     "test:desktop:macos": "bash scripts/dev/macos-private-rc-suite.sh",
     "test:desktop:linux:antigravity": "HA_NOVA_LIVE_SETUP_CMD='HA_NOVA_NO_BROWSER=1 ha-nova setup antigravity' bash scripts/smoke/linux-headless-setup-check.sh",
@@ -100,6 +102,7 @@
   "devDependencies": {
     "@types/node": "^25.9.5",
     "@types/ws": "^8.18.1",
+    "@vitest/coverage-v8": "^4.1.10",
     "husky": "^9.1.7",
     "tsx": "^4.23.0",
     "typescript": "^6.0.3",
