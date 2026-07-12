@@ -9,6 +9,7 @@ worktrees/
 .env.*.local
 
 # Go build artifacts
+.gocache/
 cli/relay
 cli/cli
 
