@@ -1,10 +1,15 @@
 import { describe, expect, it } from "vitest";
 
 import {
+  computeDwellSeconds,
+  computeEffectiveIrradianceThreshold,
   computeIrradianceGateWithHysteresis,
+  computePrecipitationAllowsSunShadingGate,
   computeDreameBudgetOnStop,
   computeDreameRemainingBudget,
+  computeWeatherSupportsSunShadingGate,
   createBaseState,
+  decideAwayOnlyShade,
   runEastVeluxFollowSun,
   runVeluxHeatAiringOpen,
   runVeluxHeatStop,
@@ -13,6 +18,7 @@ import {
   runVeluxScheduledAiringOpen,
   runWestInternalBlindFollowSun,
   runWeatherSafetyRetractSensitive,
+  simulateShadeGroupCloseWithRetry,
   windowModes,
 } from "./home-automation-sim.js";
 
@@ -157,8 +163,8 @@ describe("home automation simulation", () => {
     expect(result.state.westInternalBlinds).toBe("closed");
   });
 
-  it("allows cloudy weather to close west internal blinds when irradiance is above the internal threshold", () => {
-    const result = runWestInternalBlindFollowSun(
+  it("uses the cloudy threshold before adding the internal offset", () => {
+    const belowCloudyThreshold = runWestInternalBlindFollowSun(
       createBaseState({
         sunOnWestGeom: true,
         summerConditions: true,
@@ -166,14 +172,52 @@ describe("home automation simulation", () => {
         weatherState: "cloudy",
         precipitation: 0,
         irrThreshold: 250,
+        irrThresholdCloudy: 500,
         irrThresholdInternalOffset: 500,
         globalRadiation: 800,
         westInternalBlinds: "open",
       }),
     );
+    const atCloudyThreshold = runWestInternalBlindFollowSun(
+      createBaseState({
+        sunOnWestGeom: true,
+        summerConditions: true,
+        coolingNeeded: true,
+        weatherState: "cloudy",
+        precipitation: 0,
+        irrThreshold: 250,
+        irrThresholdCloudy: 500,
+        irrThresholdInternalOffset: 500,
+        globalRadiation: 1000,
+        westInternalBlinds: "open",
+      }),
+    );
+
+    expect(belowCloudyThreshold.actions).toEqual([]);
+    expect(belowCloudyThreshold.state.westInternalBlinds).toBe("open");
+    expect(atCloudyThreshold.actions).toEqual([
+      "cover.close_cover:cover.west_internal_blinds",
+    ]);
+    expect(atCloudyThreshold.state.westInternalBlinds).toBe("closed");
+  });
+
+  it("keeps partly-cloudy weather on the base threshold", () => {
+    const result = runWestInternalBlindFollowSun(
+      createBaseState({
+        sunOnWestGeom: true,
+        summerConditions: true,
+        coolingNeeded: true,
+        weatherState: "partlycloudy",
+        precipitation: 0,
+        irrThreshold: 250,
+        irrThresholdCloudy: 500,
+        irrThresholdInternalOffset: 500,
+        globalRadiation: 750,
+        westInternalBlinds: "open",
+      }),
+    );
 
     expect(result.actions).toEqual(["cover.close_cover:cover.west_internal_blinds"]);
-    expect(result.state.westInternalBlinds).toBe("closed");
   });
 
   it("does not close west internal blinds in rain even when irradiance is high", () => {
@@ -1235,5 +1279,83 @@ describe("home automation simulation", () => {
 
     expect(belowOn.isOn).toBe(false);
     expect(aboveOn.isOn).toBe(true);
+  });
+
+  it("holds the irradiance gate through transient unavailable samples", () => {
+    expect(
+      computeIrradianceGateWithHysteresis({
+        currentIrradiance: "unavailable",
+        onThreshold: 500,
+        offDelta: 150,
+        wasOn: true,
+      }).isOn,
+    ).toBe(true);
+    expect(
+      computeIrradianceGateWithHysteresis({
+        currentIrradiance: "unknown",
+        onThreshold: 500,
+        offDelta: 150,
+        wasOn: false,
+      }).isOn,
+    ).toBe(false);
+  });
+
+  it("uses the elevated threshold only for cloudy weather", () => {
+    expect(computeEffectiveIrradianceThreshold("cloudy", 250, 500)).toBe(500);
+    expect(computeEffectiveIrradianceThreshold("cloudy", 600, 500)).toBe(600);
+    expect(computeEffectiveIrradianceThreshold("partlycloudy", 250, 500)).toBe(250);
+    expect(computeEffectiveIrradianceThreshold("sunny", 250, 500)).toBe(250);
+  });
+
+  it("holds weather and precipitation gates through transient unavailable samples", () => {
+    expect(computeWeatherSupportsSunShadingGate("unavailable", true)).toBe(true);
+    expect(computeWeatherSupportsSunShadingGate("unknown", false)).toBe(false);
+    expect(computeWeatherSupportsSunShadingGate("sunny", false)).toBe(true);
+    expect(computeWeatherSupportsSunShadingGate("rainy", true)).toBe(false);
+    expect(computePrecipitationAllowsSunShadingGate("unavailable", true)).toBe(true);
+    expect(computePrecipitationAllowsSunShadingGate("unknown", false)).toBe(false);
+    expect(computePrecipitationAllowsSunShadingGate(0.1, false)).toBe(true);
+    expect(computePrecipitationAllowsSunShadingGate(0.2, true)).toBe(false);
+  });
+
+  it("converts dashboard dwell minutes to seconds with a twelve-minute fallback", () => {
+    expect(computeDwellSeconds(12)).toBe(720);
+    expect(computeDwellSeconds(7)).toBe(420);
+    expect(computeDwellSeconds("unavailable")).toBe(720);
+    expect(computeDwellSeconds(Number.NaN)).toBe(720);
+  });
+
+  it("opens away-only shades for occupancy and closes only after away plus dwell", () => {
+    expect(decideAwayOnlyShade(true, true, 90, true)).toBe("open");
+    expect(decideAwayOnlyShade(false, true, 90, false)).toBe("hold");
+    expect(decideAwayOnlyShade(false, false, 90, true)).toBe("open");
+    expect(decideAwayOnlyShade(false, true, 29, true)).toBe("hold");
+    expect(decideAwayOnlyShade(false, true, 30, true)).toBe("close");
+  });
+
+  it("retries a failed group close once and records a final failure", () => {
+    expect(
+      simulateShadeGroupCloseWithRetry({
+        firstAttemptClosed: true,
+        retryAttemptClosed: false,
+      }),
+    ).toEqual(["cover.close_cover:group"]);
+    expect(
+      simulateShadeGroupCloseWithRetry({
+        firstAttemptClosed: false,
+        retryAttemptClosed: true,
+      }),
+    ).toEqual([
+      "cover.close_cover:group",
+      "delay:00:01:00",
+      "cover.close_cover:group:retry",
+      "log:retry",
+    ]);
+    expect(
+      simulateShadeGroupCloseWithRetry({
+        firstAttemptClosed: false,
+        retryAttemptClosed: false,
+      }),
+    ).toContain("log:close_failed");
   });
 });

@@ -11,6 +11,8 @@ export type WeatherState =
   | "hail"
   | "snowy"
   | "other";
+export type UnavailableState = "unknown" | "unavailable" | "none" | "None" | "";
+export type AwayShadeDecision = "open" | "close" | "hold";
 export type VeluxCloseTrigger =
   | "outside_warmer"
   | "no_request"
@@ -43,6 +45,7 @@ export interface AutomationSimState {
   precipitation: number;
   globalRadiation: number;
   irrThreshold: number;
+  irrThresholdCloudy: number;
   irrThresholdInternalOffset: number;
   co2: number;
   ventilationTargetCo2: number;
@@ -81,10 +84,15 @@ export interface DreameDryingBudgetSnapshot {
 }
 
 export interface IrradianceHysteresisInput {
-  currentIrradiance: number;
+  currentIrradiance: number | UnavailableState;
   onThreshold: number;
   offDelta: number;
   wasOn: boolean;
+}
+
+export interface ShadeGroupCloseRetryInput {
+  firstAttemptClosed: boolean;
+  retryAttemptClosed: boolean;
 }
 
 type WindowKey =
@@ -128,6 +136,7 @@ export function createBaseState(
     precipitation: 0,
     globalRadiation: 120,
     irrThreshold: 250,
+    irrThresholdCloudy: 500,
     irrThresholdInternalOffset: 500,
     co2: 450,
     ventilationTargetCo2: 500,
@@ -464,12 +473,85 @@ export function computeIrradianceGateWithHysteresis(
 ): { isOn: boolean; offThreshold: number } {
   const offThreshold = Math.max(0, input.onThreshold - input.offDelta);
 
+  if (typeof input.currentIrradiance !== "number") {
+    return { isOn: input.wasOn, offThreshold };
+  }
+
   return {
     isOn: input.wasOn
       ? input.currentIrradiance >= offThreshold
       : input.currentIrradiance >= input.onThreshold,
     offThreshold,
   };
+}
+
+export function computeEffectiveIrradianceThreshold(
+  weatherState: WeatherState,
+  baseThreshold: number,
+  cloudyThreshold: number,
+): number {
+  if (weatherState === "cloudy") {
+    return Math.max(baseThreshold, cloudyThreshold);
+  }
+  return baseThreshold;
+}
+
+export function computeWeatherSupportsSunShadingGate(
+  weatherState: WeatherState | UnavailableState,
+  wasOn: boolean,
+): boolean {
+  if (["unknown", "unavailable", "none", "None", ""].includes(weatherState)) {
+    return wasOn;
+  }
+  return ["sunny", "partlycloudy", "cloudy"].includes(weatherState);
+}
+
+export function computePrecipitationAllowsSunShadingGate(
+  precipitation: number | UnavailableState,
+  wasOn: boolean,
+): boolean {
+  if (typeof precipitation !== "number") {
+    return wasOn;
+  }
+  return precipitation <= 0.1;
+}
+
+export function computeDwellSeconds(dwellMinutes: number | UnavailableState): number {
+  if (typeof dwellMinutes !== "number") {
+    return 12 * 60;
+  }
+  if (!Number.isFinite(dwellMinutes)) {
+    return 12 * 60;
+  }
+  return Math.trunc(dwellMinutes * 60);
+}
+
+export function decideAwayOnlyShade(
+  occupied: boolean,
+  directSun: boolean,
+  awayMinutes: number,
+  dwellElapsed: boolean,
+): AwayShadeDecision {
+  if (occupied) return "open";
+  if (!dwellElapsed) return "hold";
+  if (!directSun) return "open";
+  if (awayMinutes < 30) return "hold";
+  return "close";
+}
+
+export function simulateShadeGroupCloseWithRetry(
+  input: ShadeGroupCloseRetryInput,
+): string[] {
+  const actions = ["cover.close_cover:group"];
+  if (input.firstAttemptClosed) {
+    return actions;
+  }
+
+  actions.push("delay:00:01:00", "cover.close_cover:group:retry", "log:retry");
+  if (!input.retryAttemptClosed) {
+    actions.push("log:close_failed");
+  }
+  return actions;
 }
 
 function cloneState(state: AutomationSimState): AutomationSimState {
@@ -511,7 +593,12 @@ function precipitationAllowsSunShading(state: AutomationSimState): boolean {
 }
 
 function irradianceAboveInternalThreshold(state: AutomationSimState): boolean {
-  return state.globalRadiation >= state.irrThreshold + state.irrThresholdInternalOffset;
+  const effectiveThreshold = computeEffectiveIrradianceThreshold(
+    state.weatherState,
+    state.irrThreshold,
+    state.irrThresholdCloudy,
+  );
+  return state.globalRadiation >= effectiveThreshold + state.irrThresholdInternalOffset;
 }
 
 function directSunWestInternalFinal(state: AutomationSimState): boolean {
