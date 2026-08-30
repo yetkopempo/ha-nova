@@ -3,8 +3,10 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 
@@ -21,6 +23,22 @@ import (
 // fallback paths behave like on claude-less CI. Tests that need claude
 // behavior prepend their own mock in front of it.
 func TestMain(m *testing.M) {
+	// os.UserHomeDir and the Windows path helpers prefer USERPROFILE,
+	// APPDATA, and LOCALAPPDATA over HOME. Isolate all three package-wide so a
+	// test that only overrides HOME can never mutate a developer's real install
+	// or configuration directories.
+	windowsStateRoot := ""
+	if runtime.GOOS == "windows" {
+		root, err := os.MkdirTemp("", "ha-nova-windows-state")
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "cannot isolate Windows test state: %v\n", err)
+			os.Exit(1)
+		}
+		windowsStateRoot = root
+		os.Setenv("USERPROFILE", root)
+		os.Setenv("APPDATA", filepath.Join(root, "AppData", "Roaming"))
+		os.Setenv("LOCALAPPDATA", filepath.Join(root, "AppData", "Local"))
+	}
 	testSecretDirForRuntime = func() (string, bool) {
 		dir := strings.TrimSpace(os.Getenv("HA_NOVA_TEST_SECRET_DIR"))
 		return dir, dir != ""
@@ -82,6 +100,9 @@ func TestMain(m *testing.M) {
 	}
 	if testSecretDirRoot != "" {
 		os.RemoveAll(testSecretDirRoot)
+	}
+	if windowsStateRoot != "" {
+		os.RemoveAll(windowsStateRoot)
 	}
 	os.Exit(code)
 }
