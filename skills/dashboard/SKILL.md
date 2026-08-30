@@ -16,6 +16,7 @@ Storage dashboard work only:
 - list Lovelace resources
 - inspect the current dashboard structure: views, cards, badges, header cards
 - create a new storage dashboard shell
+- save a strategy config on a created shell (HA generates the content)
 - update dashboard metadata
 - create, update, and delete Lovelace resources
 - find a specific dashboard element before changing it
@@ -40,6 +41,7 @@ If the user asks for a broad redesign instead of a concrete safe change, narrow 
 
 ## Bootstrap (once per session)
 
+Read and follow `../ha-nova/session-bootstrap.md`.
 Verify relay CLI: `ha-nova relay health`
 If this fails: `ha-nova setup`
 
@@ -63,7 +65,7 @@ Relevant WS types:
 - `lovelace/resources/delete`
 
 Critical behavior:
-- `lovelace/config/save` is a full-document overwrite
+- `lovelace/config/save` is a full-document overwrite. Payload shape: `{"type":"lovelace/config/save","url_path":"<url_path>","config":{"views":[...]}}` — the whole document goes under `config`, and whatever is missing from it is gone. For the DEFAULT dashboard omit `url_path` entirely; the field takes a string, so an explicit `null` is rejected and the save never lands
 - there is no partial update endpoint
 - omitted views/cards are lost
 - `lovelace/dashboards/list` is the source of truth for `dashboard_id`, `url_path`, and `mode`
@@ -72,6 +74,9 @@ Critical behavior:
 - `lovelace/config/save` success, including `data: null`, is provisional until read-back matches
 
 ## Flow
+
+Drafts follow `skills/ha-nova/smallest-solution.md`: the complete requested outcome in the simplest safe design, nothing for hypothetical future needs.
+
 
 1. Resolve the dashboard target.
    - Always list dashboards first with `lovelace/dashboards/list`.
@@ -86,6 +91,7 @@ Critical behavior:
    - if `mode` is not `storage`, stop and explain that this skill will not write or delete it
 3. Choose the mutation path.
    - create shell: preview `title`, `url_path`, `icon`, `require_admin`, `show_in_sidebar`, confirm this exact preview, then call `lovelace/dashboards/create`
+   - strategy config: a created shell may be saved with `{"strategy":{"type":"areas"}}` or `{"strategy":{"type":"original-states"}}` as the ENTIRE config — Home Assistant generates all views and cards at render time. Normal preview/confirm/drift rules apply; the card allowlist is not consulted because no cards are authored here. Freeform card authoring beyond the allowlist stays refused, and switching a populated dashboard TO a strategy discards its stored views — that save is destructive (`confirm:<token>` + auto config snapshot)
    - metadata update: preview the exact metadata fields, confirm this exact preview, then call `lovelace/dashboards/update` with `dashboard_id`
      - only send changed metadata fields supported there: `title`, `icon`, `show_in_sidebar`, `require_admin`
      - do not resend `url_path`, `mode`, or unrelated config fields in the update payload
@@ -96,7 +102,7 @@ Critical behavior:
      - call `lovelace/resources/create|update`
    - resource delete:
      - preview the exact resource identity
-     - require exact token confirmation `confirm:<token>`
+     - require exact confirmation code `confirm:<token>`
      - call `lovelace/resources/delete` with `resource_id`
    - content update / card operation:
      - read the current dashboard config with `lovelace/config`
@@ -105,17 +111,23 @@ Critical behavior:
      - resolve the exact target by view, title/heading text, entity reference, card type, or explicit position
      - merge the requested change in memory
      - validate the final JSON payload before sending it
-     - preview a concise diff/excerpt
+     - template-capable fields (Jinja-documented per card type: Markdown `content`) run the Render Loop (`skills/ha-nova/template-guidelines.md`) before the preview; titles and built-in visibility are not Jinja-aware — offer the structured equivalent
+     - preview a concise diff/excerpt plus a plain-language behavior line (write-safety → Behavior narrative)
      - confirm this exact preview
+     - drift check between confirmation and save: if the conversation paused since the preview, re-read the live config and compare the FULL document against the merge basis — including the very view/card being edited; on any foreign change, STOP — confirmation expired; re-merge onto the fresh read and re-preview (the full-document save would silently revert the external edit)
+     - capture the auto config snapshot of the pre-save document when the save removes views or cards (`skills/ha-nova/config-snapshots.md`; on capture failure follow its capture-failure stop)
      - save the full merged config with `lovelace/config/save`
      - new cards may be created only from this built-in allowlist:
        - `entity`, `entities`, `button`, `tile`, `gauge`, `sensor`, `markdown`, `history-graph`
      - existing custom cards may only be moved, deleted, or shallow-updated when the exact field already exists
-     - persisted card removal is destructive and requires exact token confirmation `confirm:<token>`; only discarding an unpersisted draft card is non-destructive
+     - persisted card removal is destructive and requires exact confirmation code `confirm:<token>`; only discarding an unpersisted draft card is non-destructive
    - delete:
      - preview the exact dashboard identity
-     - require exact token confirmation `confirm:<token>`
+     - require exact confirmation code `confirm:<token>`
+     - capture the auto config snapshot first — data = `{shell: <the dashboard's lovelace/dashboards/list entry>, config: <the full lovelace/config>}`, so a later-session restore can recreate the shell (url_path, title, icon, sidebar, admin flag) before saving the content (`skills/ha-nova/config-snapshots.md`; on capture failure follow its capture-failure stop)
      - call `lovelace/dashboards/delete` with `dashboard_id`
+     - multi-item deletes follow `skills/ha-nova/batch-safety.md`; dashboards, resources, and cards are separate families — one family per manifest; a card batch within one dashboard executes as ONE merged `lovelace/config/save` (single-call path — sequential per-card saves would overwrite each other), verified by one read-back
+   - an entity reference on an existing dashboard may join a non-destructive grouped change set ONLY as the downstream operation of a dependency-bound set (`skills/ha-nova/grouped-change-set.md` → Dependency-Bound Outputs); every other dashboard write stays single-operation; a dashboard-card removal may join a cross-family destructive cleanup only through its manifest (`grouped-change-set.md` → Cross-Family Destructive Cleanup)
 4. Read the current dashboard when content changes are involved.
    - use `lovelace/config` with the chosen `url_path`
 5. Read back and verify:
@@ -128,7 +140,7 @@ Critical behavior:
 
 ## Output Format
 
-Apply `skills/ha-nova/output-rules.md` to all user-facing output.
+Apply `skills/ha-nova/output-rules.md` to all user-facing output. Write previews, delete confirmations, and results render as the Cards defined there.
 
 For list/read:
 - `Dashboard`
@@ -141,11 +153,11 @@ For create/update/delete:
 - `Mode`
 - `Planned change`
 - `Save status` / `Delete status` before confirmation
-- `Options` / confirmation token
+- `Options` / confirmation-code prompt
 - `Verification`
 - `Next step`
 
-Use stable localized slot labels in this order; omit empty slots, do not invent ad-hoc headings.
+Use stable localized slot labels in this order; omit empty slots, do not invent ad-hoc headings. List/read renders the Report shape; dashboard and resource inventories render the List Frame (output-rules.md).
 
 Do not dump the full dashboard JSON/YAML by default.
 
@@ -154,13 +166,14 @@ Do not dump the full dashboard JSON/YAML by default.
 - Preview before write: nothing is saved until the user confirms the shown preview.
 - Confirmation binds to the displayed preview and expires on any change to target, payload, endpoint, or scope (context skill → Active Preview Confirmation).
 - Pre-preview phrases ("do it", "go ahead", "implement the plan") authorize drafting and preview only — never the write itself.
-- Delete and destructive operations require the typed token `confirm:<token>` verbatim; "yes" or any natural-language reply is invalid.
+- Delete and destructive operations require the typed confirmation code `confirm:<token>` verbatim; "yes" or any natural-language reply is invalid.
 - Never guess entity, service, or config IDs — resolve them or ask.
 - Home Assistant is reached exclusively through `ha-nova relay`.
 - For any HA write this skill does not cover, STOP and invoke `ha-nova:fallback` first — never probe unfamiliar write endpoints.
 
 - No guessed `url_path` or `dashboard_id` values.
-- Dashboard/resource/card delete uses exact token confirmation only, even for items created earlier in the same session. Dashboard writes have no `revert`; the recovery path is Home Assistant Backups.
+- Dashboard/resource/card delete uses exact confirmation code only, even for items created earlier in the same session. Dashboard writes have no `revert` — recovery for dashboard/card deletes is the auto config snapshot (next bullet); resources recover via Home Assistant Backups.
+- Content-removing saves capture an auto config snapshot — that is the recovery net. Dashboard deletes capture one too, but restore is PARTIAL: recreate the dashboard (reusing the `url_path`), then save the snapshot content — say that in the delete preview. LOVELACE RESOURCE deletes are NOT snapshot-covered — they keep the safety-backup offer. Otherwise offer a backup via `ha-nova:backup` only when the snapshot store is unavailable (never for routine small edits).
 - If the change needs a broad re-layout instead of a targeted edit, say so before writing.
 
 ## Guardrails

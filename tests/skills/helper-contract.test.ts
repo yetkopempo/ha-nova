@@ -87,7 +87,7 @@ describe("helper contract", () => {
       expect(skillDoc).toContain("Changes slot");
       expect(skillDoc).toContain("explicit not-saved-yet line");
       expect(skillDoc).toContain("Options block (`apply`, `show yaml`, `cancel`)");
-      expect(skillDoc).toContain("explicit not-deleted-yet line before the confirmation token");
+      expect(skillDoc).toContain("explicit not-deleted-yet line before the confirmation code");
       expect(skillDoc).not.toContain("as a `## Changes` diff");
     });
 
@@ -107,12 +107,14 @@ describe("helper contract", () => {
 
     it("references the dedicated config-entry flow schema doc", () => {
       expect(skillDoc).toContain("helper-flow-schemas.md");
-      expect(flowSchemasDoc).toContain("full supported config-entry family (10 domains)");
+      expect(flowSchemasDoc).toContain("full supported config-entry family (12 domains)");
       expect(flowSchemasDoc).toContain("Canonical write identity: `entry_id`");
     });
 
-    it("documents full config-entry helper ownership for the 10 supported domains", () => {
-      for (const domain of [
+    it("documents full config-entry helper ownership for the 12 supported domains", () => {
+      // generic_thermostat + switch_as_x promoted from fallback (#531 P4-05,
+      // 2026-08-20).
+      const expectedDomains = [
         "utility_meter",
         "derivative",
         "integration",
@@ -123,12 +125,27 @@ describe("helper contract", () => {
         "group",
         "history_stats",
         "template",
-      ]) {
-        expect(skillDoc).toContain(domain);
-        expect(flowSchemasDoc).toContain(domain);
-      }
+        "generic_thermostat",
+        "switch_as_x",
+      ];
+      const skillDomainLine = skillDoc
+        .split("\n")
+        .find((line) => line.startsWith("  - `utility_meter`"));
+      expect(skillDomainLine).toBeDefined();
+      expect(
+        [...(skillDomainLine ?? "").matchAll(/`([^`]+)`/g)].map((match) => match[1]),
+      ).toEqual(expectedDomains);
+      const domainListStart = flowSchemasDoc.indexOf("(12 domains):");
+      const domainListEnd = flowSchemasDoc.indexOf("This file is an observed");
+      expect(domainListStart).toBeGreaterThan(-1);
+      expect(domainListEnd).toBeGreaterThan(domainListStart);
+      expect(
+        [...flowSchemasDoc.slice(domainListStart, domainListEnd).matchAll(/^- `([^`]+)`$/gm)].map(
+          (match) => match[1],
+        ),
+      ).toEqual(expectedDomains);
 
-      expect(skillDoc).toContain("CRUD support for 10 domains:");
+      expect(skillDoc).toContain("CRUD support for 12 domains:");
       expect(skillDoc).toContain("verified for the `sensor` subtype");
       expect(skillDoc).not.toContain("does **not** support update yet");
       // Template authoring safety: broken templates render entities unavailable.
@@ -152,7 +169,11 @@ describe("helper contract", () => {
       expect(skillDoc).toContain("start an options flow");
       expect(skillDoc).toContain("current editable options snapshot");
       expect(skillDoc).toContain("Supports options-flow editing:");
-      expect(skillDoc).toContain("Supports Options-Flow Editing");
+      // List Frame trim (max 4 short columns): options-flow support and linked
+      // entities live in the per-helper detail read, not the list table.
+      expect(skillDoc).toContain("| Title | Domain | Entry ID | State |");
+      // Ambiguous entries still get their linked-entity context for selection.
+      expect(skillDoc).toContain("add a\n   short disambiguation line");
       expect(skillDoc).toContain("Current flow step:");
       expect(skillDoc).toContain("Current editable fields:");
       expect(skillDoc).toContain("mark its value as unavailable instead of guessing");
@@ -251,7 +272,7 @@ describe("helper contract", () => {
       const fallbackDoc = readFileSync(
         resolve(__dirname, "../../skills/fallback/SKILL.md"),
         "utf-8",
-      );
+      ) + "\n" + readFileSync(resolve(__dirname, "../../skills/fallback/relay-ready.md"), "utf-8");
       const supportedTypesLine = fallbackDoc
         .split("\n")
         .find((line) => line.includes("Supported types in this fallback section:"));
@@ -260,9 +281,10 @@ describe("helper contract", () => {
       expect(supportedTypesLine).toContain("`trend`");
       expect(supportedTypesLine).toContain("`random`");
       expect(supportedTypesLine).toContain("`filter`");
-      expect(supportedTypesLine).toContain("`generic_thermostat`");
-      expect(supportedTypesLine).toContain("`switch_as_x`");
       expect(supportedTypesLine).toContain("`generic_hygrostat`");
+      // Promoted to ha-nova:helper (#531 P4-05, 2026-08-20).
+      expect(supportedTypesLine).not.toContain("`generic_thermostat`");
+      expect(supportedTypesLine).not.toContain("`switch_as_x`");
       expect(supportedTypesLine).not.toContain("`utility_meter`");
       expect(supportedTypesLine).not.toContain("`derivative`");
       expect(supportedTypesLine).not.toContain("`integration`");

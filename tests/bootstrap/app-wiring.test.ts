@@ -26,6 +26,7 @@ describe("app wiring", () => {
   it("wires /health and /ws handlers in application router", async () => {
     const app = createApp({
       fileAccess: { mode: "off" as const, configRoot: "", warnings: [] },
+      snapshotRoot: "/tmp/nova-snapshots-test",
       authToken: "secret",
       version: "1.0.0",
       wsClient: {
@@ -57,8 +58,11 @@ describe("app wiring", () => {
       data: {
         status: "ok",
         ha_ws_connected: true,
+        ha_ws_disconnect_reason: null,
         version: "1.0.0",
-        uptime_s: 4
+        uptime_s: 4,
+        file_access: "off",
+        snapshots: { files: 0, bytes: 0 }
       }
     });
 

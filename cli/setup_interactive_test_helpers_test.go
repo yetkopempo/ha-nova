@@ -17,16 +17,13 @@ func setupWizardRelayInstallPrompts() []string {
 	}
 }
 
-func setupWizardLLATPrompts() []string {
-	return []string{
-		"",
-		"",
-		"",
-	}
-}
-
 func setupWizardGenerateRelayTokenPrompts() []string {
 	return []string{
+		"",
+		"",
+		"",
+		"",
+		"manual",
 		"",
 		"",
 		"",
@@ -35,7 +32,22 @@ func setupWizardGenerateRelayTokenPrompts() []string {
 
 func setupWizardPasteRelayTokenPrompts(token string) []string {
 	return []string{
+		"",
+		"",
+		"",
+		"",
+		"manual",
 		"1",
 		token,
+	}
+}
+
+func setupWizardPairingPrompts(code string) []string {
+	return []string{
+		"",
+		"",
+		"",
+		"",
+		code,
 	}
 }

@@ -16,6 +16,44 @@ type uninstallPreflight struct {
 	config            runtimeConfig
 }
 
+// uninstallRelayRemovalEvidence records only Relay removals that guided
+// teardown completed and identified exactly. A missing profile or Relay
+// identity is never evidence that another Relay is gone.
+type uninstallRelayRemovalEvidence map[string]string
+
+func uninstallRelayRemovalEvidenceFromPreflight(
+	preflight uninstallPreflight,
+	teardownCompleted bool,
+) uninstallRelayRemovalEvidence {
+	return uninstallRelayRemovalEvidenceForDefault(
+		preflight.config.RelayInstanceID,
+		teardownCompleted,
+	)
+}
+
+func uninstallRelayRemovalEvidenceForDefault(
+	relayInstanceID string,
+	teardownCompleted bool,
+) uninstallRelayRemovalEvidence {
+	relayInstanceID = strings.TrimSpace(relayInstanceID)
+	if !teardownCompleted || relayInstanceID == "" {
+		return nil
+	}
+	return uninstallRelayRemovalEvidence{
+		defaultServerProfileName: relayInstanceID,
+	}
+}
+
+func (evidence uninstallRelayRemovalEvidence) matches(
+	profileName string,
+	relayInstanceID string,
+) bool {
+	expectedRelayInstanceID, exists := evidence[profileName]
+	return exists &&
+		strings.TrimSpace(relayInstanceID) != "" &&
+		expectedRelayInstanceID == strings.TrimSpace(relayInstanceID)
+}
+
 func renderUninstallPreflight(out io.Writer, paths runtimePaths, source string) {
 	session := resolveStatusUISession(out)
 	renderSimpleHeader(out, session, "HA NOVA Uninstall")
@@ -27,6 +65,7 @@ func renderUninstallPreflight(out io.Writer, paths runtimePaths, source string) 
 	fmt.Fprintf(out, "  %s\n", session.style("strong", "Full purge also removes:"))
 	fmt.Fprintf(out, "    %s Home Assistant connection config\n", session.bullet())
 	fmt.Fprintf(out, "    %s %s\n", session.bullet(), uninstallTokenLineLabel())
+	fmt.Fprintf(out, "    %s Home Assistant Cloud authorization (when configured)\n", session.bullet())
 	fmt.Fprintln(out)
 	if runtime.GOOS == "windows" && source == installSourceBundle {
 		renderSetupParagraphTight(out, session.style("muted", uninstallWindowsBundleNote()))
@@ -60,18 +99,25 @@ func uninstallWindowsBundleNote() string {
 	return "Windows bundle note: a short-lived helper finishes the uninstall after the running ha-nova.exe exits. Please wait a moment for the final removal to complete."
 }
 
-// collectUninstallPreflight reads the raw config (loadJSONConfig, not
-// loadConfig: partial setups must still yield the HA URL for the server-side
-// checklist) and probes whether the relay still answers.
+// collectUninstallPreflight reads the raw default profile (not loadConfig:
+// partial setups must still yield the HA URL for the server-side checklist,
+// and uninstall is install-wide, so no runtime selection applies) and probes
+// whether the relay still answers.
 func collectUninstallPreflight(paths runtimePaths) uninstallPreflight {
 	preflight := uninstallPreflight{}
 
-	cfg, err := loadJSONConfig(paths.ConfigFile)
+	cfg, err := loadRawDefaultProfileConfig(paths.ConfigFile)
 	if err != nil {
 		return preflight
 	}
 	preflight.config = cfg
 	preflight.haURL = strings.TrimSpace(cfg.HAURL)
+	if strings.TrimSpace(cfg.RelaySecureBaseURL) != "" &&
+		strings.TrimSpace(cfg.RelaySpkiPin) != "" &&
+		defaultUninstallDeviceCredentialExists() &&
+		verifyDefaultUninstallDeviceHealth(cfg) {
+		preflight.relayStillRunning = true
+	}
 	if cfg.RelayBaseURL == "" {
 		return preflight
 	}
@@ -88,7 +134,10 @@ func collectUninstallPreflight(paths runtimePaths) uninstallPreflight {
 	}
 	preflight.relayToken = token
 
-	if _, err := fetchRelayHealth(cfg.RelayBaseURL, token); err == nil {
+	if !preflight.relayStillRunning {
+		_, err = fetchRelayHealth(cfg.RelayBaseURL, token)
+	}
+	if err == nil {
 		preflight.relayStillRunning = true
 	}
 	return preflight
@@ -125,7 +174,7 @@ func preflightNoteLines(preflight uninstallPreflight) []string {
 		notes = append(notes,
 			"1. Remove the NOVA Relay app: "+haRelayAppPageURL(preflight.haURL),
 			"2. Remove the repository: "+haAppStoreURL(preflight.haURL)+" > three-dot menu > Repositories > remove "+haNovaRepositoryURL,
-			"3. Revoke the \"NOVA\" access token: "+haProfileSecurityURL(preflight.haURL),
+			"3. If this was a legacy/standalone install, revoke its \"NOVA\" access token: "+haProfileSecurityURL(preflight.haURL),
 		)
 	} else {
 		notes = append(notes,

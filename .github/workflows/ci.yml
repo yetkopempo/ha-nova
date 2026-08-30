@@ -60,19 +60,52 @@ jobs:
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v7
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
 
       - name: Setup Node
-        uses: actions/setup-node@v6
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
           node-version: 20
           cache: npm
 
+      - name: Verify Home Assistant Cloud source gate
+        # PR and merge-queue checks run later from trusted default-branch code.
+        # This in-tree gate protects direct main pushes after merge.
+        if: github.event_name == 'push'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          HA_NOVA_CLOUD_GATE_EVIDENCE_JSON: ${{ secrets.HA_NOVA_CLOUD_GATE_EVIDENCE_JSON }}
+        run: bash scripts/release/verify-cloud-release-gate.sh
+
       - name: Setup Go
-        uses: actions/setup-go@v6
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
-          go-version: "1.24"
+          go-version: "1.26.5"
           cache-dependency-path: cli/go.sum
+
+      # The dev-sync tests shell out to `go build` under a restricted PATH
+      # (binDir:/usr/bin:/bin) that excludes the setup-go toolchain dir, so they
+      # would otherwise resolve the runner's older system Go and fail go.mod's
+      # 1.26 requirement (GOTOOLCHAIN=local). Point /usr/bin/go at the 1.26
+      # toolchain so the restricted PATH resolves the right version.
+      # The dev-sync tests run `go build` in parallel, each under a temp HOME and
+      # a restricted PATH. Pin GOMODCACHE/GOCACHE to shared locations (exported
+      # via GITHUB_ENV so the tests' spawned env inherits them instead of
+      # deriving cold caches from the temp HOME) and put Go 1.26 on /usr/bin so
+      # the restricted PATH resolves the right version. Then warm the cache once
+      # so each test build is an incremental cache hit instead of a cold full
+      # compile of the heavy pairing crypto deps that would race and exhaust the
+      # runner.
+      - name: Prepare Go for the parallel dev-sync builds
+        run: |
+          echo "GOMODCACHE=$(go env GOMODCACHE)" >> "$GITHUB_ENV"
+          echo "GOCACHE=$(go env GOCACHE)" >> "$GITHUB_ENV"
+          sudo ln -sf "$(command -v go)" /usr/bin/go
+
+      - name: Warm the Go cache
+        run: cd cli && go build ./...
 
       - name: Install
         run: npm ci
@@ -88,9 +121,9 @@ jobs:
         uses: actions/checkout@v7
 
       - name: Setup Go
-        uses: actions/setup-go@v6
+        uses: actions/setup-go@v7
         with:
-          go-version: "1.24"
+          go-version: "1.26.5"
           cache-dependency-path: cli/go.sum
 
       - name: Build (cross-target)
@@ -101,3 +134,167 @@ jobs:
           GOOS=windows GOARCH=amd64 go build -o /dev/null .
           GOOS=linux GOARCH=amd64 go build -o /dev/null .
           GOOS=linux GOARCH=arm64 go build -o /dev/null .
+
+  macos-native-secret-boundary:
+    name: macos-native-secret-boundary
+    runs-on: macos-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Setup Go
+        uses: actions/setup-go@v7
+        with:
+          go-version: "1.26.5"
+          cache-dependency-path: cli/go.sum
+
+      - name: Verify macOS Keychain no-UI policy
+        run: |
+          cd cli
+          /usr/bin/sandbox-exec \
+            -p '(version 1)(allow default)(deny process-exec (literal "/usr/bin/security"))' \
+            go test -count=1 \
+              -run '^(TestDecodeDarwinGoKeyringValue|TestNativeSecretWorkerAcceptsRelayTokenKey|Test(Read|Set|Delete)DarwinKeychainSecretInProcess.*|TestDarwin(KeychainNoUI.*|Device.*|RelayToken.*|Interactive.*|ExplicitPair.*|PairCommand.*|DoctorResume.*))$' \
+              .
+
+      - name: Reject a non-hardened executable
+        run: |
+          cd cli
+          go test -c -o "${RUNNER_TEMP}/ha-nova-cli.test" .
+          /usr/bin/codesign --force --sign - \
+            --timestamp=none \
+            "${RUNNER_TEMP}/ha-nova-cli.test"
+          /usr/bin/codesign --verify --strict "${RUNNER_TEMP}/ha-nova-cli.test"
+          "${RUNNER_TEMP}/ha-nova-cli.test" \
+            -test.run '^TestDarwinNativeSecretWorkerRejectsNonHardenedExecutable$' \
+            -test.v
+
+      - name: Verify the hardened same-executable boundary
+        run: |
+          /usr/bin/codesign --force --sign - \
+            --options runtime,hard,kill,library \
+            --timestamp=none \
+            "${RUNNER_TEMP}/ha-nova-cli.test"
+          /usr/bin/codesign --verify --strict "${RUNNER_TEMP}/ha-nova-cli.test"
+          "${RUNNER_TEMP}/ha-nova-cli.test" \
+            -test.run '^(TestDarwinNativeSecretWorkerVerifiesSameExecutableParent|TestDarwinOAuthSecurityBindingLoads|TestDarwinOAuthBackendStopsBeforeNativeAccessWhenCanceled)$' \
+            -test.v
+
+  windows-native-secret-boundary:
+    name: windows-native-secret-boundary
+    runs-on: windows-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Setup Go
+        uses: actions/setup-go@v7
+        with:
+          go-version: "1.26.5"
+          cache-dependency-path: cli/go.sum
+
+      - name: Verify native worker boundaries
+        shell: pwsh
+        run: |
+          Set-Location cli
+          go test -count=1 -run '^(TestWindowsOAuthNativeOperationsHonorHardDeadline|TestNativeSecretWorker.*)$' .
+
+  windows-powershell-unicode:
+    name: windows-powershell-unicode
+    runs-on: windows-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Setup Go
+        uses: actions/setup-go@v7
+        with:
+          go-version: "1.26.5"
+          cache-dependency-path: cli/go.sum
+
+      - name: Verify PowerShell 5.1 UTF-8 round trip
+        shell: powershell
+        run: |
+          if ($PSVersionTable.PSVersion.Major -ne 5) {
+            throw "Windows PowerShell 5.1 required, got $($PSVersionTable.PSVersion)"
+          }
+
+          $utf8NoBom = New-Object -TypeName System.Text.UTF8Encoding -ArgumentList $false
+          $strictUtf8 = New-Object -TypeName System.Text.UTF8Encoding -ArgumentList $false, $true
+          $expectedHex = "47-72-C3-BC-C3-9F-65-20-E2-80-93-20-C3-96-6C-20-26-20-C3-9C-62-65-72-73-63-68-75-73-73-20-C2-B7-20-63-61-66-C3-A9-20-C2-B7-20-E6-9D-B1-E4-BA-AC-20-C2-B7-20-F0-9F-98-80"
+          [byte[]]$expectedBytes = $expectedHex.Split("-") | ForEach-Object {
+            [System.Convert]::ToByte($_, 16)
+          }
+          $expected = $strictUtf8.GetString($expectedBytes)
+          $document = [pscustomobject]@{ title = $expected }
+          $json = $document | ConvertTo-Json -Depth 100
+
+          function Read-StrictUtf8([string]$Path) {
+            $inputBytes = [System.IO.File]::ReadAllBytes($Path)
+            $offset = 0
+            if ($inputBytes.Length -ge 3 -and $inputBytes[0] -eq 0xEF -and $inputBytes[1] -eq 0xBB -and $inputBytes[2] -eq 0xBF) {
+              $offset = 3
+            }
+            if ($inputBytes.Length -ge ($offset + 3) -and $inputBytes[$offset] -eq 0xEF -and $inputBytes[$offset + 1] -eq 0xBB -and $inputBytes[$offset + 2] -eq 0xBF) {
+              throw "More than one leading UTF-8 BOM is unsupported"
+            }
+            return $strictUtf8.GetString($inputBytes, $offset, $inputBytes.Length - $offset)
+          }
+
+          if ([System.BitConverter]::ToString($utf8NoBom.GetBytes($expected)) -cne $expectedHex) {
+            throw "UTF-8 test vector did not round-trip"
+          }
+          [System.IO.File]::WriteAllText("$PWD\payload.json", $json, $utf8NoBom)
+
+          $bytes = [System.IO.File]::ReadAllBytes("$PWD\payload.json")
+          if ($bytes.Length -ge 3 -and $bytes[0] -eq 0xEF -and $bytes[1] -eq 0xBB -and $bytes[2] -eq 0xBF) {
+            throw "payload.json unexpectedly contains a UTF-8 BOM"
+          }
+
+          $roundTrip = Read-StrictUtf8 "$PWD\payload.json" | ConvertFrom-Json
+          if ($roundTrip.title -cne $expected) {
+            throw "PowerShell 5.1 changed Unicode code points"
+          }
+
+          [byte[]]$utf8Bom = 0xEF, 0xBB, 0xBF
+          [System.IO.File]::WriteAllBytes("$PWD\payload-bom.json", [byte[]]($utf8Bom + $bytes))
+          $bomRoundTrip = Read-StrictUtf8 "$PWD\payload-bom.json" | ConvertFrom-Json
+          if ($bomRoundTrip.title -cne $expected) {
+            throw "PowerShell 5.1 changed Unicode code points after one UTF-8 BOM"
+          }
+
+          [System.IO.File]::WriteAllBytes("$PWD\payload-double-bom.json", [byte[]]($utf8Bom + $utf8Bom + $bytes))
+          $doubleBomRejected = $false
+          try {
+            $null = Read-StrictUtf8 "$PWD\payload-double-bom.json"
+          } catch {
+            $doubleBomRejected = $true
+          }
+          if (-not $doubleBomRejected) {
+            throw "Strict UTF-8 reader accepted more than one leading UTF-8 BOM"
+          }
+
+          [System.IO.File]::WriteAllText("$PWD\utf16le.json", $json, [System.Text.Encoding]::Unicode)
+          [System.IO.File]::WriteAllText("$PWD\utf16be.json", $json, [System.Text.Encoding]::BigEndianUnicode)
+          foreach ($unsupported in @("$PWD\utf16le.json", "$PWD\utf16be.json")) {
+            $rejected = $false
+            try {
+              $null = Read-StrictUtf8 $unsupported
+            } catch {
+              $rejected = $true
+            }
+            if (-not $rejected) {
+              throw "Strict UTF-8 reader accepted $unsupported"
+            }
+          }
+
+          Set-Location cli
+          go build -o ha-nova.exe .
+          [Console]::OutputEncoding = $utf8NoBom
+          $OutputEncoding = $utf8NoBom
+          $cliValue = & .\ha-nova.exe relay jq -r --file ..\payload.json '.title'
+          $cliHex = [System.BitConverter]::ToString($utf8NoBom.GetBytes([string]$cliValue))
+          if ($LASTEXITCODE -ne 0 -or $cliValue -cne $expected -or $cliHex -cne $expectedHex) {
+            throw "ha-nova.exe changed Unicode code points"
+          }
+          go test . -run 'Test(RelayUnicodeRoundTrip|RelayRejectsUTF16|RelayRejectsBOMLessUTF16JQ|RelayRejectsTwoResponseBOMs|RelayHealthResponseUsesStrictUTF8Boundary)' -count=1

@@ -1,6 +1,6 @@
 ---
 name: review
-description: Use when analyzing, reviewing, auditing, or checking Home Assistant automations, scripts, or helpers for errors, best-practice violations, and conflicts. Do not invoke `ha-nova:read` separately — this skill handles discovery and reading internally.
+description: Use when analyzing, reviewing, auditing, or checking Home Assistant automations, scripts, helpers, scenes, or dashboards for errors, best-practice violations, and conflicts. Do not invoke `ha-nova:read` separately — this skill handles discovery and reading internally.
 license: MIT
 compatibility: Requires the ha-nova CLI (run 'ha-nova setup' first) and the HA NOVA Relay in Home Assistant (App, or standalone container on Container/Core).
 ---
@@ -10,8 +10,9 @@ compatibility: Requires the ha-nova CLI (run 'ha-nova setup' first) and the HA N
 
 ## Scope
 
-Read-only quality review for automations, scripts, and helpers:
+Read-only quality review for automations, scripts, helpers, storage scenes, and storage dashboards:
 - Config quality checks (safety, reliability, performance, style)
+- Notification checks follow `skills/ha-nova/mobile-notification-composition.md`: objective schema, capability, safety, or privacy violations are findings; optional style differences are suggestions; recurring-workflow intent advice is low-severity usability advice, never a correctness finding
 - Collision scan (other automations targeting same entities)
 - Conflict analysis (real conflicts vs safe patterns)
 - Explorative questions for complex automation/script behavior
@@ -28,6 +29,7 @@ Read-only analysis. Exception: after explicit user confirmation, one Quick-Fix s
 
 ## Bootstrap (once per session)
 
+Read and follow `../ha-nova/session-bootstrap.md`.
 Preflight: `ha-nova relay health` (once per session, skip if already verified). If this fails: `ha-nova setup`.
 
 ## Relay Contract
@@ -41,6 +43,8 @@ Relay CLI: `ha-nova relay`
 ## Target Resolution
 
 If user provides an exact automation/script `entity_id` (e.g., `automation.main_lights`), skip search and go directly to config read.
+
+Storage scenes resolve like automations (registry `unique_id` → `GET /api/config/scene/config/<id>`; name-based requests search the `scene.` domain in the compact registry exactly like the automation keyword search). The Editability Guard from `ha-nova:scene` applies. A scene without registry `unique_id` is YAML-backed: run SC checks only when that scene's exact YAML is already in context; otherwise STOP and ask for the pasted scene YAML — never emit an empty or inferred review. Storage dashboards resolve by `url_path` (`lovelace/dashboards/list` → `lovelace/config`), and D-02/D-05 additionally read `lovelace/resources`. Apply the SC/D families from `skills/review/checks.md`; cross-item HX rules run in aggregate/bulk mode OR whenever their required registry/state context is already loaded. A dashboard D-01/D-06 pass normally loads that context, so apply HX-05 to visible card actions without expanding the workset. Flow adaptation for these targets: a SCENE replaces the Step-2 collision scan with a consumer scan (`search/related` on the scene entity — who activates it) and skips conflict analysis; a DASHBOARD skips Steps 2–4 entirely (no collision surface, no Quick-Fix) — its review is the D config-quality pass plus suggestion synthesis. Output for both: keep the Report shape but include ONLY the sections that ran (findings, consumers for scenes, suggestions, next step) — never render empty collision/conflict/Quick-Fix sections for checks that were intentionally skipped.
 
 For helpers, resolve the family first:
 - storage-based family: entity_id domain is one of `input_boolean`, `input_number`, `input_text`, `input_select`, `input_datetime`, `input_button`, `counter`, `timer`, `schedule`
@@ -204,12 +208,16 @@ Before analyzing, consult these sources:
 
 Only fetch pages relevant to the triggers, actions, and templates found in the config. Cross-check against documented gotchas and constraints — this catches issues beyond the hardcoded checks below.
 
-**Verify-before-flag rule:** Before reporting ANY issue:
-1. Check local reference doc
-2. If not found, check the official HA docs above
-3. Only flag as error if confirmed invalid after both checks
+**Verify-before-flag rule:** the canonical sequence lives in
+`skills/review/checks.md` → Verify Before Flagging, because the post-write
+phases load that file without this one. Resolve every finding against a source
+before reporting it, and flag it when the source confirms the CLAIM you are
+making — semantics or risk for behavioral checks, schema invalidity only for
+schema-shaped ones.
 
-Do NOT flag valid HA builtins or documented behavior as errors.
+Do NOT flag valid HA builtins or documented behavior as errors — but "valid"
+alone never clears a behavioral finding: much of the catalog describes config
+Home Assistant accepts and that still misbehaves.
 
 ### Step 1: Config Quality Review
 
@@ -241,8 +249,9 @@ Branch by target family:
    - helper (config-entry family): use up to 3 `linked_entities[]` from the canonical metadata item
 2. For the top 3 most significant candidate entities, run `search/related`:
    ```text
-   ha-nova relay ws --data-file <payload-file>
+   ha-nova relay ws --data-file <payload-file> --jq-file <filter-file>
    ```
+   `<filter-file>` is the canonical `skills/ha-nova/search-related-consumers.jq` (recreate per `skills/ha-nova/relay-api.md` → Parsing rule on flat-copy installs).
 3. Collect related automations/scripts (exclude current target).
 4. Read configs of related items (max 5 for a single standalone target; keep a tighter shared budget across a bulk workset; post-write scans inside `write`/`helper` deliberately use a tighter budget of max 3 related configs). Resolve `unique_id` first for automation/script targets (see Target Resolution step 5), then:
    ```text
@@ -251,17 +260,22 @@ Branch by target family:
    # Script:
    ha-nova relay core --method GET --path /api/config/script/config/<unique_id> --jq-file <config-filter-file> --out <related-file>
    ```
-5. If no related items found, report "no conflicts" in the Conflicts section and skip Step 3.
+5. If no related items found, report "no conflicts" in the Conflicts section and skip Step 3. On a filter error, report the collision scan as inconclusive — never as "no conflicts".
 
-### Trace Analysis (on request)
+### Trace Evidence (automation/script reviews only)
 
-When the user reports runtime issues ("automation didn't fire", "wrong behavior last night"):
-1. Follow the trace procedure in `skills/read/SKILL.md` → Trace Debugging
-2. Prefer the normalized CLI helper fields from `ha-nova trace latest/list/get --json`; they are enough for run selection, result status, timestamp, item binding, and most review findings.
-3. Inspect raw trace internals only when step-level evidence is required. Raw trace nodes can be arrays of event records; type-check before reading `path`, `result`, `changed_variables`, or `error`, and avoid large jq projections as the standard path.
-4. Cross-reference trace findings with config quality findings from Step 1
-5. Verify `item_id` in every trace matches the target's `unique_id` before attributing results. see `skills/ha-nova/SKILL.md` → Claim-Evidence Binding.
-6. Include trace-based findings in the Findings section with a descriptive title (e.g., `🔴 Condition blocked — condition was never met in last 3 runs`). Localize at runtime per `skills/ha-nova/output-rules.md`.
+Trace ANALYSIS belongs to `ha-nova:diagnose`: a runtime complaint ("didn't
+fire", "wrong behavior last night") is a concrete incident and routes there,
+not here. Stay in this skill only when the user asked for an automation or
+script review and traces are supporting evidence for a config finding — never
+as the answer to a failure question.
+
+In that case:
+1. Prefer the normalized CLI helper fields from `ha-nova trace latest <automation_or_script_entity_id> --json`, `ha-nova trace list <automation_or_script_entity_id> --json`, and `ha-nova trace get <automation_or_script_entity_id> <run_id> --json`; they are enough for run selection, result status, timestamp, item binding, and most review findings.
+2. Inspect raw trace internals only when step-level evidence is required. Raw trace nodes can be arrays of event records; type-check before reading `path`, `result`, `changed_variables`, or `error`, and avoid large jq projections as the standard path.
+3. Cross-reference trace findings with config quality findings from Step 1
+4. Verify `item_id` in every trace matches the target's `unique_id` before attributing results. see `skills/ha-nova/SKILL.md` → Claim-Evidence Binding.
+5. Include trace-based findings in the Findings section with a descriptive title (e.g., `🔴 Condition blocked — condition was never met in last 3 runs`). Localize at runtime per `skills/ha-nova/output-rules.md`.
 
 ### Step 3: Conflict Analysis
 
@@ -298,11 +312,12 @@ After completing Steps 1-3, check if the current entity state (from the earlier 
 - Fix requires config change (that's a Suggestions item)
 - Multiple equally valid corrections exist (ambiguous — note in Questions to consider instead)
 - State read failed or entity unavailable — skip, note in Instant Help section: localized equivalent of "Skipped: current state unavailable."
+- The corrective call would grant physical access or is physically irreversible — unlocking or opening a lock, disarming an alarm panel, opening a garage/gate/entry-door cover by `device_class`, or running a scene, script, or automation that reaches one. Every corrective call — ordinary device control or a trigger-source write such as resetting a desynchronized `input_select` — must RUN the indirect-actuation gate first (`skills/ha-nova/indirect-actuation.md`); ordinary device control still carries its CONSUMER scan. What disqualifies it is the gate's VERDICT, not having consulted the gate: a clean consumer scan leaves the correction ordinary and Quick-Fixable, while a typed-tier verdict — or a scan that could not enumerate the consumers — sends it out of Quick-Fix. Never Quick-Fix those: name the fix and offer to run it as a separate service call, which carries the typed high-consequence gate this step does not.
 
 **If qualified:**
 1. Show current state vs expected state
 2. Show exact service call that would fix it
-3. Ask for natural confirmation bound to this exact service-call preview (same tier as `ha-nova:service-call`; see context skill → Active Preview Confirmation; no token needed for ordinary service calls)
+3. Ask for natural confirmation bound to this exact service-call preview (same tier as `ha-nova:service-call`; see context skill → Active Preview Confirmation; no typed confirmation code needed for ordinary service calls)
 
 **On confirmation:**
 Execute via Relay:
@@ -376,11 +391,13 @@ Rules:
 
 Apply `skills/ha-nova/output-rules.md` to all user-facing output.
 
+Review output is sectioned, not card-framed; only a Section 8 quick-fix proposal renders as the service-call Preview Card (`apply · cancel`, output-rules.md → Cards) when it proposes a call.
+
 Exception: if a maintainer-provided release-validation or machine-check prompt explicitly pins exact section titles or machine markers, follow that override exactly so automated validation can compare the fixed headings. This exception does not allow internal check codes in normal user-facing prose.
 
 ### Standard mode
 
-For resolved targets `== 1`, keep this 8-section output in the same order every time:
+For resolved automation/script/helper targets `== 1`, keep this 8-section output in the same order every time (scene/dashboard targets omit skipped sections per Target Resolution):
 
 **Section 1 — Review target:**
 - domain (automation / script / helper) and target entity_id
@@ -413,7 +430,7 @@ For resolved targets `== 1`, keep this 8-section output in the same order every 
 
 **Section 6 — Suggestions:**
 - confident improvement ideas only
-- each: short title + what it does + why it helps
+- each item follows the Suggestion Block item shape (output-rules.md): short title + what it does + why it helps; the section header stays plain — review output is sectioned, not card-framed
 - rank by intervention depth: Fix existing → Simplify existing → Extend existing → Add new
 - do not place intent-uncertain removals/simplifications here
 - or localized equivalent of "No confident suggestions."
@@ -464,10 +481,12 @@ For resolved targets `> 1`, return exactly these 6 sections:
 - Preview before write: nothing is saved until the user confirms the shown preview.
 - Confirmation binds to the displayed preview and expires on any change to target, payload, endpoint, or scope (context skill → Active Preview Confirmation).
 - Pre-preview phrases ("do it", "go ahead", "implement the plan") authorize drafting and preview only — never the write itself.
-- Delete and destructive operations require the typed token `confirm:<token>` verbatim; "yes" or any natural-language reply is invalid.
+- Delete and destructive operations require the typed confirmation code `confirm:<token>` verbatim; "yes" or any natural-language reply is invalid.
 - Never guess entity, service, or config IDs — resolve them or ask.
 - Home Assistant is reached exclusively through `ha-nova relay`.
 - For any HA write this skill does not cover, STOP and invoke `ha-nova:fallback` first — never probe unfamiliar write endpoints.
+
+- Drafts follow `skills/ha-nova/smallest-solution.md`: the complete requested outcome in the simplest safe design, nothing for hypothetical future needs.
 
 - Read-only analysis: no config writes through the relay (see Scope for the single Quick-Fix exception).
 - The Quick-Fix service call requires confirmation bound to its exact preview; bulk mode disables it entirely.

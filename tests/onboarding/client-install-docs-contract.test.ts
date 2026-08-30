@@ -16,6 +16,8 @@ function expectOverlayToPointBackToReadme(doc: string): void {
 describe("client install docs contract", () => {
   const readme = readFileSync("README.md", "utf8");
   const governance = readFileSync("docs/reference/documentation-governance.md", "utf8");
+  const contextSkill = readFileSync("skills/ha-nova/SKILL.md", "utf8");
+  const sessionBootstrap = readFileSync("skills/ha-nova/session-bootstrap.md", "utf8");
   const claudeInstall = readFileSync(".claude/INSTALL.md", "utf8");
   const codexInstall = readFileSync(".codex/INSTALL.md", "utf8");
   const antigravityInstall = readFileSync(".antigravity/INSTALL.md", "utf8");
@@ -27,8 +29,13 @@ describe("client install docs contract", () => {
     expect(readme).not.toContain("npm.cmd");
     expect(readme).not.toContain("5 tested clients");
     expect(readme).toContain("ha-nova uninstall --purge");
-    expect(readme).toContain("Copy the one-liner for your OS");
-    expect(readme).toContain("https://github.com/markusleben/ha-nova/releases/latest");
+    expect(readme).toContain(
+      "curl -fsSL https://raw.githubusercontent.com/markusleben/ha-nova/main/install.sh | bash"
+    );
+    expect(readme).toContain(
+      "irm https://raw.githubusercontent.com/markusleben/ha-nova/main/install.ps1 | iex"
+    );
+    expect(readme).toContain("The installer selects the latest stable release.");
     expect(readme).toContain("Git for Windows / Git Bash");
     expect(readme).toContain("Google Antigravity Desktop or CLI must be installed");
     expect(readme).toContain("Google Antigravity is the current Google client path");
@@ -36,8 +43,6 @@ describe("client install docs contract", () => {
     expect(readme).not.toContain("%LOCALAPPDATA%\\Programs\\antigravity\\Antigravity.exe");
     // Hermes is now a listed (preview) client like the others; the gate is resolved.
     expect(readme).not.toContain("docs/reference/hermes-platform-validation.md");
-    expect(readme).not.toContain("raw.githubusercontent.com/markusleben/ha-nova/main/install.sh");
-    expect(readme).not.toContain("raw.githubusercontent.com/markusleben/ha-nova/main/install.ps1");
   });
 
   it("keeps client overlays scoped to client-specific deltas", () => {
@@ -46,6 +51,20 @@ describe("client install docs contract", () => {
     expectOverlayToPointBackToReadme(antigravityInstall);
     expectOverlayToPointBackToReadme(opencodeInstall);
     expectOverlayToPointBackToReadme(hermesInstall);
+  });
+
+  it("keeps update completion guidance consistent across every client", () => {
+    const instruction = "After `ha-nova update` succeeds, start a new AI client session to load the updated HA NOVA skills.";
+    for (const overlay of [claudeInstall, codexInstall, antigravityInstall, opencodeInstall, hermesInstall]) {
+      expect(overlay).toContain(instruction);
+    }
+    expect(contextSkill).toContain("../ha-nova/session-bootstrap.md");
+    expect(sessionBootstrap).toContain(
+      "After a successful `ha-nova update`, tell the"
+    );
+    expect(sessionBootstrap).toMatch(
+      /user to start a new\s+AI-client session/
+    );
   });
 
   it("keeps reciprocal client overlay links on the current Antigravity overlay", () => {
@@ -143,6 +162,10 @@ describe("client install docs contract", () => {
     expect(hermesInstall).toContain("local-first HA NOVA client");
     expect(hermesInstall).toContain("same home network or a private VPN/overlay route");
     expect(hermesInstall).toContain("generic public VPS");
+    expect(hermesInstall).toContain("ha-nova cloud add");
+    expect(hermesInstall).toContain(
+      "Service, headless, SSH, WSL2, and generic VPS sessions stay local-only",
+    );
     expect(hermesInstall).toContain("Do not expose the HA NOVA Relay directly to the public internet.");
     expect(hermesInstall).toContain("docs/reference/hermes-platform-validation.md");
     expect(hermesInstall).toContain("~/.hermes/skills/ha-nova/");

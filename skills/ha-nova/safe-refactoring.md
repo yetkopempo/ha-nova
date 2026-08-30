@@ -46,7 +46,7 @@ ha-nova relay ws --data-file <payload-file>
 ha-nova relay ws --data-file <payload-file>
 ```
 
-Only proceed with permanent deletion after tokenized confirmation (see write skill → Phase 2).
+Only proceed with permanent deletion after the typed confirmation code (see write skill → Phase 2).
 
 ## Entity Rename Workflow
 
@@ -127,13 +127,14 @@ If no automations or scripts reference it, it's an orphan candidate.
 
 ## search/related Signal Strength
 
+- Read discipline: parse consumer checks through `skills/ha-nova/search-related-consumers.jq` (automation/script/scene projection; recreate per `skills/ha-nova/relay-api.md` → Parsing rule on flat-copy installs). Only a verified-shape empty result is a no-consumer signal; a filter error or a scan that did not run is inconclusive and never justifies a cleanup verdict.
 - Helpers: strong signal for direct consumers
 - Automations and scripts: medium signal; direct refs are good, templates can still hide usage
 - Scenes: weak signal; always do a manual check before destructive cleanup
 
 ### Cleanup
 
-For confirmed orphans, delete via the helper skill flow (tokenized confirmation required).
+For confirmed orphans, delete via the helper skill flow (typed confirmation code required).
 
 ## Safety Rules
 
@@ -143,6 +144,6 @@ For confirmed orphans, delete via the helper skill flow (tokenized confirmation 
 - Template references (`states('...')`, `is_state('...')`) are NOT auto-updated — must be fixed manually
 - Prefer disable over delete when impact is unclear
 - Orphan detection is advisory — some helpers are intentionally UI-only
-- All deletes require tokenized confirmation (`confirm:<token>`), including cleanup, undo-create, orphan cleanup, failed-create cleanup, and deleting items created earlier in the same session.
+- All deletes require the typed confirmation code (`confirm:<token>`), including cleanup, undo-create, orphan cleanup, failed-create cleanup, and deleting items created earlier in the same session.
 - A delete is not done until follow-up verification confirms the target is gone.
 - Do not present a destructive change as complete when consumer impact is still unresolved.

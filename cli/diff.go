@@ -12,16 +12,18 @@ import (
 	"strings"
 )
 
-// runDiffCommand renders a deterministic, human-readable change list between two
-// Home Assistant config bodies (the "before" and "after" of an update). The
-// output is a stable artifact — like `git diff` — that the skill prints verbatim
-// under a localized "## Changes" heading. Keeping the rendering here, not in the
-// LLM, makes the diff identical on every run and across clients/models. The
-// presentation helpers (labels, value formatting) live in diff_format.go.
+// runDiffCommand renders a deterministic, human-readable change table between
+// two Home Assistant config bodies (the "before" and "after" of an update).
+// Every output line is one GFM table data row `| Field | before | after |`;
+// the skill adds its localized header row above and prints the rows verbatim.
+// The output is a stable artifact — like `git diff` — and keeping the
+// rendering here, not in the LLM, makes it identical on every run and across
+// clients/models. Presentation helpers (labels, cells) live in diff_format.go.
 func runDiffCommand(_ runtimePaths, args []string) int {
 	fs := flag.NewFlagSet("diff", flag.ContinueOnError)
 	fs.SetOutput(io.Discard)
 	var beforePath, afterPath, outPath string
+	var outPathSet bool
 	fs.StringVar(&beforePath, "before", "", "path to the current/before config JSON")
 	fs.StringVar(&afterPath, "after", "", "path to the proposed/after config JSON")
 	fs.StringVar(&outPath, "out", "", "optional path to write the rendered diff")
@@ -30,6 +32,19 @@ func runDiffCommand(_ runtimePaths, args []string) int {
 			return 0
 		}
 		printErr("%s", err)
+		return 1
+	}
+	fs.Visit(func(f *flag.Flag) {
+		if f.Name == "out" {
+			outPathSet = true
+		}
+	})
+	if fs.NArg() != 0 {
+		printErr("diff does not accept positional arguments; no diff was rendered")
+		return 1
+	}
+	if outPathSet && strings.TrimSpace(outPath) == "" {
+		printErr("--out requires a non-empty path; no diff was rendered")
 		return 1
 	}
 	if strings.TrimSpace(beforePath) == "" || strings.TrimSpace(afterPath) == "" {
@@ -47,7 +62,7 @@ func runDiffCommand(_ runtimePaths, args []string) int {
 		return 1
 	}
 	lines := renderConfigChanges(before, after)
-	if strings.TrimSpace(outPath) != "" {
+	if outPathSet {
 		rendered := ""
 		if len(lines) > 0 {
 			rendered = strings.Join(lines, "\n") + "\n"
@@ -88,6 +103,10 @@ func configObjectFromBytes(data []byte) (map[string]interface{}, error) {
 }
 
 func decodeJSONNumber(data []byte) (interface{}, error) {
+	data, err := strictJSONBytes(data, "config JSON")
+	if err != nil {
+		return nil, err
+	}
 	dec := json.NewDecoder(bytes.NewReader(data))
 	dec.UseNumber()
 	var v interface{}
@@ -139,40 +158,16 @@ func normalizeConfig(m map[string]interface{}) map[string]interface{} {
 	return out
 }
 
-type configChange struct {
-	order int
-	path  string
-	text  string
-}
-
-func renderConfigChanges(before, after map[string]interface{}) []string {
-	var changes []configChange
-	diffMaps(nil, normalizeConfig(before), normalizeConfig(after), &changes)
-	sort.SliceStable(changes, func(i, j int) bool {
-		if changes[i].order != changes[j].order {
-			return changes[i].order < changes[j].order
-		}
-		return changes[i].path < changes[j].path
-	})
-	lines := make([]string, 0, len(changes))
-	var prev configChange
-	for i, c := range changes {
-		// The aligned-item pairing and the notification-copy pass can surface
-		// the same field change twice; identical entries are adjacent after
-		// the stable sort.
-		if i > 0 && c.path == prev.path && c.text == prev.text {
-			continue
-		}
-		lines = append(lines, "- "+c.text)
-		prev = c
-	}
-	return lines
-}
-
 type segment struct {
 	key     string
 	index   int
 	isIndex bool
+	// anchor is the recognizable summary of the list item this index points at
+	// ("condition sensor.x", `"My alias"`). humanizeLabel lets it replace the
+	// positional index tokens through or/and wrappers: a layperson recognizes
+	// the entity, never the index chain. Key and branch tokens survive, and
+	// disambiguateLabels restores the full chain on a label collision.
+	anchor string
 }
 
 func diffValues(segs []segment, before, after interface{}, changes *[]configChange) {
@@ -243,16 +238,19 @@ func diffArrays(segs []segment, before, after []interface{}, changes *[]configCh
 		// a bare count can actively misrepresent a change (nesting actions into
 		// one if-block reduces the count without removing behavior).
 		*changes = append(*changes, configChange{
-			order: topOrder(segs),
-			path:  pathString(segs),
-			text:  fmt.Sprintf("%s: %d → %d items", humanizeLabel(segs), len(before), len(after)),
+			order:      topOrder(segs),
+			path:       pathString(segs),
+			segs:       segs,
+			label:      humanizeLabel(segs),
+			beforeCell: itemsCell(len(before)),
+			afterCell:  itemsCell(len(after)),
 		})
 		diffAlignedItems(segs, before, after, changes)
 		diffNotificationCopyInCommonItems(segs, before, after, changes)
 		return
 	}
 	for i := range before {
-		diffValues(appendSegment(segs, segment{index: i, isIndex: true}), before[i], after[i], changes)
+		diffValues(appendSegment(segs, segment{index: i, isIndex: true, anchor: itemAnchorFor(segs, before, before[i])}), before[i], after[i], changes)
 	}
 }
 
@@ -282,11 +280,11 @@ func diffAlignedItems(segs []segment, before, after []interface{}, changes *[]co
 	aMid := after[prefix : len(after)-suffix]
 	paired := 0
 	for paired < len(bMid) && paired < len(aMid) && alignedPairable(bMid[paired], aMid[paired]) {
-		diffValues(appendSegment(segs, segment{index: prefix + paired, isIndex: true}), bMid[paired], aMid[paired], changes)
+		diffValues(appendSegment(segs, segment{index: prefix + paired, isIndex: true, anchor: itemAnchorFor(segs, before, bMid[paired])}), bMid[paired], aMid[paired], changes)
 		paired++
 	}
-	renderAlignedSide(segs, bMid[paired:], prefix+paired, "removed (was %s)", changes)
-	renderAlignedSide(segs, aMid[paired:], prefix+paired, "added (%s)", changes)
+	renderAlignedSide(segs, bMid[paired:], prefix+paired, true, changes)
+	renderAlignedSide(segs, aMid[paired:], prefix+paired, false, changes)
 }
 
 // alignedPairable reports whether two items are the same kind of step, so a
@@ -297,105 +295,47 @@ func alignedPairable(before, after interface{}) bool {
 	return kind != "" && kind == configItemKind(after)
 }
 
-func renderAlignedSide(segs []segment, items []interface{}, offset int, verbFormat string, changes *[]configChange) {
+// renderAlignedSide emits one table row per added/removed item; the empty
+// side of the row carries the absence marker, so the Before/After columns
+// encode add vs remove positionally.
+func renderAlignedSide(segs []segment, items []interface{}, offset int, removed bool, changes *[]configChange) {
 	rendered := len(items)
 	if rendered > maxAlignedItemsPerSide {
 		rendered = maxAlignedItemsPerSide
 	}
+	side := func(itemSegs []segment, summary string) configChange {
+		c := configChange{
+			order:      topOrder(segs),
+			path:       pathString(itemSegs),
+			segs:       itemSegs,
+			beforeCell: summary,
+			afterCell:  "—",
+		}
+		if !removed {
+			c.beforeCell, c.afterCell = c.afterCell, c.beforeCell
+		}
+		return c
+	}
 	for i := 0; i < rendered; i++ {
 		itemSegs := appendSegment(segs, segment{index: offset + i, isIndex: true})
-		*changes = append(*changes, configChange{
-			order: topOrder(segs),
-			path:  pathString(itemSegs),
-			text:  fmt.Sprintf("%s: %s", humanizeLabel(itemSegs), fmt.Sprintf(verbFormat, summarizeConfigItem(items[i]))),
-		})
+		c := side(itemSegs, summarizeConfigItem(items[i]))
+		c.label = humanizeLabel(itemSegs)
+		*changes = append(*changes, c)
 	}
 	if len(items) > rendered {
-		*changes = append(*changes, configChange{
-			order: topOrder(segs),
-			path:  pathString(appendSegment(segs, segment{index: offset + rendered, isIndex: true})),
-			text:  fmt.Sprintf("%s: … and %d more %s", humanizeLabel(segs), len(items)-rendered, alignedVerbWord(verbFormat)),
-		})
-	}
-}
-
-func alignedVerbWord(verbFormat string) string {
-	if strings.HasPrefix(verbFormat, "removed") {
-		return "removed"
-	}
-	return "added"
-}
-
-func appendSegment(segs []segment, s segment) []segment {
-	out := make([]segment, len(segs)+1)
-	copy(out, segs)
-	out[len(segs)] = s
-	return out
-}
-
-func makeChange(segs []segment, before, after interface{}) configChange {
-	label := humanizeLabel(segs)
-	var text string
-	switch {
-	case before == nil:
-		text = fmt.Sprintf("%s: added (%s)", label, formatValue(after))
-	case after == nil:
-		text = fmt.Sprintf("%s: removed (was %s)", label, formatValue(before))
-	default:
-		bf, af := formatValue(before), formatValue(after)
-		if bf == af {
-			// Same rendered text but a real change → a type/representation
-			// difference (e.g. number 5 vs string "5"). Disambiguate by type so
-			// the user never sees a confusing "5 → 5".
-			bf = fmt.Sprintf("%s (%s)", bf, jsonTypeName(before))
-			af = fmt.Sprintf("%s (%s)", af, jsonTypeName(after))
+		verb := "added"
+		if removed {
+			verb = "removed"
 		}
-		text = fmt.Sprintf("%s: %s → %s", label, bf, af)
+		// The honest cap stays a table row: a plain line mid-output would
+		// terminate the GFM table and split it in two.
+		c := side(appendSegment(segs, segment{index: offset + rendered, isIndex: true}), fmt.Sprintf("… and %d more %s", len(items)-rendered, verb))
+		c.segs = segs
+		c.label = humanizeLabel(segs)
+		*changes = append(*changes, c)
 	}
-	return configChange{order: topOrder(segs), path: pathString(segs), text: text}
 }
 
-// topKeyOrder pins the order of the well-known top-level fields so the change
-// list always reads in the same sequence; everything else sorts after, by path.
-var topKeyOrder = map[string]int{
-	"alias": 0, "description": 1, "mode": 2, "enabled": 3,
-	"triggers": 4, "conditions": 5, "actions": 6, "sequence": 7,
-}
-
-func topOrder(segs []segment) int {
-	if len(segs) > 0 && !segs[0].isIndex {
-		if o, ok := topKeyOrder[segs[0].key]; ok {
-			return o
-		}
-	}
-	return 100
-}
-
-func pathString(segs []segment) string {
-	var sb strings.Builder
-	for _, s := range segs {
-		if s.isIndex {
-			// Zero-padded so lexicographic path sorting equals numeric index
-			// order ("[0002]" < "[0010]"); paths are sort keys, never shown.
-			fmt.Fprintf(&sb, "[%04d]", s.index)
-		} else {
-			if sb.Len() > 0 {
-				sb.WriteByte('.')
-			}
-			sb.WriteString(s.key)
-		}
-	}
-	return sb.String()
-}
-
-// valuesEqual compares two decoded JSON values for semantic equality. Numbers
-// that are mathematically equal but differ in representation (5 vs 5.0, 1e3 vs
-// 1000, including INSIDE duration maps like {"seconds":30} vs {"seconds":30.0})
-// compare equal: Home Assistant can round-trip a config and change the numeric
-// form, and a false "drift" would block a safe revert and train the user to wave
-// the guard away. big.Rat keeps large ints (epoch-nanos, ids) exact, so distinct
-// values never collapse to a false match. A number vs a string of the same digits
-// stays a real change (different types). Maps are key-order-independent.
 func valuesEqual(a, b interface{}) bool {
 	switch av := a.(type) {
 	case json.Number:

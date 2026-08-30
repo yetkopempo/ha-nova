@@ -1,4 +1,4 @@
-import { timingSafeEqual } from "node:crypto";
+import { constantTimeEqualSecret } from "./secret-compare.js";
 
 export interface AuthSuccess {
   ok: true;
@@ -26,7 +26,7 @@ export function authorizeRequest(
     return unauthorized("Invalid bearer token");
   }
 
-  if (!constantTimeEqual(token, expectedToken)) {
+  if (!constantTimeEqualSecret(token, expectedToken)) {
     return unauthorized("Invalid bearer token");
   }
 
@@ -40,15 +40,4 @@ function unauthorized(message: string): AuthFailure {
     code: "UNAUTHORIZED",
     message
   };
-}
-
-function constantTimeEqual(left: string, right: string): boolean {
-  const leftBuffer = Buffer.from(left);
-  const rightBuffer = Buffer.from(right);
-
-  if (leftBuffer.length !== rightBuffer.length) {
-    return false;
-  }
-
-  return timingSafeEqual(leftBuffer, rightBuffer);
 }

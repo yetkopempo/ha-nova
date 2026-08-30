@@ -2,6 +2,7 @@ package main
 
 import (
 	"bufio"
+	"bytes"
 	"fmt"
 	"io"
 	"net/http"
@@ -67,7 +68,6 @@ func TestInteractiveSetupFreshInstallShowsWizardAndInstallsAntigravitySkills(t *
 		[]string{"4", haServer.URL},
 		setupWizardRelayInstallPrompts(),
 		setupWizardGenerateRelayTokenPrompts(),
-		setupWizardLLATPrompts(),
 	)
 
 	exitCode := 0
@@ -89,15 +89,10 @@ func TestInteractiveSetupFreshInstallShowsWizardAndInstallsAntigravitySkills(t *
 		"Next, add the HA NOVA app repository to your Home Assistant.",
 		"Once the repository is added:",
 		`Search for "NOVA Relay"`,
-		"NOVA needs two passwords",
-		"This step is only for the Relay Auth Token. The Home Assistant Access Token comes next as its own step.",
-		"Create a Home Assistant Access Token in Home Assistant.",
-		"Then paste it into NOVA Relay.",
-		"[ Only if needed ]",
-		"Still missing the Relay Auth Token in NOVA Relay?",
-		"Here it is again:",
-		"Press Enter to open your HA profile",
-		"Press Enter to open the relay settings",
+		"NOVA keeps client and Home Assistant access separate",
+		"Standalone Container/Core relays keep HA_LLAT in the server environment; the CLI never asks for it.",
+		`Paste the token into the "Relay Auth Token" field`,
+		"Press Enter after you saved the Relay Auth Token and restarted NOVA Relay",
 		"Setting up HA NOVA for Google Antigravity...",
 		"Setup complete!",
 	} {
@@ -120,7 +115,7 @@ func TestInteractiveSetupFreshInstallShowsWizardAndInstallsAntigravitySkills(t *
 	if !(discoveryIdx < hostPromptIdx && hostPromptIdx < stepOneIdx) {
 		t.Fatalf("expected discovery and host prompt before step 1:\n%s", output)
 	}
-	for step := 1; step <= 5; step++ {
+	for step := 1; step <= 4; step++ {
 		if !hasSetupStep(output, step) {
 			t.Fatalf("wizard output missing step %d marker:\n%s", step, output)
 		}
@@ -129,10 +124,8 @@ func TestInteractiveSetupFreshInstallShowsWizardAndInstallsAntigravitySkills(t *
 	if len(generatedTokenMatch) != 2 {
 		t.Fatalf("expected generated relay token in wizard output:\n%s", output)
 	}
-	if !strings.Contains(output, "Still missing the Relay Auth Token in NOVA Relay?") ||
-		!strings.Contains(output, "Here it is again:") ||
-		!strings.Contains(output, generatedTokenMatch[1]) {
-		t.Fatalf("expected LLAT step to repeat relay token as reminder:\n%s", output)
+	if strings.Count(output, generatedTokenMatch[1]) != 1 {
+		t.Fatalf("expected generated relay token to be displayed exactly once:\n%s", output)
 	}
 
 	if _, err := os.Stat(filepath.Join(home, ".gemini", "config", "skills", "ha-nova", "SKILL.md")); err != nil {
@@ -160,6 +153,41 @@ func TestInteractiveSetupFreshInstallShowsWizardAndInstallsAntigravitySkills(t *
 	}
 	if saved.RelayBaseURL != relayServer.URL {
 		t.Fatalf("saved.RelayBaseURL = %q, want %q", saved.RelayBaseURL, relayServer.URL)
+	}
+}
+
+func TestInteractiveSetupWithoutAvailableClientReturnsGuidance(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	t.Setenv("HA_NOVA_DEV_ROOT", repoRootForSetupTest(t))
+	withClientRuntimeAvailability(t, map[string]bool{})
+
+	paths, err := detectPaths()
+	if err != nil {
+		t.Fatalf("detectPaths() error: %v", err)
+	}
+
+	exitCode := 1
+	stdout, stderr := captureInteractiveSetupIO(t, "", func() int {
+		clientRuntimeDetectedForStatus = func(string) bool { return false }
+		exitCode = interactiveSetup(paths, runtimeConfig{}, loadStateOrDefault(paths), "", "", "", "", "", false)
+		return exitCode
+	})
+	if exitCode != 0 {
+		t.Fatalf("interactiveSetup() exit = %d, want 0\nstdout:\n%s\nstderr:\n%s", exitCode, stdout, stderr)
+	}
+
+	output := stdout + stderr
+	for _, want := range []string{
+		"No supported AI client is ready on this machine yet.",
+		"Install one supported client first, then rerun: ha-nova setup",
+	} {
+		if !strings.Contains(output, want) {
+			t.Fatalf("missing-client guidance missing %q:\n%s", want, output)
+		}
+	}
+	if strings.Contains(output, "[ha-nova] ERROR") {
+		t.Fatalf("missing-client guidance must not render as an error:\n%s", output)
 	}
 }
 
@@ -198,7 +226,6 @@ func TestInteractiveSetupFreshInstallCanTargetHermes(t *testing.T) {
 		[]string{"5", haServer.URL},
 		setupWizardRelayInstallPrompts(),
 		setupWizardGenerateRelayTokenPrompts(),
-		setupWizardLLATPrompts(),
 	)
 
 	exitCode := 0
@@ -277,7 +304,6 @@ func TestInteractiveSetupOffersServiceCredentialsForHermesWhenKeyringLocked(t *t
 		[]string{"5", "y", haServer.URL},
 		setupWizardRelayInstallPrompts(),
 		setupWizardGenerateRelayTokenPrompts(),
-		setupWizardLLATPrompts(),
 	)
 
 	exitCode := 0
@@ -352,7 +378,6 @@ func TestInteractiveSetupFreshInstallCanPasteExistingRelayToken(t *testing.T) {
 		[]string{"4", haServer.URL},
 		setupWizardRelayInstallPrompts(),
 		setupWizardPasteRelayTokenPrompts(pastedToken),
-		setupWizardLLATPrompts(),
 	)
 
 	exitCode := 0
@@ -381,7 +406,7 @@ func TestInteractiveSetupFreshInstallCanPasteExistingRelayToken(t *testing.T) {
 	}
 }
 
-func TestInteractiveSetupFreshInstallPastedTokenSkipsLLATWalkthroughWhenVerifySucceeds(t *testing.T) {
+func TestInteractiveSetupFreshInstallManualTokenFallbackRunsAppSetupBeforeVerify(t *testing.T) {
 	home := t.TempDir()
 	t.Setenv("HOME", home)
 	t.Setenv("HA_NOVA_NO_BROWSER", "1")
@@ -431,20 +456,21 @@ func TestInteractiveSetupFreshInstallPastedTokenSkipsLLATWalkthroughWhenVerifySu
 		"Connected to Home Assistant",
 	} {
 		if !strings.Contains(output, want) {
-			t.Fatalf("expected reuse-token verify-first text %q in output:\n%s", want, output)
+			t.Fatalf("expected explicit-token fallback text %q in output:\n%s", want, output)
 		}
 	}
-	for _, unwanted := range []string{
+	// The App receives upstream access automatically: the explicit-token
+	// fallback must not surface any Home Assistant access-token walkthrough.
+	for _, forbidden := range []string{
 		"Create a Home Assistant Access Token in Home Assistant.",
 		"Press Enter to open your HA profile",
-		"Press Enter to open the relay settings",
 	} {
-		if strings.Contains(output, unwanted) {
-			t.Fatalf("did not expect LLAT walkthrough text %q in output:\n%s", unwanted, output)
+		if strings.Contains(output, forbidden) {
+			t.Fatalf("explicit-token fallback must not show LLAT setup %q:\n%s", forbidden, output)
 		}
 	}
 	if !hasSetupStep(output, 3) {
-		t.Fatalf("expected reuse-token verify-first step marker in output:\n%s", output)
+		t.Fatalf("expected explicit-token verification step marker in output:\n%s", output)
 	}
 	if strings.Contains(output, "automations\n\n\n  Existing relay token found:") {
 		t.Fatalf("expected single-gap spacing before reuse-token note:\n%s", output)
@@ -497,7 +523,6 @@ func TestInteractiveSetupFailsEarlyWhenLinuxKeyringPreflightFails(t *testing.T) 
 		[]string{"4", haServer.URL},
 		setupWizardRelayInstallPrompts(),
 		setupWizardGenerateRelayTokenPrompts(),
-		setupWizardLLATPrompts(),
 	)
 
 	exitCode := 0
@@ -528,6 +553,7 @@ func TestInteractiveSetupFailsEarlyWhenLinuxKeyringPreflightFails(t *testing.T) 
 }
 
 func TestInteractiveSetupRecoversSecureStorageBeforeHostStep(t *testing.T) {
+	allowNativeSecureStoragePromptForTest(t)
 	home := t.TempDir()
 	t.Setenv("HOME", home)
 	t.Setenv("HA_NOVA_NO_BROWSER", "1")
@@ -554,14 +580,12 @@ func TestInteractiveSetupRecoversSecureStorageBeforeHostStep(t *testing.T) {
 	originalPreflight := relayAuthTokenSetupPreflightForSetup
 	originalSupport := detectPlatformSecureStorageRecoverySupportForSetup
 	originalRunRecovery := runPlatformSecureStorageRecoveryForSetup
-	originalReadSecret := readSetupSecretInputForSetup
 	originalTTY := writerSupportsTTYForSetup
 	originalInputTTY := uiInputSupportsTTY
 	defer func() {
 		relayAuthTokenSetupPreflightForSetup = originalPreflight
 		detectPlatformSecureStorageRecoverySupportForSetup = originalSupport
 		runPlatformSecureStorageRecoveryForSetup = originalRunRecovery
-		readSetupSecretInputForSetup = originalReadSecret
 		writerSupportsTTYForSetup = originalTTY
 		uiInputSupportsTTY = originalInputTTY
 	}()
@@ -578,21 +602,12 @@ func TestInteractiveSetupRecoversSecureStorageBeforeHostStep(t *testing.T) {
 		return true, nil
 	}
 	recoveryCalls := 0
-	runPlatformSecureStorageRecoveryForSetup = func(action platformSecureStorageRecoveryAction, secret []byte) error {
+	runPlatformSecureStorageRecoveryForSetup = func(action platformSecureStorageRecoveryAction) error {
 		recoveryCalls++
 		if action != platformSecureStorageRecoveryInitialize {
 			t.Fatalf("unexpected recovery action %q", action)
 		}
-		if string(secret) != "linux-local-keyring" {
-			t.Fatalf("unexpected recovery secret %q", string(secret))
-		}
 		return nil
-	}
-	readSetupSecretInputForSetup = func(fd int) ([]byte, error) {
-		if fd <= 0 {
-			t.Fatalf("expected terminal fd, got %d", fd)
-		}
-		return []byte("linux-local-keyring"), nil
 	}
 	writerSupportsTTYForSetup = func(io.Writer) bool { return true }
 	uiInputSupportsTTY = func() bool { return true }
@@ -606,7 +621,6 @@ func TestInteractiveSetupRecoversSecureStorageBeforeHostStep(t *testing.T) {
 		[]string{"4", "", haServer.URL},
 		setupWizardRelayInstallPrompts(),
 		setupWizardGenerateRelayTokenPrompts(),
-		setupWizardLLATPrompts(),
 	)
 
 	exitCode := 0
@@ -622,13 +636,13 @@ func TestInteractiveSetupRecoversSecureStorageBeforeHostStep(t *testing.T) {
 	if !strings.Contains(output, "Local secure storage needs setup") {
 		t.Fatalf("expected dedicated secure storage recovery page:\n%s", output)
 	}
-	if !strings.Contains(output, "not the Relay token or the Home Assistant token") {
-		t.Fatalf("expected explicit local-password guidance:\n%s", output)
+	if !strings.Contains(output, "trusted desktop prompt") {
+		t.Fatalf("expected native secure-storage prompt guidance:\n%s", output)
 	}
-	if !strings.Contains(output, "HA NOVA, NOVA Relay, and Home Assistant never receive it.") {
-		t.Fatalf("expected explicit local-only keyring guidance:\n%s", output)
+	if !strings.Contains(output, "HA NOVA never reads it in the terminal") {
+		t.Fatalf("expected explicit no-terminal-password guidance:\n%s", output)
 	}
-	if !strings.Contains(output, "Set up local secure storage now") {
+	if !strings.Contains(output, "Open the system secure-storage setup now") {
 		t.Fatalf("expected recovery action prompt:\n%s", output)
 	}
 	if !strings.Contains(output, "Home Assistant address") {
@@ -780,7 +794,6 @@ func TestInteractiveSetupBackFromRelayInstallLetsUserChangeHost(t *testing.T) {
 		[]string{"4", firstHAServer.URL, "back", secondHAServer.URL},
 		setupWizardRelayInstallPrompts(),
 		setupWizardPasteRelayTokenPrompts("relay-token-from-other-device"),
-		setupWizardLLATPrompts(),
 	)
 
 	exitCode := 0
@@ -873,7 +886,7 @@ func TestInteractiveSetupRelayTokenFlagCanBackToHostAfterVerifyFailure(t *testin
 		if baseURL == failingRelay.URL {
 			return relayWSPingResponse{StatusCode: http.StatusBadGateway, Body: []byte("upstream unavailable")}, nil
 		}
-		return relayWSPingResponse{StatusCode: http.StatusOK, Body: []byte(`{"type":"pong"}`)}, nil
+		return relayWSPingResponse{StatusCode: http.StatusOK, Body: []byte(`{"ok":true,"data":{"type":"pong"}}`)}, nil
 	}
 
 	paths, err := detectPaths()
@@ -884,9 +897,7 @@ func TestInteractiveSetupRelayTokenFlagCanBackToHostAfterVerifyFailure(t *testin
 	input := joinSetupInputs(
 		[]string{firstHAServer.URL},
 		setupWizardRelayInstallPrompts(),
-		setupWizardLLATPrompts(),
 		[]string{"back", "back", secondHAServer.URL},
-		setupWizardLLATPrompts(),
 		[]string{"n"},
 	)
 
@@ -938,12 +949,6 @@ func TestInteractiveSetupResumeCanChangeHostFromRepairMenuWithoutTokenRePrompt(t
 	// Created after every live server: a later httptest bind in this test could
 	// be handed the freed port, silently resurrecting the "dead" address.
 	deadHAURL := newDeadServerURL()
-
-	originalDetect := detectDefaultHAHostChoiceForSetup
-	t.Cleanup(func() { detectDefaultHAHostChoiceForSetup = originalDetect })
-	detectDefaultHAHostChoiceForSetup = func(cfg runtimeConfig) (string, string, bool) {
-		return "", "", false
-	}
 
 	paths, err := detectPaths()
 	if err != nil {
@@ -1029,12 +1034,6 @@ func TestInteractiveSetupHostChangePersistsNewHostEvenWhenUserExitsBeforeVerifyS
 	defer failingRelayServer.Close()
 
 	deadHAURL := newDeadServerURL()
-
-	originalDetect := detectDefaultHAHostChoiceForSetup
-	t.Cleanup(func() { detectDefaultHAHostChoiceForSetup = originalDetect })
-	detectDefaultHAHostChoiceForSetup = func(cfg runtimeConfig) (string, string, bool) {
-		return "", "", false
-	}
 
 	paths, err := detectPaths()
 	if err != nil {
@@ -1132,10 +1131,10 @@ func TestInteractiveSetupExitAtTokenChoiceCancelsCleanly(t *testing.T) {
 }
 
 func TestInteractiveSetupInitialClientPageAllowsRepeatedBack(t *testing.T) {
-	originalDetect := detectDefaultHAHostChoiceForSetup
-	t.Cleanup(func() { detectDefaultHAHostChoiceForSetup = originalDetect })
-	detectDefaultHAHostChoiceForSetup = func(cfg runtimeConfig) (string, string, bool) {
-		return "", "", false
+	originalDiscover := discoverReachableHAHostsForSetup
+	t.Cleanup(func() { discoverReachableHAHostsForSetup = originalDiscover })
+	discoverReachableHAHostsForSetup = func(runtimeConfig) ([]setupDiscoveryCandidate, string) {
+		return nil, ""
 	}
 
 	home := t.TempDir()
@@ -1143,6 +1142,7 @@ func TestInteractiveSetupInitialClientPageAllowsRepeatedBack(t *testing.T) {
 	t.Setenv("HA_NOVA_NO_BROWSER", "1")
 	t.Setenv("HA_NOVA_ALLOW_INSECURE_TEST_KEYRING", "1")
 	t.Setenv("HA_NOVA_TEST_KEYRING_FILE", filepath.Join(home, ".config", "ha-nova", ".test-relay-auth-token"))
+	t.Setenv("HA_NOVA_DEV_ROOT", repoRootForSetupTest(t))
 
 	haServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		w.WriteHeader(http.StatusOK)
@@ -1169,7 +1169,6 @@ func TestInteractiveSetupInitialClientPageAllowsRepeatedBack(t *testing.T) {
 		[]string{"back", "back", "4", haServer.URL},
 		setupWizardRelayInstallPrompts(),
 		setupWizardPasteRelayTokenPrompts("relay-token-from-other-device"),
-		setupWizardLLATPrompts(),
 	)
 
 	exitCode := 0
@@ -1191,6 +1190,7 @@ func TestInteractiveSetupAlreadyDoneUsesResumeBanner(t *testing.T) {
 	t.Setenv("HA_NOVA_NO_BROWSER", "1")
 	t.Setenv("HA_NOVA_ALLOW_INSECURE_TEST_KEYRING", "1")
 	t.Setenv("HA_NOVA_TEST_KEYRING_FILE", filepath.Join(home, ".config", "ha-nova", ".test-relay-auth-token"))
+	stubCensusTTY(t, true, true)
 
 	relayServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path != "/health" {
@@ -1228,9 +1228,16 @@ func TestInteractiveSetupAlreadyDoneUsesResumeBanner(t *testing.T) {
 	}
 	writeInstalledClaudePluginFixture(t, home)
 	writeClaudeMarketplaceRegistrationFixture(t, home, filepath.Join(paths.ConfigDir, "claude-marketplace"))
+	if err := markCensusLifecycleStopped(paths); err != nil {
+		t.Fatalf("mark census lifecycle stopped: %v", err)
+	}
+	lifecycleMarker := [][]byte{
+		captureInstallLifecycleGeneration(paths),
+		captureCensusLifecycleMarker(paths),
+	}
 
-	stdout, stderr := captureInteractiveSetupIO(t, "", func() int {
-		return interactiveSetup(paths, cfg, state, "claude", "", "", "", "", false)
+	stdout, stderr := captureInteractiveSetupIO(t, "2\n", func() int {
+		return interactiveSetup(paths, cfg, state, "claude", "", "", "", "", false, lifecycleMarker...)
 	})
 
 	output := stdout + stderr
@@ -1239,6 +1246,65 @@ func TestInteractiveSetupAlreadyDoneUsesResumeBanner(t *testing.T) {
 	}
 	if strings.Contains(output, "Setup complete!") {
 		t.Fatalf("did not expect fresh-setup success banner in resume output:\n%s", output)
+	}
+	if censusLifecycleStopped(paths) {
+		t.Fatal("successful already-complete setup did not clear its matching lifecycle marker")
+	}
+	if !strings.Contains(output, censusAskQuestionPrefix) {
+		t.Fatalf("successful already-complete setup omitted the one-time census question:\n%s", output)
+	}
+	census := loadCensusState(paths)
+	if census.Answer != "no" || census.Enabled {
+		t.Fatalf("explicit No census answer was not applied exactly once: %+v", census)
+	}
+
+	generationAfterReactivation := captureInstallLifecycleGeneration(paths)
+	secondLifecycle := [][]byte{
+		generationAfterReactivation,
+		captureCensusLifecycleMarker(paths),
+	}
+	secondExitCode := 0
+	captureInteractiveSetupIO(t, "\n", func() int {
+		secondExitCode = interactiveSetup(paths, cfg, state, "claude", "", "", "", "", false, secondLifecycle...)
+		return secondExitCode
+	})
+	if secondExitCode != 0 {
+		t.Fatalf("unchanged already-complete setup exit = %d, want 0", secondExitCode)
+	}
+	if got := captureInstallLifecycleGeneration(paths); !bytes.Equal(got, generationAfterReactivation) {
+		t.Fatal("unchanged already-complete setup rotated the install lifecycle generation")
+	}
+}
+
+func TestCompleteSetupLifecycleFailurePreventsSuccessBanner(t *testing.T) {
+	paths := setupServerCommandTest(t, `{"schema_version":1}`)
+	lifecycleMarker := [][]byte{
+		captureInstallLifecycleGeneration(paths),
+		captureCensusLifecycleMarker(paths),
+	}
+	release, acquired := acquireCensusLock(paths)
+	if !acquired {
+		t.Fatal("acquireCensusLock() = false")
+	}
+	defer release()
+
+	var output strings.Builder
+	handled, code := maybeHandleInteractiveSetupCurrentState(
+		bufio.NewReader(strings.NewReader("")),
+		&output,
+		paths,
+		runtimeConfig{},
+		setupState{ConfigOK: true, TokenOK: true, RelayOK: true, WSOK: true, SkillsOK: true},
+		false,
+		false,
+		lifecycleMarker...,
+	)
+	if !handled || code != 1 {
+		t.Fatalf("handled=%v code=%d output=%s", handled, code, output.String())
+	}
+	if strings.Contains(output.String(), "Everything is already set up!") ||
+		strings.Contains(output.String(), "Setup complete!") {
+		t.Fatalf("lifecycle failure reported success:\n%s", output.String())
 	}
 }
 
@@ -1393,7 +1459,7 @@ func TestInteractiveSetupRelayTokenFlagPersistsBeforeVerify(t *testing.T) {
 	}
 
 	exitCode := 0
-	stdout, stderr := captureInteractiveSetupIO(t, joinSetupInputs(setupWizardLLATPrompts(), []string{"n"}), func() int {
+	stdout, stderr := captureInteractiveSetupIO(t, joinSetupInputs([]string{"n"}), func() int {
 		exitCode = interactiveSetup(paths, cfg, loadStateOrDefault(paths), "claude", "", "", "", "flag-token-from-cli", false)
 		return exitCode
 	})
@@ -1439,7 +1505,7 @@ func TestInteractiveSetupCompletedResumeRejectsBrokenHostOverride(t *testing.T) 
 		return []byte(`{"status":"ok","data":{"ha_ws_connected":true}}`), nil
 	}
 	probeRelayWSPingForReadiness = func(relayBaseURL, token string) (relayWSPingResponse, error) {
-		return relayWSPingResponse{StatusCode: 200, Body: []byte(`{"type":"pong"}`)}, nil
+		return relayWSPingResponse{StatusCode: 200, Body: []byte(`{"ok":true,"data":{"type":"pong"}}`)}, nil
 	}
 
 	paths, err := detectPaths()
@@ -1561,7 +1627,7 @@ func TestInteractiveSetupWSDegradedEndsIncomplete(t *testing.T) {
 	}
 }
 
-func TestInteractiveSetupWSDegradedMentionsLLATCause(t *testing.T) {
+func TestInteractiveSetupWSDegradedMentionsUpstreamAuthCause(t *testing.T) {
 	withClientRuntimeAvailability(t, map[string]bool{"claude": true})
 	withClientAttachmentPresence(t, map[string]bool{"claude": true})
 
@@ -1617,7 +1683,6 @@ func TestInteractiveSetupWSDegradedMentionsLLATCause(t *testing.T) {
 
 	exitCode := 0
 	input := joinSetupInputs(
-		setupWizardLLATPrompts(),
 		[]string{"n"},
 	)
 	stdout, stderr := captureInteractiveSetupIO(t, input, func() int {
@@ -1631,11 +1696,11 @@ func TestInteractiveSetupWSDegradedMentionsLLATCause(t *testing.T) {
 	output := stdout + stderr
 	for _, want := range []string{
 		"Home Assistant WebSocket is not connected yet",
-		"The Home Assistant Access Token in NOVA Relay still needs to be checked.",
-		`Set the "Home Assistant Access Token" field ("ha_llat")`,
+		"NOVA Relay's upstream Home Assistant access was rejected.",
+		"App install: update or restart NOVA Relay. Standalone Container/Core: replace HA_LLAT in the server environment.",
 	} {
 		if !strings.Contains(output, want) {
-			t.Fatalf("expected LLAT-specific guidance %q in output:\n%s", want, output)
+			t.Fatalf("expected upstream-auth guidance %q in output:\n%s", want, output)
 		}
 	}
 }
@@ -1663,17 +1728,19 @@ func TestInteractiveSetupWSDegradedUsesWSPingSuccessAsReady(t *testing.T) {
 	probeRelayWSPingForSetup = func(relayBaseURL, token string) (relayWSPingResponse, error) {
 		return relayWSPingResponse{
 			StatusCode: http.StatusOK,
-			Body:       []byte(`{"type":"pong"}`),
+			Body:       []byte(`{"ok":true,"data":{"type":"pong"}}`),
 		}, nil
 	}
 
+	healthCalls := 0
 	relayServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path != "/health" {
 			http.NotFound(w, r)
 			return
 		}
 		w.Header().Set("Content-Type", "application/json")
-		_, _ = w.Write([]byte(`{"status":"ok","data":{"ha_ws_connected":false}}`))
+		healthCalls++
+		fmt.Fprintf(w, `{"status":"ok","data":{"ha_ws_connected":%t}}`, healthCalls > 1)
 	}))
 	defer relayServer.Close()
 
@@ -1703,7 +1770,7 @@ func TestInteractiveSetupWSDegradedUsesWSPingSuccessAsReady(t *testing.T) {
 	}
 	writeInstalledClaudePluginFixture(t, home)
 
-	input := joinSetupInputs(setupWizardLLATPrompts(), nil)
+	input := joinSetupInputs(nil)
 	stdout, stderr := captureInteractiveSetupIO(t, input, func() int {
 		return interactiveSetup(paths, cfg, state, "claude", "", "", "", "", false)
 	})
@@ -1875,7 +1942,6 @@ func TestInteractiveSetupCompletedResumeUsesOverrideHealthInsteadOfOldHealthySta
 
 	exitCode := 0
 	input := joinSetupInputs(
-		setupWizardLLATPrompts(),
 		[]string{"n"},
 	)
 	stdout, stderr := captureInteractiveSetupIO(t, input, func() int {
@@ -1962,7 +2028,6 @@ func TestInteractiveSetupContinueAnywayPersistsExplicitURL(t *testing.T) {
 		},
 		setupWizardRelayInstallPrompts(),
 		setupWizardGenerateRelayTokenPrompts(),
-		setupWizardLLATPrompts(),
 		[]string{"4"},
 	)
 
@@ -2158,7 +2223,7 @@ func TestInteractiveSetupCompletedResumePersistsHostOnlyOverride(t *testing.T) {
 	}
 	fetchRelayHealthForReadiness = fetchRelayHealthForSetup
 	probeRelayWSPingForReadiness = func(relayBaseURL, token string) (relayWSPingResponse, error) {
-		return relayWSPingResponse{StatusCode: 200, Body: []byte(`{"type":"pong"}`)}, nil
+		return relayWSPingResponse{StatusCode: 200, Body: []byte(`{"ok":true,"data":{"type":"pong"}}`)}, nil
 	}
 
 	paths, err := detectPaths()
@@ -2214,6 +2279,11 @@ func TestInteractiveSetupCompletedResumePersistsHostOnlyOverride(t *testing.T) {
 func captureInteractiveSetupIO(t *testing.T, input string, fn func() int) (string, string) {
 	t.Helper()
 	withAllClientRuntimesAvailable(t)
+	originalDiscovery := discoverReachableHAHostsForSetup
+	discoverReachableHAHostsForSetup = func(cfg runtimeConfig) ([]setupDiscoveryCandidate, string) {
+		return nil, preferredUnverifiedHAHost(cfg)
+	}
+	defer func() { discoverReachableHAHostsForSetup = originalDiscovery }()
 
 	home, err := os.UserHomeDir()
 	if err == nil {
@@ -2341,10 +2411,8 @@ func TestInteractiveSetupFreshHostChangeRoutesBackThroughInstallStepsNotStraight
 	// the new address may be a different instance, so the wizard re-runs the
 	// install/token/LLAT steps for it (Codex P2 on the fresh-flow shortcut).
 	input := joinSetupInputs(
-		setupWizardLLATPrompts(),
 		[]string{"2", goodHAServer.URL},
 		[]string{"", ""},
-		setupWizardLLATPrompts(),
 	)
 
 	exitCode := 0
@@ -2408,7 +2476,7 @@ func TestInteractiveSetupFlagDrivenRunSkipsIntroEvenWithoutClientTarget(t *testi
 	}
 }
 
-func TestInteractiveSetupFlaggedFreshHostChangeReenablesInstallAndLLATSteps(t *testing.T) {
+func TestInteractiveSetupFlaggedFreshHostChangeReenablesInstallSteps(t *testing.T) {
 	home := t.TempDir()
 	t.Setenv("HOME", home)
 	t.Setenv("HA_NOVA_NO_BROWSER", "1")
@@ -2435,15 +2503,14 @@ func TestInteractiveSetupFlaggedFreshHostChangeReenablesInstallAndLLATSteps(t *t
 		t.Fatalf("detectPaths() error: %v", err)
 	}
 
-	// `ha-nova setup antigravity --host <wrong> --relay-token <tok>`:
-	// skipLLATWalkthrough starts true. When the user interactively corrects
-	// the address, the flag-driven shortcut is abandoned — the wizard must
-	// re-run the install steps AND the access-token walkthrough for the new
+	// `ha-nova setup antigravity --host <wrong> --relay-token <tok>`: the
+	// flag-driven shortcut skips the install walkthrough. When the user
+	// interactively corrects the address, that shortcut is abandoned — the
+	// wizard must re-run the install steps and the token step for the new
 	// address instead of bouncing token → verify forever (Codex P2 round 3).
 	input := joinSetupInputs(
 		[]string{"2", goodHAServer.URL},
 		[]string{"", ""},
-		setupWizardLLATPrompts(),
 	)
 
 	exitCode := 0
@@ -2461,7 +2528,6 @@ func TestInteractiveSetupFlaggedFreshHostChangeReenablesInstallAndLLATSteps(t *t
 	for _, want := range []string{
 		"Change Home Assistant address",
 		"Install NOVA Relay in Home Assistant",
-		"Create a Home Assistant Access Token in Home Assistant.",
 	} {
 		if !strings.Contains(output, want) {
 			t.Fatalf("output missing %q:\n%s", want, output)
@@ -2522,11 +2588,10 @@ func TestInteractiveSetupPastedTokenFreshHostChangeRoutesThroughInstallSteps(t *
 	// address" (2) must route through the install steps for the corrected
 	// address — a pasted token is not resume state (Codex P2 round 4).
 	input := joinSetupInputs(
-		[]string{"1", "pasted-relay-token"},
+		setupWizardPasteRelayTokenPrompts("pasted-relay-token"),
 		[]string{"2", goodHAServer.URL},
-		[]string{"", ""},
-		[]string{"1", "pasted-relay-token"},
-		setupWizardLLATPrompts(),
+		setupWizardRelayInstallPrompts(),
+		setupWizardPasteRelayTokenPrompts("pasted-relay-token"),
 	)
 
 	exitCode := 0

@@ -14,19 +14,21 @@ Configuration that has NO Home Assistant API and only exists as a YAML file:
 - `rest` and `command_line` sensors
 - packages
 - frontend themes
+- `recorder:` configuration blocks (include/exclude filters, `purge_keep_days`) — recorder is not reloadable, a restart applies it
 
 Not in scope: anything with an API — config-entry template helpers (`ha-nova:helper`), automations and scripts (`ha-nova:write`), dashboards (`ha-nova:dashboard`), scenes (`ha-nova:scene`). If a helper can express it, use the helper: it is safer, reloadable, and editable in the UI.
 
 ## Bootstrap (once per session)
 
+Read and follow `../ha-nova/session-bootstrap.md`.
 Verify relay CLI: `ha-nova relay health`
 If this fails: `ha-nova setup`
 
-This skill needs **Relay 0.4.0 or newer** AND file access enabled. Both are the user's decision, not yours:
+This skill needs **Relay 0.9.0 or newer** AND file access enabled. Both are the user's decision, not yours:
 - Probe once: `ha-nova relay files --data-file <payload-file>` with `{"action":"list_dir","path":"/config"}`.
 - `FILE_ACCESS_DISABLED` -> file access is OFF (the default). Tell the user how to turn it on (App: Settings > Apps > NOVA Relay > Configuration > `file_access`: `readwrite`, restart; container: `FILE_ACCESS=readwrite` plus a config mount) and what it means, then continue with the manual path below. Do not nag.
 - `FILE_ACCESS_READONLY` -> reads work, writes do not. Offer the manual path below instead of asking for more permission.
-- If the relay is older than 0.4.0, say so plainly — the endpoint does not exist there.
+- If the relay is older than 0.9.0, report the compatibility failure and offer the Relay update. Do not bypass the enforced floor even if an older Relay happens to expose the endpoint.
 
 ## Relay Contract
 
@@ -37,11 +39,18 @@ This skill needs **Relay 0.4.0 or newer** AND file access enabled. Both are the 
 
 ## Flow
 
+Drafts follow `skills/ha-nova/smallest-solution.md`: the complete requested outcome in the simplest safe design, nothing for hypothetical future needs.
+
+
 Never skip a step.
 
 1. **Read before write.** `read_file` the target (or `list_dir` to find it). Never write a file you have not read: `write_file` replaces the whole file, so an unread file means an unknown loss.
-2. **Build the change in memory** and show a real diff of before/after in the `Changes` slot. Say plainly which file, and that the whole file is being replaced.
-3. **Confirm**, then `write_file` with `backup: true` (the default). The relay writes `<file>.bak` first — that is your rollback; name it in the preview. A brand-new file gets no `.bak` — say so.
+2. **Build the change in memory**. For template/REST/command-line SENSOR definitions, apply the TS checks from `skills/review/checks.md` → Template/REST/Command-line Sensors to the draft first — fix HIGH findings inline, show the rest as plain-language advisories below the preview (never the internal codes). Then preview it as the File-Change Preview (below). Never a `-`/`+` unified diff, never the whole file unless asked — but say plainly that the whole file is replaced on save.
+3. **Confirm**, then capture the auto config snapshot (category `yaml`; data = `{path: <exact logical path>, content: <current file content>}` — the slugified name is lossy, the stored `path` is what makes the promised path-stable restore possible; `skills/ha-nova/config-snapshots.md` — the `.bak` holds only ONE step, the snapshot store keeps history; on capture failure follow its capture-failure stop; skip for a brand-new file), then run the drift check IMMEDIATELY before the write (`skills/ha-nova/write-safety.md` → Drift check before apply) — last, so the snapshot round trip cannot open a new window behind it:
+   - existing file: `read_file` it once more and compare against the content step 1 read. Changed? STOP — someone edited it during the pause (the File editor app is the common case) and `write_file` would revert them. Show the new content and ask again.
+   - brand-new file: absence IS the basis. Probe the exact path with `read_file`: `FILE_NOT_FOUND` is the expected answer and confirms the file is still absent — treat it as success here, not as an error. Any other outcome means the file exists now, so STOP: something created it since step 1 and writing would overwrite a file nobody read. Do not use `list_dir` for this: it returns at most 500 entries and sets `truncated: true`, so a busy directory can report a file as absent when it is not.
+
+   Then `write_file` with `backup: true` (the default). The relay writes `<file>.bak` first — that is your immediate rollback; name it in the preview. A brand-new file gets no `.bak` — say so.
 4. **Validate**: `POST /api/config/core/check_config`. `{"result":"invalid"}` means Home Assistant would refuse this config: roll back immediately — restore the `.bak` (`read_file` it, `write_file` it back with `"backup": false`, or the `.bak` becomes the invalid file); a NEW file has no `.bak`, `delete_file` it instead. Tell the user what was wrong, and do NOT reload.
 5. **Reload the right domain** — a full restart is almost never necessary:
    - template sensors -> `template.reload`
@@ -49,7 +58,8 @@ Never skip a step.
    - command-line sensors -> `command_line.reload`
    - themes -> `frontend.reload_themes`
    - packages / anything under `homeassistant:` -> `homeassistant.reload_core_config` (say when a real restart IS required — some keys only apply at boot).
-6. **Verify by read-back**: the new entity must appear in `/api/states/<entity_id>` with a real state. A successful reload is not proof: an entity that never appears means the config was accepted but the platform rejected it. Report that honestly and offer the `.bak` restore.
+   - `recorder:` -> no reload service: after green `check_config`, offer a user-consented `homeassistant.restart` or report the change as applying at the next restart.
+6. **Verify by read-back**: the new entity must appear in `/api/states/<entity_id>` with a real state. A `recorder:` edit creates no entity — verify by re-reading the file (and `check_config` after a restart). A successful reload is not proof: an entity that never appears means the config was accepted but the platform rejected it. Report that honestly and offer the `.bak` restore. For a multi-entity file, also confirm the file's OTHER entities still appear in `/api/states` — a silently dropped sibling passes `check_config` (still-valid config, fewer entities).
 
 ## Conventions
 
@@ -57,9 +67,28 @@ Never skip a step.
 - Never touch `secrets.yaml`, `.storage/`, or the recorder database: the relay refuses them anyway, and needing them means the approach is wrong.
 - Code is not configuration: the relay refuses `custom_components/`, `python_scripts/`, `www/` and writes only `.yaml`/`.yml`/`.conf`/`.json`/`.txt`/`.md` — never offer to place scripts there.
 
+## File-Change Preview
+
+The Preview Card variant for file edits (`skills/ha-nova/output-rules.md` -> Cards) — effect sentences, then ONLY the changed section (after-state), what it replaces, the backup line:
+
+```
+📝 Preview: file change template_sensors.yaml
+Adds a sensor that shows whether any window is open.
+
+New section (the only part that changes):
+- binary_sensor:
+    - name: "Any window open"
+
+Replaces: nothing — this section is new. A backup (.bak) is written first.
+⚠️  Nothing saved yet.
+Options: apply · show yaml · cancel   (show yaml = the whole resulting file)
+```
+
+For an edit to an existing section, show the after-state section and one sentence naming what the old one did.
+
 ## When file access is off (the default)
 
-Do not treat this as a blocker to argue around. Produce the exact YAML block, name the exact file it belongs in, and give the two commands to apply it (`check_config`, then the reload service) — which work through `/core` without file access. The user pastes the block with the File editor App or their own editor. This path is fully supported.
+Do not argue around it. Produce the exact YAML block, name the file, and give the two `/core` commands to apply it (`check_config`, then the reload service). The user pastes the block with the File editor App or their own editor. This path is fully supported.
 
 ## Error Handling
 
@@ -74,19 +103,19 @@ Full relay/upstream error taxonomy: `skills/ha-nova/relay-api.md` -> Error Handl
 
 Apply `skills/ha-nova/output-rules.md` to all user-facing output.
 
-Name the file, show the diff (not the whole file unless asked), state that a `.bak` was written, and report the verification result: which entity appeared, with which state. If the entity did not appear, say so plainly and offer the restore.
+Previews use the File-Change Preview above; results use the Result Card. Report the verification result: which entity appeared, with which state. If the entity did not appear, say so plainly and offer the restore.
 
 ## Safety
 
 - Preview before write: nothing is saved until the user confirms the shown preview.
 - Confirmation binds to the displayed preview and expires on any change to target, payload, endpoint, or scope (context skill → Active Preview Confirmation).
 - Pre-preview phrases ("do it", "go ahead", "implement the plan") authorize drafting and preview only — never the write itself.
-- Delete and destructive operations require the typed token `confirm:<token>` verbatim; "yes" or any natural-language reply is invalid.
+- Delete and destructive operations require the typed confirmation code `confirm:<token>` verbatim; "yes" or any natural-language reply is invalid.
 - Never guess entity, service, or config IDs — resolve them or ask.
 - Home Assistant is reached exclusively through `ha-nova relay`.
 - For any HA write this skill does not cover, STOP and invoke `ha-nova:fallback` first — never probe unfamiliar write endpoints.
 
-- **Whole-file replacement**: `write_file` replaces the entire file. Always read first and preview the diff.
+- **Whole-file replacement**: `write_file` replaces the entire file. Always read first and show the File-Change Preview.
 - **The `.bak` is the rollback and it is not automatic beyond one step**: a second write overwrites the first backup. For a bigger change, offer a Home Assistant backup first (`ha-nova:backup`).
 - **check_config before reload, always.** Reloading an invalid configuration can drop entities that other automations depend on.
 - Never enable `file_access` on the user's behalf, and never ask twice.
@@ -94,6 +123,7 @@ Name the file, show the diff (not the whole file unless asked), state that a `.b
 ## Guardrails
 
 - One file per operation.
-- Never write a file without a preceding read and an explicit diff.
+- Never write a file without a preceding read and a shown File-Change Preview.
+- A user-requested `delete_file` is code-gated like any delete AND captures the auto config snapshot of the file first (it has no `.bak`; `skills/ha-nova/config-snapshots.md`).
 - Never claim success from a reload alone — the entity must exist in `/api/states`.
 - Do not add `!include` lines that already exist, and never rewrite `configuration.yaml` wholesale to add one.

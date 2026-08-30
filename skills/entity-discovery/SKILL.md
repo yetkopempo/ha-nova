@@ -1,6 +1,6 @@
 ---
 name: entity-discovery
-description: Use when searching or resolving Home Assistant entities by name, room, or domain through HA NOVA Relay.
+description: Use when searching or resolving Home Assistant entities by name, room, or domain through HA NOVA Relay, and live state snapshots across a domain — what is open, on, running, locked, who is home.
 license: MIT
 compatibility: Requires the ha-nova CLI (run 'ha-nova setup' first) and the HA NOVA Relay in Home Assistant (App, or standalone container on Container/Core).
 ---
@@ -22,6 +22,7 @@ Read-only behavior.
 
 ## Bootstrap (once per session)
 
+Read and follow `../ha-nova/session-bootstrap.md`.
 Verify relay CLI: `ha-nova relay health`
 If this fails: `ha-nova setup`
 
@@ -41,7 +42,7 @@ Use file-based relay requests by default:
 
 Entity registry uses compact abbreviated keys: `ei`=entity_id, `en`=name, `ai`=area_id.
 
-Search both entity_id and name. Use short keyword stems to handle spelling variants. Always limit to 20 results.
+Search both entity_id and name. Use short keyword stems to handle spelling variants. Cap display at 20 rows through the canonical envelope below — never a bare slice.
 
 For bulk selectors, follow `skills/ha-nova/bulk-patterns.md`.
 - `prefix`: case-insensitive prefix match on the entity_id suffix and display name
@@ -61,18 +62,26 @@ Create `<payload-file>` with `{"type":"config/entity_registry/list_for_display"}
 ha-nova relay ws --data-file <payload-file> --jq-file <filter-file>
 ```
 
-Write `<filter-file>` with:
+Write `<filter-file>` by copying the canonical `skills/ha-nova/discovery-filter.jq`
+and replacing `KEYWORD` with the pattern; if the canonical file is unavailable
+(flat-copy installs), recreate it with exactly:
 
 ```jq
-[.data.entities[] | select((.ei + " " + (.en // "")) | test("KEYWORD";"i")) | {entity_id: .ei, name: .en, area_id: .ai}] | .[0:20]
+[.data.entities[] | select((.ei + " " + (.en // "")) | test("KEYWORD";"i")) | {entity_id: .ei, name: .en, area_id: .ai}]
+| {total: length, shown: (.[0:20] | length), omitted: ([length - 20, 0] | max), truncated: (length > 20), matches: .[0:20]}
 ```
 
-This generic `test("KEYWORD";"i")` example is for free-text search, not explicit `prefix` matching.
+It returns `{total, shown, omitted, truncated, matches}` — the 20-row cap
+applies to `matches` only; the counts are exact.
+
+This generic `test("KEYWORD";"i")` filter is for free-text search, not explicit `prefix` matching.
 For an explicit prefix selector, match the suffix and display name with `startswith(...)`, not loose substring search.
 
-**If 0 results:** try synonyms, alternative terms, or shorter keyword stems. Use OR for multiple variants: `test("kw1|kw2|kw3";"i")`.
+**If the compact search does not resolve a suitable target** — no results, or only matches the user rejects or that plainly are not what they meant — escalate ONCE to the full registry (`config/entity_registry/list`) and match against `aliases[]` too — `list_for_display` does not carry them, and an alias is exactly where a household keeps the name it actually says (a household's own word for `light.floor_lamp_living`). Only then try synonyms, alternative terms, or shorter keyword stems. Use OR for multiple variants: `test("kw1|kw2|kw3";"i")`. When a resolved entity had no matching alias and the user's word was clearly their habitual name, offer once to store it as an alias via `ha-nova:organize`.
+**Diacritics:** `test(...;"i")` folds case, not accents — a name with `é`/`ü`/`ö` does not match its plain-ASCII spelling. Whenever the keyword or likely entity names carry accents or umlauts (common in non-English homes), put the transliterated variants into the OR-pattern: `test("café|cafe";"i")`, and for umlauts include both the `ue`/`oe`/`ae` and bare-vowel forms.
 **If too many:** narrow with AND: `test("kw1";"i") and test("kw2";"i")`.
-**Never** dump entire domains without a user-intent keyword.
+**Fail closed on truncation:** while `truncated` is true the result proves neither absence nor uniqueness — the target may sit past the cap. Narrow automatically (area, domain, exact identifier, aliases, extra AND terms) until `truncated` is false before concluding either; report `total`/`shown`/`omitted` with the rows.
+**Never** dump entire domains without a user-intent keyword, and never show an unfiltered full-registry dump.
 
 When the task is multi-target inventory:
 - save the shortlist with `--out <result-file>`
@@ -127,19 +136,125 @@ This is more reliable than keyword search or assuming `.ai` is populated for roo
 
 **IMPORTANT:** Never dump raw `get_states` — it returns thousands of entities with full attributes.
 
+### Device-sibling capability discovery
+
+A capability-oriented request (restart, identify, calibrate, reset, siren, ...) on a resolved entity or device, where the capability is not on the resolved entity itself, is answered by the device's OTHER entities — not by "the entity cannot do that":
+
+1. Resolve the physical device: for an entity target, read its registry row (WS `config/entity_registry/get`) and take its `device_id`; a target already resolved AS a device (a device-registry row or config-entry device) supplies its `device_id` directly — no entity row is required to proceed.
+2. List ALL registry entities of that device from the FULL registry (`config/entity_registry/list`, filter by `device_id`) — `list_for_display` omits disabled entities, and the registry row's `disabled_by` decides enabled/disabled status. NEVER validate a disabled candidate through `/api/states`: it has no state there, and its absence proves nothing about the capability. The 20-row display envelope does NOT apply here — a device's own entity list is complete and bounded by nature; capping it could hide the one capability past the cap.
+3. Select by domain, `device_class`, `translation_key`, and entity_id semantics on the SAME device. An entity on another device never qualifies merely because its name matches.
+4. Prefer an enabled exact match. Multiple plausible candidates → ONE bounded clarification listing each candidate's entity ID, domain, device, and enabled/disabled status.
+5. Report a disabled candidate as available-but-disabled WITH its `disabled_by` source and offer the matching enable flow via `ha-nova:organize` (a `"device"`-disabled sibling needs its parent DEVICE re-enabled, not the entity alone; integration/config_entry-disabled items are not enableable from any skill — the HA UI owns those). Never enable anything automatically, and never press or execute from discovery — hand off to the owning skill.
+
+This contract is generic — never hard-coded to a brand, to cameras, or to restart buttons.
+
+## State Snapshot Queries
+
+"is everything closed?", "who is home?", "what is running right now?" — these ask
+about STATE across many entities, not about finding one. They are reads and
+belong here; `ha-nova:health` answers what is broken, not what is on.
+
+One call answers them: `ha-nova relay core --method GET --path /api/states --out <result-file>`,
+then filter by domain plus `device_class` and state:
+
+```jq
+[.data.body[]
+ | select(.attributes.device_class == "window" and .state == "on")
+ | {e: .entity_id, n: .attributes.friendly_name}]
+```
+
+Three answers, not two: **yes / no / could not tell**. An entity that is
+`unknown` or `unavailable`, and one that is readable but does not report the
+thing being asked, both go in the third bucket and get named. "Everything is
+closed" with three sensors offline is the reassurance nobody should get —
+"none open, 3 could not be read" is the honest form.
+
+Skip group helpers when counting: a Light Group is a real `light.*` entity
+beside its members, so it double-counts. They carry an `entity_id` LIST in
+their attributes — skip any entity whose `attributes.entity_id` is an array.
+(`switch_as_x` mirrors double-count too and carry no such marker; say so if
+the count looks high.)
+
+- **open windows/doors** — `binary_sensor` with `device_class`
+  `window`/`door`/`garage_door`/`opening` (the generic contact class) in state
+  `on`, AND `cover.*` in `open`/`opening`/`closing` (mid-close is still open)
+  with the COVER classes, which are named differently: `garage` — not the
+  binary sensor's `garage_door` — plus `door`, `window`, `gate`. A motorized
+  window is a cover, not a binary_sensor, so checking one family answers the
+  question wrong. A cover in those states whose `device_class` is absent or
+  outside that list is not evidence of closed: report it as "N open, class
+  unknown". Do NOT do the same for unclassed binary sensors — one is
+  indistinguishable from a motion sensor and would manufacture false alarms.
+- **who is home** — `person.*` in state `home`. Anything else that is not
+  `unknown`/`unavailable` is away, including a named zone like `work`: those
+  are zone names, not errors. `unknown` means no tracker had usable data —
+  third bucket, because "nobody is home" from a dropped phone is how an alarm
+  gets armed on someone. (This skill owns person STATE reads; `ha-nova:admin`
+  owns creating and editing them.)
+- **unlocked doors** — `lock.*` in any state that is not `locked` and not
+  `unavailable`/`unknown`, AND `binary_sensor` with `device_class: lock` in
+  state `on`, which reports `on` for UNLOCKED — the reverse of every other
+  class here. Name the state each one is in rather than flattening them to
+  "unlocked": jammed and mid-travel are not secured, and they are what a user
+  needs to hear.
+- **is everything OFF** — `light`/`switch`/`fan`/`siren`/`remote` in `on`
+  (a Harmony-style `remote` in `on` means an AV activity is live);
+  `media_player` in anything but `off`/`standby`/`unavailable`/`unknown`
+  (paused and idle are not off; `standby` IS — Home Assistant core deprecates
+  it as meaning off-or-idle, and users call that TV off);
+  `binary_sensor` with `device_class` `running` or `moving` in `on`;
+  `script` in `on` and `automation` with `attributes.current > 0` — both are
+  actually executing, and the RUNNING list counts them, so leaving them out
+  here would let "is everything off?" say yes to something "what is running?"
+  names in the same breath;
+  `climate`/`water_heater`/`humidifier` in any state but
+  `off`/`unavailable`/`unknown` — an unreachable one is not off, it goes in
+  the third bucket;
+  `vacuum` and `lawn_mower` in `cleaning`/`mowing`/`returning`/`paused`/`error`
+  — `error` means stranded mid-floor, not put away, and it is readable so the
+  unavailable rule never catches it; `valve` in `open`/`opening`/`closing`;
+  `cover` only in `opening`/`closing` — a cover left open is answered by the
+  open-windows question above, not by this one, because it consumes nothing.
+- **what is RUNNING** — narrower, and everything in it is also in OFF above;
+  keep that invariant when either list changes. Same lights, switches, fans,
+  sirens and `binary_sensor` `running`, plus `device_class: moving`; but
+  `media_player` only in `playing`/`buffering`; `vacuum`/`lawn_mower` only in
+  `cleaning`/`mowing`/`returning` (report `error` as stuck, not as running);
+  `valve` in `open`/`opening`/`closing`; `cover` in `opening`/`closing` only —
+  a motor turning is running, a cover left open is not.
+  - `climate` runs when `hvac_action` is PRESENT and not `off`/`idle`
+    (heating, cooling, drying, fan, preheating, defrosting).
+  - `humidifier` has the same shape under a different key: `attributes.action`
+    PRESENT and not `off`/`idle`.
+  - `water_heater` has NO action attribute at all — its state is an operation
+    mode (`eco`, `performance`, `heat_pump`, ...), which reports enablement and
+    never activity. It can never be proven running: enabled goes in the third
+    bucket, never in "nothing is running".
+  - An ABSENT action attribute is the third bucket too, not a no. Most simple
+    thermostats never publish one, and "nothing is running" while the heat pump
+    runs is the failure this whole section exists to prevent.
+  - `automation` in `on` means ENABLED, not running — exclude it, or the answer
+    is "47 things are running". Its real running signal is
+    `attributes.current > 0`. `script` in `on` does mean running.
+
+Answer count-first ("2 windows open: kitchen, bathroom"), then the names, in the List
+Frame. This is a summary, not the banned domain dump: `output-rules.md` asks
+for counts, groups and a few examples exactly here. A follow-up "and which are
+closed?" is a fresh read, not a cached list.
+
 ## Matching Rules
 
 - area-first bulk discovery by room/area uses `search/related` on the resolved area before keyword heuristics
 - exact `entity_id` match wins
-- keyword match on entity_id + name second
+- keyword match on entity_id + name second; rank whole-word and name matches above bare substring hits
 
-If ambiguity remains: present top candidates (max 10), ask one selection question.
+If ambiguity remains: present top candidates (max 10) and state the match basis for each (name, entity_id, alias, or area) — the user must see WHY a candidate matched; then ask one selection question.
 
 ## Output Format
 
 Apply `skills/ha-nova/output-rules.md` to all user-facing output.
 
-Return the Step 4 shortlist shape; never dump raw `get_states` output.
+Render the Step 4 shortlist as the List Frame (output-rules.md); never dump raw `get_states` output.
 
 ## Safety
 

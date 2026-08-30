@@ -27,6 +27,11 @@ func runInternalUninstall(_ runtimePaths, args []string) int {
 	selfPath := fs.String("self-path", "", "temp helper path")
 	purge := fs.Bool("purge", false, "remove config and token")
 	teardownDone := fs.Bool("teardown-done", false, "server-side teardown already completed by the parent")
+	teardownRelayInstanceID := fs.String(
+		"teardown-relay-instance-id",
+		"",
+		"exact Relay identity removed by guided teardown",
+	)
 	if err := fs.Parse(args); err != nil {
 		printHumanErr("%s", err)
 		return 1
@@ -36,7 +41,21 @@ func runInternalUninstall(_ runtimePaths, args []string) int {
 		printHumanErr("%s", err)
 		return 1
 	}
-	status, err := beginWindowsUninstallStatus(paths, uninstallModeFromFlag(*purge), installSourceBundle)
+	removedRelays, err := windowsUninstallHelperTeardownEvidence(
+		*teardownDone,
+		*teardownRelayInstanceID,
+	)
+	if err != nil {
+		printHumanErr("%s", err)
+		return 1
+	}
+	status, err := beginWindowsUninstallStatusWithTeardown(
+		paths,
+		uninstallModeFromFlag(*purge),
+		installSourceBundle,
+		*teardownDone,
+		removedRelays,
+	)
 	if err != nil {
 		printHumanErr("cannot persist Windows uninstall recovery state: %s", err)
 		return 1
@@ -46,7 +65,13 @@ func runInternalUninstall(_ runtimePaths, args []string) int {
 	waitForParentReleaseForUninstall(*parentPID)
 	preflight := collectUninstallPreflight(paths)
 	report := &uninstallReport{}
-	if err := finalizeWindowsUninstall(paths, report, uninstallModeFromFlag(*purge), status); err != nil {
+	if err := finalizeWindowsUninstall(
+		paths,
+		report,
+		uninstallModeFromFlag(*purge),
+		status,
+		removedRelays,
+	); err != nil {
 		report.printDetails()
 		printHumanErr("%s", err)
 		return 1
@@ -74,7 +99,7 @@ func runUninstall(paths runtimePaths, args []string) int {
 	fs := flag.NewFlagSet("uninstall", flag.ContinueOnError)
 	fs.SetOutput(io.Discard)
 	yes := fs.Bool("yes", false, "skip confirmation prompts (prints the Home Assistant cleanup checklist instead)")
-	purge := fs.Bool("purge", false, "also remove config, state, and the relay auth token (full local wipe)")
+	purge := fs.Bool("purge", false, "also remove config, state, and the relay auth token (retains two opaque safety markers)")
 	if err := fs.Parse(args); err != nil {
 		if helpRequested(err, fs, "ha-nova uninstall [--yes] [--purge]") {
 			return 0
@@ -91,11 +116,25 @@ func runUninstall(paths runtimePaths, args []string) int {
 	source := detectInstallSource(paths, state)
 	mode := uninstallModeFromFlag(*purge)
 	recoveryMode := false
+	recoveredTeardown := false
+	var recoveredRemovedRelays uninstallRelayRemovalEvidence
 	if recovery := inspectWindowsUninstallStatus(paths); recovery.Kind != windowsUninstallStatusKindNone {
 		if exitCode := handleWindowsUninstallRecovery(recovery, mode); exitCode != 0 {
 			return exitCode
 		}
 		recoveryMode = recovery.Kind == windowsUninstallStatusKindInterrupted || recovery.Kind == windowsUninstallStatusKindFailed || recovery.Kind == windowsUninstallStatusKindCorrupt
+		if recovery.Kind == windowsUninstallStatusKindInterrupted ||
+			recovery.Kind == windowsUninstallStatusKindFailed {
+			recoveredTeardown, recoveredRemovedRelays, err =
+				windowsUninstallTeardownEvidence(recovery.Status)
+			if err != nil {
+				printHumanErr(
+					"Windows uninstall recovery marker has invalid guided-teardown evidence: %s",
+					err,
+				)
+				return 1
+			}
+		}
 	}
 
 	renderUninstallPreflight(os.Stdout, paths, source)
@@ -112,16 +151,26 @@ func runUninstall(paths runtimePaths, args []string) int {
 		mode = selectedMode
 	}
 
+	guidedSession := !*yes && !recoveryMode && isInteractiveTTY()
+	if guidedSession {
+		if err := prepareUninstallBeforeGuidedTeardown(
+			paths,
+			mode,
+		); err != nil {
+			printHumanErr("%s", err)
+			return 1
+		}
+	}
 	preflight := collectUninstallPreflight(paths)
 	teardown := teardownNotOffered
-	if !*yes && !recoveryMode && isInteractiveTTY() {
+	if guidedSession {
 		outcome, err := maybeOfferGuidedTeardown(bufio.NewReader(os.Stdin), os.Stdout, preflight, defaultTeardownDeps())
 		if err != nil {
 			printHumanErr("%s", err)
 			return 1
 		}
 		if outcome == teardownCancelled {
-			printHumanInfo("Uninstall cancelled — nothing was removed.")
+			printHumanInfo("The remaining uninstall was cancelled. Any recovery cleanup or Home Assistant steps already completed remain in effect.")
 			return 0
 		}
 		teardown = outcome
@@ -130,12 +179,26 @@ func runUninstall(paths runtimePaths, args []string) int {
 		}
 	}
 	if runtime.GOOS == "windows" && source == installSourceBundle {
-		if teardown == teardownCompleted {
+		teardownDone := teardown == teardownCompleted
+		removedRelays := uninstallRelayRemovalEvidenceFromPreflight(
+			preflight,
+			teardownDone,
+		)
+		if recoveryMode {
+			teardownDone = recoveredTeardown
+			removedRelays = recoveredRemovedRelays
+		}
+		if teardownDone {
 			printTeardownCompletedNotes(os.Stdout, mode)
 		} else {
 			printUninstallPreflightNotes(os.Stdout, preflight)
 		}
-		if err := launchWindowsUninstall(paths, mode, teardown == teardownCompleted); err != nil {
+		if err := launchWindowsUninstall(
+			paths,
+			mode,
+			teardownDone,
+			removedRelays,
+		); err != nil {
 			printHumanErr("cannot finish Windows uninstall: %s", err)
 			return 1
 		}
@@ -153,15 +216,55 @@ func runUninstall(paths runtimePaths, args []string) int {
 	}
 
 	report := &uninstallReport{}
-	if err := finalizeLocalUninstall(paths, state, report, mode); err != nil {
+	configDirExisted := fileExists(paths.ConfigDir)
+	cleanupConfigDir := false
+	var configCleanupErr error
+	releaseMutation, acquired := acquireAutoRepairLockWithFinalizer(paths, func() {
+		if !cleanupConfigDir {
+			return
+		}
+		if !configDirExisted {
+			configCleanupErr = os.Remove(paths.ConfigDir)
+			if isNotExist(configCleanupErr) {
+				configCleanupErr = nil
+			}
+			return
+		}
+		configCleanupErr = removeDirIfEmptyWithReport(paths.ConfigDir, report)
+	})
+	if !acquired {
+		printHumanErr("another HA NOVA client update is already in progress")
+		return 1
+	}
+	state = loadStateOrDefault(paths)
+	removedRelays := uninstallRelayRemovalEvidenceFromPreflight(
+		preflight,
+		teardown == teardownCompleted,
+	)
+	if err := finalizeLocalUninstallWithProgressUnlocked(
+		paths,
+		state,
+		report,
+		mode,
+		nil,
+		removedRelays,
+	); err != nil {
+		releaseMutation()
 		printHumanErr("%s", err)
 		return 1
 	}
 	if source == installSourceBundle {
 		if err := removeBundleRuntime(paths, report); err != nil {
+			releaseMutation()
 			printHumanErr("%s", err)
 			return 1
 		}
+	}
+	cleanupConfigDir = true
+	releaseMutation()
+	if configCleanupErr != nil {
+		printHumanErr("failed to remove managed config directory: %s", configCleanupErr)
+		return 1
 	}
 
 	if teardown == teardownCompleted {
@@ -177,10 +280,39 @@ func runUninstall(paths runtimePaths, args []string) int {
 	return 0
 }
 
-func launchWindowsUninstall(paths runtimePaths, mode uninstallMode, teardownDone bool) error {
+func launchWindowsUninstall(
+	paths runtimePaths,
+	mode uninstallMode,
+	teardownDone bool,
+	removedRelays uninstallRelayRemovalEvidence,
+) error {
+	if _, err := windowsUninstallRelayRemovalRefFromEvidence(
+		teardownDone,
+		removedRelays,
+	); err != nil {
+		return err
+	}
+	status, err := beginWindowsUninstallStatusWithTeardown(
+		paths,
+		mode,
+		installSourceBundle,
+		teardownDone,
+		removedRelays,
+	)
+	if err != nil {
+		return fmt.Errorf(
+			"cannot persist Windows uninstall recovery state: %w",
+			err,
+		)
+	}
 	tempHelper := filepath.Join(os.TempDir(), "ha-nova-uninstall-"+strconv.Itoa(os.Getpid())+".exe")
 	if err := copyFile(filepath.Join(paths.InstallRoot, publicBinaryName()), tempHelper); err != nil {
-		return err
+		return failWindowsUninstallStatus(
+			paths,
+			status,
+			"bundle_runtime_cleanup",
+			err,
+		)
 	}
 	statusTicks := windowsUninstallStatusMarkerTicks(paths.UninstallStatusFile)
 	args := []string{"internal-uninstall", "--parent-pid", strconv.Itoa(os.Getpid()), "--self-path", tempHelper}
@@ -190,7 +322,28 @@ func launchWindowsUninstall(paths runtimePaths, mode uninstallMode, teardownDone
 	if teardownDone {
 		args = append(args, "--teardown-done")
 	}
-	return launchWindowsDetachedHelperWithEnv(tempHelper, paths.UninstallStatusFile, statusTicks, helperInstallRootEnv(paths.InstallRoot), args...)
+	if relayInstanceID, exists := removedRelays[defaultServerProfileName]; exists && strings.TrimSpace(relayInstanceID) != "" {
+		args = append(
+			args,
+			"--teardown-relay-instance-id",
+			strings.TrimSpace(relayInstanceID),
+		)
+	}
+	if err := launchWindowsDetachedHelperWithEnv(
+		tempHelper,
+		paths.UninstallStatusFile,
+		statusTicks,
+		helperInstallRootEnv(paths.InstallRoot),
+		args...,
+	); err != nil {
+		return failWindowsUninstallStatus(
+			paths,
+			status,
+			"bundle_runtime_cleanup",
+			err,
+		)
+	}
+	return nil
 }
 
 func scheduleWindowsSelfDelete(path string) error {
@@ -234,11 +387,52 @@ func discardInstallRoot(installRoot string) error {
 	return nil
 }
 
-func finalizeWindowsUninstall(paths runtimePaths, report *uninstallReport, mode uninstallMode, status *windowsUninstallStatus) error {
+func finalizeWindowsUninstall(
+	paths runtimePaths,
+	report *uninstallReport,
+	mode uninstallMode,
+	status *windowsUninstallStatus,
+	removedRelays uninstallRelayRemovalEvidence,
+) error {
 	state := loadStateOrDefault(paths)
-	if err := finalizeLocalUninstallWithProgress(paths, state, report, mode, func(step string) error {
-		return updateWindowsUninstallStatusProgress(paths, status)
-	}); err != nil {
+	configDirExisted := fileExists(paths.ConfigDir)
+	cleanupConfigDir := false
+	var configCleanupErr error
+	releaseMutation, acquired := acquireAutoRepairLockWithFinalizer(paths, func() {
+		if !cleanupConfigDir {
+			return
+		}
+		if !configDirExisted {
+			configCleanupErr = os.Remove(paths.ConfigDir)
+			if isNotExist(configCleanupErr) {
+				configCleanupErr = nil
+			}
+			return
+		}
+		configCleanupErr = removeDirIfEmptyWithReport(paths.ConfigDir, report)
+	})
+	if !acquired {
+		return failWindowsUninstallStatus(paths, status, "client_integrations", fmt.Errorf("another HA NOVA client update is already in progress"))
+	}
+	mutationReleased := false
+	releaseMutationOnce := func() {
+		if !mutationReleased {
+			releaseMutation()
+			mutationReleased = true
+		}
+	}
+	defer releaseMutationOnce()
+	state = loadStateOrDefault(paths)
+	if err := finalizeLocalUninstallWithProgressUnlocked(
+		paths,
+		state,
+		report,
+		mode,
+		func(step string) error {
+			return updateWindowsUninstallStatusProgress(paths, status)
+		},
+		removedRelays,
+	); err != nil {
 		return failWindowsUninstallStatus(paths, status, normalizeUninstallFailureStep(err), err)
 	}
 	if err := removeLegacyWindowsPackageResidueForUninstall(paths, report); err != nil {
@@ -255,6 +449,11 @@ func finalizeWindowsUninstall(paths runtimePaths, report *uninstallReport, mode 
 	}
 	if err := removePathWithReport(paths.PublicBinary, report); err != nil && !isNotExist(err) {
 		return failWindowsUninstallStatus(paths, status, "bundle_runtime_cleanup", err)
+	}
+	cleanupConfigDir = true
+	releaseMutationOnce()
+	if configCleanupErr != nil {
+		return failWindowsUninstallStatus(paths, status, "config_cleanup", configCleanupErr)
 	}
 	return nil
 }
@@ -285,18 +484,176 @@ func promptUninstallMode(defaultMode uninstallMode) (uninstallMode, bool, error)
 	}
 }
 
-func finalizeLocalUninstall(paths runtimePaths, state installState, report *uninstallReport, mode uninstallMode) error {
-	return finalizeLocalUninstallWithProgress(paths, state, report, mode, nil)
+func finalizeLocalUninstall(paths runtimePaths, state installState, report *uninstallReport, mode uninstallMode, teardownCompleted bool) error {
+	return finalizeLocalUninstallWithProgress(paths, state, report, mode, nil, teardownCompleted)
 }
 
-func finalizeLocalUninstallWithProgress(paths runtimePaths, state installState, report *uninstallReport, mode uninstallMode, beforeStep func(string) error) error {
-	relayTokenFile := ""
+func finalizeLocalUninstallWithProgress(paths runtimePaths, state installState, report *uninstallReport, mode uninstallMode, beforeStep func(string) error, teardownCompleted bool) error {
+	configDirExisted := fileExists(paths.ConfigDir)
+	cleanupConfigDir := false
+	var configCleanupErr error
+	releaseMutation, acquired := acquireAutoRepairLockWithFinalizer(paths, func() {
+		if !cleanupConfigDir {
+			return
+		}
+		if !configDirExisted {
+			configCleanupErr = os.Remove(paths.ConfigDir)
+			if isNotExist(configCleanupErr) {
+				configCleanupErr = nil
+			}
+			return
+		}
+		configCleanupErr = removeDirIfEmptyWithReport(paths.ConfigDir, report)
+	})
+	if !acquired {
+		return fmt.Errorf("another HA NOVA client update is already in progress")
+	}
+	state = loadStateOrDefault(paths)
+	removedRelays := uninstallRelayRemovalEvidenceFromPreflight(
+		collectUninstallPreflight(paths),
+		teardownCompleted,
+	)
+	err := finalizeLocalUninstallWithProgressUnlocked(
+		paths,
+		state,
+		report,
+		mode,
+		beforeStep,
+		removedRelays,
+	)
+	cleanupConfigDir = err == nil
+	releaseMutation()
+	if err == nil {
+		err = configCleanupErr
+	}
+	return err
+}
+
+func finalizeLocalUninstallWithProgressUnlocked(
+	paths runtimePaths,
+	state installState,
+	report *uninstallReport,
+	mode uninstallMode,
+	beforeStep func(string) error,
+	removedRelays uninstallRelayRemovalEvidence,
+) (resultErr error) {
 	if mode == uninstallModePurge {
-		// Read the raw config: token-file cleanup must not depend on setup
-		// completeness (loadConfig fails when relay_base_url is missing,
+		defer func() {
+			resultErr = resetPurgeStorageProofAfterError(
+				paths,
+				resultErr,
+			)
+		}()
+	}
+	relayTokenFile := ""
+	var purgeTargets []profilePurgeTarget
+	var purgeInventory fullPurgeInventory
+	retirementProfiles, err :=
+		deviceCredentialRetirementCheckpointProfiles(paths)
+	if err != nil {
+		return err
+	}
+	if mode != uninstallModePurge && len(retirementProfiles) > 0 {
+		return fmt.Errorf(
+			"device credential retirement is pending for server %q; run `%s` to finish it before uninstalling, or use `ha-nova uninstall --purge`",
+			retirementProfiles[0],
+			deviceRetirementSetupCommand(retirementProfiles[0]),
+		)
+	}
+	if mode == uninstallModePurge {
+		// Validate the whole raw Cloud identity set before any external revoke
+		// or local deletion. Duplicate profile IDs must fail closed globally.
+		cloudTargets, err := collectCloudPurgeTargets(
+			paths.ConfigFile,
+		)
+		if err != nil {
+			return fmt.Errorf(
+				"failed to inspect Home Assistant Cloud authorization: %w",
+				err,
+			)
+		}
+		purgeTargets, err = collectProfilePurgeTargets(paths)
+		if err != nil {
+			return fmt.Errorf(
+				"failed to inspect device credential cleanup: %w",
+				err,
+			)
+		}
+		if err := validateProfilePurgeTargets(purgeTargets); err != nil {
+			return fmt.Errorf(
+				"failed to validate device credential cleanup: %w",
+				err,
+			)
+		}
+		purgeInventory = newFullPurgeInventory(
+			purgeTargets,
+			cloudTargets,
+		)
+		if err := settleDeviceCredentialRetirementsForPurge(
+			paths,
+			report,
+		); err != nil {
+			return fmt.Errorf(
+				"failed to settle pending device retirement: %w",
+				err,
+			)
+		}
+		if beforeStep != nil {
+			if err := beforeStep("token_cleanup"); err != nil {
+				return fmt.Errorf("failed before token_cleanup: %w", err)
+			}
+		}
+		if err := purgeCloudAuthorizationsForUninstall(
+			paths,
+			report,
+		); err != nil {
+			return fmt.Errorf(
+				"failed to revoke Home Assistant Cloud authorization: %w",
+				err,
+			)
+		}
+		// Cloud device revocation can durably checkpoint and then delete a
+		// profile's native slot. Refresh the targets so the local sweep sees
+		// that exact profile+slot proof instead of treating the now-absent
+		// credential as unexplained state loss.
+		purgeTargets, err = collectProfilePurgeTargets(paths)
+		if err != nil {
+			return fmt.Errorf(
+				"failed to refresh device credential cleanup: %w",
+				err,
+			)
+		}
+		if err := validateProfilePurgeTargets(purgeTargets); err != nil {
+			return fmt.Errorf(
+				"failed to validate checkpointed device credential cleanup: %w",
+				err,
+			)
+		}
+		// Read the raw config document: token-file cleanup must not depend on
+		// setup completeness (loadConfig fails when relay_base_url is missing,
 		// which would silently skip service token file removal on purge).
-		if cfg, err := loadJSONConfig(paths.ConfigFile); err == nil {
-			relayTokenFile = strings.TrimSpace(cfg.RelayTokenFile)
+		if doc, err := loadConfigDocument(paths.ConfigFile); err == nil {
+			// Literal default profile: the legacy service token is
+			// default-profile-only, regardless of where default_server points.
+			if cfg, ok := doc.flatProfile(defaultServerProfileName); ok {
+				relayTokenFile = strings.TrimSpace(cfg.RelayTokenFile)
+			}
+		}
+		// Native-store deletion can have an ambiguous outcome. Keep config.json
+		// as the durable retry target until every profile's device slots have
+		// been confirmed absent.
+		if err := purgeAllDeviceCredentialsWithReport(
+			purgeTargets,
+			report,
+			removedRelays,
+		); err != nil {
+			return fmt.Errorf(
+				"failed to remove device credentials: %w",
+				err,
+			)
+		}
+		if err := purgeInventory.captureFinalConfig(paths); err != nil {
+			return err
 		}
 	}
 	if beforeStep != nil {
@@ -322,13 +679,51 @@ func finalizeLocalUninstallWithProgress(paths runtimePaths, state installState, 
 	if pathRemoval != "" {
 		report.addRemoved(pathRemoval)
 	}
+	if mode == uninstallModePurge {
+		if err := applyFullPurgeRelayTokenPolicy(
+			paths,
+			relayTokenFile,
+			report,
+		); err != nil {
+			return fmt.Errorf("failed to remove relay auth token: %w", err)
+		}
+	}
 	if beforeStep != nil {
 		if err := beforeStep("config_cleanup"); err != nil {
 			return fmt.Errorf("failed before config_cleanup: %w", err)
 		}
 	}
-	if err := removeManagedConfigArtifacts(paths, report, mode == uninstallModePurge); err != nil {
-		return fmt.Errorf("failed to remove managed config artifacts: %w", err)
+	if mode == uninstallModePurge {
+		currentTargets, err :=
+			purgeInventory.verifyFinalConfigAndTargets(paths)
+		if err != nil {
+			return err
+		}
+		if err := requirePurgedDeviceCredentialsAbsent(
+			currentTargets,
+		); err != nil {
+			return fmt.Errorf(
+				"device credentials reappeared before config cleanup: %w",
+				err,
+			)
+		}
+	}
+	var configCleanupErr error
+	if mode == uninstallModePurge {
+		configCleanupErr = removeManagedConfigArtifactsAtSnapshot(
+			paths,
+			report,
+			purgeInventory.config,
+			purgeInventory.configExists,
+		)
+	} else {
+		configCleanupErr = removeManagedConfigArtifacts(paths, report, false)
+	}
+	if configCleanupErr != nil {
+		return fmt.Errorf(
+			"failed to remove managed config artifacts: %w",
+			configCleanupErr,
+		)
 	}
 	if beforeStep != nil {
 		if err := beforeStep("cache_cleanup"); err != nil {
@@ -339,43 +734,16 @@ func finalizeLocalUninstallWithProgress(paths runtimePaths, state installState, 
 		return fmt.Errorf("failed to remove managed cache artifacts: %w", err)
 	}
 	if mode == uninstallModePurge {
-		if beforeStep != nil {
-			if err := beforeStep("token_cleanup"); err != nil {
-				return fmt.Errorf("failed before token_cleanup: %w", err)
-			}
-		}
-		tokenFileHandled := false
-		if relayTokenFile != "" {
-			var err error
-			tokenFileHandled, err = applyUninstallServiceTokenFilePolicy(paths, relayTokenFile, report)
-			if err != nil {
-				return fmt.Errorf("failed to remove relay auth token: %w", err)
-			}
-		}
-		if tokenFileHandled {
-			restoreSuppression := withRelayAuthTokenFileSuppressed()
-			applyUninstallKeyringTokenBestEffort(report)
-			restoreSuppression()
-		}
-		if !tokenFileHandled {
-			restoreSuppression := func() {}
-			if relayTokenFile != "" {
-				// The configured token file lies outside the managed config
-				// directory; the boundary check above deliberately left it
-				// alone. Never delete user-managed files — clean only the OS
-				// keyring copy.
-				restoreSuppression = withRelayAuthTokenFileSuppressed()
-				report.addNote(fmt.Sprintf("Kept the relay token file outside the HA NOVA config directory: %s", relayTokenFile))
-			}
-			if err := applyUninstallTokenPolicy(report); err != nil {
-				restoreSuppression()
-				return fmt.Errorf("failed to remove relay auth token: %w", err)
-			}
-			restoreSuppression()
-		}
 		if err := removeDirIfEmptyWithReport(paths.ConfigDir, report); err != nil {
 			return fmt.Errorf("failed to remove managed config directory: %w", err)
 		}
+	} else if cloudConfigurationExistsForUninstall(paths.ConfigFile) &&
+		deviceCredentialExistsForUninstall() {
+		report.addNote("Kept Home Assistant connection config, this device's pairing, and its Cloud authorization. Use 'ha-nova uninstall --purge' to remove and revoke them too.")
+	} else if cloudConfigurationExistsForUninstall(paths.ConfigFile) {
+		report.addNote("Kept Home Assistant connection config and its Cloud authorization. Use 'ha-nova uninstall --purge' to remove and revoke them too.")
+	} else if deviceCredentialExistsForUninstall() {
+		report.addNote("Kept Home Assistant connection config and this device's pairing. Use 'ha-nova uninstall --purge' to remove and revoke them too.")
 	} else if fileExists(paths.ConfigFile) || relayAuthTokenExistsForUninstall() {
 		report.addNote("Kept Home Assistant connection config and stored relay token. Use 'ha-nova uninstall --purge' to remove them too.")
 	}

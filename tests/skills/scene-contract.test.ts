@@ -38,7 +38,8 @@ describe("scene contract", () => {
 
   it("gates deletes on consumer check plus token confirmation and verifies absence", () => {
     expect(sceneSkill).toContain('`{"type":"search/related","item_type":"entity","item_id":"scene.<slug>"}`');
-    expect(sceneSkill).toContain("an empty `data` object means no consumers");
+    expect(sceneSkill).toContain("only a verified-shape empty `data` object means no consumers");
+    expect(sceneSkill).toContain("a failed read is inconclusive, never a no-consumer claim");
     expect(sceneSkill).toContain("`confirm:<token>`");
     expect(sceneSkill).toContain("proceed only when the user types it back exactly");
     expect(sceneSkill).toContain("config GET returns status 404 and the entity is gone");
@@ -71,7 +72,7 @@ describe("scene contract", () => {
     expect(sceneSkill).toContain("offer removal, never preserve or drop silently");
     expect(sceneSkill).toContain("ask before creating a duplicate");
     expect(sceneSkill).toContain("require a 404 so an existing scene is never silently overwritten");
-    expect(sceneSkill).toContain("re-read and re-verify the merge basis before writing (last writer wins)");
+    expect(sceneSkill).toContain("if the live scene differs from the previewed basis, STOP — confirmation expired");
     // Scene entity state semantics: timestamp, unknown = never activated.
     expect(sceneSkill).toContain("`unknown` means \"never activated\"");
     // Activation extras stay in service-call, but the skill teaches them.
@@ -79,9 +80,9 @@ describe("scene contract", () => {
     expect(sceneSkill).toContain("`scene.apply`");
   });
 
-  it("names HA Backups as the recovery path and keeps activation out of scope", () => {
+  it("names the snapshot recovery path and keeps activation out of scope", () => {
     expect(sceneSkill).toContain("Scene writes have no `revert`");
-    expect(sceneSkill).toContain("Home Assistant Backups");
+    expect(sceneSkill).toContain("recovery is the auto config snapshot");
     expect(sceneSkill).toContain("use `ha-nova:service-call`");
     // scene.create runtime snapshots stay with write/best-practices.
     expect(sceneSkill).toContain("`scene.create` runtime snapshots");
@@ -94,7 +95,7 @@ describe("scene contract", () => {
     expect(contextSkill).toContain('"Create a scene called Movie Night"** → `ha-nova:scene`');
     expect(contextSkill).toContain('"Activate the scene Movie Night"** → `ha-nova:service-call`');
     expect(fallbackSkill).toContain("| Scenes (storage CRUD) | Covered | scene |");
-    expect(writeSafety).toContain("| `scene` | preview + read-back verify | no | HA Backups |");
+    expect(writeSafety).toContain("| `scene` | preview + read-back verify | no | config snapshot (auto before delete, identity-preserving restore); HA Backups |");
     expect(architectureDoc).toContain("scene/SKILL.md");
   });
 

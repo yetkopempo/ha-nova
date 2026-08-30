@@ -18,10 +18,11 @@ Not in scope: the MQTT broker's own configuration, Zigbee2MQTT's web UI, or crea
 
 ## Bootstrap (once per session)
 
+Read and follow `../ha-nova/session-bootstrap.md`.
 Verify relay CLI: `ha-nova relay health`
 If this fails: `ha-nova setup`
 
-Requires **Relay 0.3.0 or newer** (bounded subscription windows). Check `ha-nova relay health` -> `version`. An older relay silently ignores `on_limit`, which turns a normal quiet window into a hard error — tell the user to update the NOVA Relay instead of working around it.
+Bounded subscription windows are guaranteed by the skills' enforced relay floor (`skills/ha-nova/relay-api.md` -> Bounded Event Collection). If a relay-outdated warning appeared, have the user update the NOVA Relay instead of working around it — an older relay silently ignores `on_limit`, which turns a normal quiet window into a hard error.
 
 Requires the `mqtt` integration: check `GET /api/components` for `mqtt`. If it is absent, say so — this skill cannot add it.
 
@@ -48,42 +49,60 @@ MQTT topics never emit a "finish" event, so a listen is a WINDOW, not a request.
 - **Retained messages are NOT live traffic.** The broker replays every retained message to a new subscriber immediately, so a message can arrive in the first milliseconds of the window even though the device published it days ago and is now silent. Each event carries a `retain` flag: treat `retain: true` as broker state, not as evidence that the device is sending. For the question "is my device actually publishing?", only `retain: false` messages count — and if all you saw were retained ones, say exactly that (the device is silent; the broker is holding its last value).
 - Keep windows short (<= 10 s, the relay's ceiling) and topics as narrow as possible; `#` on the root is noise, not evidence.
 
+## User-Assisted Capture
+
+When the traffic needs the user to act (press the remote, trip the sensor), the window cannot wait for them — it starts with the call and the relay caps it at ~10 s (context skill → User-Assisted Readiness):
+
+1. Name the exact action and topic first, and ask if the user is ready.
+2. On "ready": announce "listening for the next ~10 s — act now" and open the window in the same turn.
+3. A missed capture after the action — an empty window OR one holding only retained replays (`retain: true`) — means re-arm and retry once before reporting "nothing arrived"; never call the device silent on one missed window.
+
+Never instruct the physical action before the ready-check, and never claim monitoring is active without an open window.
+
+## Zigbee2MQTT Bridge Observability (read-only)
+
+Zigbee2MQTT publishes its network state on retained `zigbee2mqtt/bridge/...` topics (`bridge/devices`, `bridge/info`, `bridge/state`). A bounded listen on one of them returns the retained replay immediately — here `retain: true` IS the answer (broker-held state), not a liveness signal. Use it for "which devices does my Zigbee network have / is the bridge online" questions. Bridge WRITES (rename, permit_join) are not covered here. ZHA and Z-Wave setups have no MQTT surface — route them to `ha-nova:fallback` (Zigbee / Z-Wave network status).
+
 ## Flow
 
 1. Clarify the topic. Prefer the narrowest one that answers the question (`zigbee2mqtt/<device>` beats `zigbee2mqtt/#`).
 2. Listen in a bounded window (above). Summarize: which topics appeared, how many messages, and — separately — how many were live (`retain: false`) versus retained replays. Quote at most a few payloads.
 3. Device discovery/debug: WS `{"type":"mqtt/device/debug_info","device_id":"<device_id>"}` shows the subscribed topics and discovery payloads for one MQTT device (resolve `device_id` from the device registry, never guess it).
 4. Publishing (mutating): service `mqtt.publish` with `topic`, `payload`, `qos`, `retain`. There is no `payload_template` field in the current schema — render any template yourself and send the finished string as `payload`. (`evaluate_payload: true` only tells HA to evaluate a Python-literal payload for raw bytes; it is not a template switch.) Preview the exact topic + payload and confirm.
+5. Verify a command/`set` publish: when the topic belongs to an HA-known device, read the affected entity's state back after a moment — a broker accept is not device confirmation; if HA shows no corresponding change, say so. For topics HA does not mirror, state plainly that HA-side verification is not possible.
 
 ## Publishing Safety (read before any publish)
 
 - A **retained** message (`retain: true`) persists on the broker and is re-delivered to every future subscriber — including Home Assistant's discovery layer. A wrong retained payload on a `homeassistant/...` discovery topic can create or destroy entities and keeps doing so after a restart. Retained publishes therefore require the typed `confirm:<token>`, not natural confirmation.
-- Publishing to a device's `set`/command topic actuates real hardware. Preview it as an action, not as a message.
+- Publishing to a device's `set`/command topic actuates real hardware. Preview it as an action, not as a message — typed `confirm:<token>`, see Safety.
 - Clearing a retained message means publishing an EMPTY payload to the same topic with `retain: true` — say this explicitly when a retained message is the problem.
+- Retained-discovery cleanup clears only the broker side; the dead entity-registry entries it leaves behind are the registry-side sibling cleanup in `ha-nova:maintenance`.
 
 ## Error Handling
 
 Full relay/upstream error taxonomy: `skills/ha-nova/relay-api.md` -> Error Handling. MQTT specifics:
-- `UNSUPPORTED_WS_TYPE` on `mqtt/subscribe`: check YOUR request first. A BARE `mqtt/subscribe` is rejected by every relay version, including 0.3.0+ — that is by design, and it means the subscription was not wrapped in a `collect_events` envelope. Fix the request. Only if the request WAS enveloped does this error mean the relay is older than 0.3.0; confirm with `ha-nova relay health` before telling the user to update the App.
+- `UNSUPPORTED_WS_TYPE` on `mqtt/subscribe`: check YOUR request first. A BARE `mqtt/subscribe` is rejected by every relay version — that is by design, and it means the subscription was not wrapped in a `collect_events` envelope. Fix the request. Only if the request WAS enveloped does this error mean the relay predates bounded windows; confirm with `ha-nova relay health` before telling the user to update the App.
 - `400 VALIDATION_ERROR` mentioning `on_limit`: never expected — an older relay ignores the field silently rather than rejecting it, so this points at a malformed envelope.
 - `UPSTREAM_WS_TIMEOUT` in window mode means the subscription never even established (broker down, integration not loaded) — that is different from an empty window, and worth saying plainly.
 - `mqtt/device/debug_info` needs a device_id from the device registry; an entity_id is rejected.
 
 ## Output Format
 
-Apply `skills/ha-nova/output-rules.md` to all user-facing output.
+Apply `skills/ha-nova/output-rules.md` to all user-facing output. Write previews, delete confirmations, and results render as the Cards defined there.
 
-For a listen: the topic, the window length, how many messages arrived (live versus retained — never merge those two), the distinct topics seen, and a few representative payloads — never the raw dump. Say explicitly when nothing arrived, and when everything that arrived was a retained replay. For a publish: the topic, payload, and whether it was retained.
+Render the Report shape (output-rules.md). For a listen: the topic, the window length, how many messages arrived (live versus retained — never merge those two), the distinct topics seen, and a few representative payloads — never the raw dump. Say explicitly when nothing arrived, and when everything that arrived was a retained replay. For a publish: the topic, payload, and whether it was retained.
 
 ## Safety
 
 - Preview before write: nothing is saved until the user confirms the shown preview.
 - Confirmation binds to the displayed preview and expires on any change to target, payload, endpoint, or scope (context skill → Active Preview Confirmation).
 - Pre-preview phrases ("do it", "go ahead", "implement the plan") authorize drafting and preview only — never the write itself.
-- Delete and destructive operations require the typed token `confirm:<token>` verbatim; "yes" or any natural-language reply is invalid.
+- Delete and destructive operations require the typed confirmation code `confirm:<token>` verbatim; "yes" or any natural-language reply is invalid.
 - Never guess entity, service, or config IDs — resolve them or ask.
 - Home Assistant is reached exclusively through `ha-nova relay`.
 - For any HA write this skill does not cover, STOP and invoke `ha-nova:fallback` first — never probe unfamiliar write endpoints.
+
+- Drafts follow `skills/ha-nova/smallest-solution.md`: the complete requested outcome in the simplest safe design, nothing for hypothetical future needs.
 
 - Retained publishes and command/`set` topics take the typed `confirm:<token>` — they change device state or broker state persistently, which is a stricter tier than an ordinary service call.
 - Listening is read-only, but keep windows short and topics narrow: a broad subscription on a busy broker is noise, and the relay caps it anyway.
@@ -91,6 +110,6 @@ For a listen: the topic, the window length, how many messages arrived (live vers
 
 ## Guardrails
 
-- One topic per window; one publish per confirmation.
+- One topic per window; one publish per confirmation — except a manifest-bound retained-discovery cleanup batch per `skills/ha-nova/batch-safety.md`: one resolved device per manifest, topics taken only from `mqtt/device/debug_info`, never guessed or globbed; command/`set` topics always stay single-target.
 - Windows are bounded by the relay (max 100 events / 10 s) — never claim continuous monitoring.
 - Never guess a `device_id` or invent a payload schema; read what the device actually publishes first.

@@ -92,12 +92,13 @@ func relayAuthTokenFilePathFromConfig() (string, bool, error) {
 	if err != nil {
 		return "", false, err
 	}
-	// Read the raw config instead of loadConfig: token storage must not
-	// depend on relay_base_url being set, and an unreadable config must
-	// fail loud instead of silently falling back to the OS keyring — on
-	// headless Linux that fallback can hang in Secret Service unlock
-	// prompts even though a token file is configured (issue #200).
-	cfg, err := loadJSONConfig(paths.ConfigFile)
+	// Read the raw default profile instead of loadConfig: token storage must
+	// not depend on relay_base_url being set or on a valid profile selection
+	// (the legacy relay token is default-profile-only), and an unreadable
+	// config must fail loud instead of silently falling back to the OS
+	// keyring — on headless Linux that fallback can hang in Secret Service
+	// unlock prompts even though a token file is configured (issue #200).
+	cfg, err := loadRawDefaultProfileConfig(paths.ConfigFile)
 	if err != nil {
 		if isNotExist(err) {
 			return "", false, nil
@@ -304,7 +305,7 @@ func relayAuthTokenProblemMessage(err error) string {
 		return "secure storage is present but not initialized on this Linux machine; initialize the default keyring and then run: ha-nova setup"
 	}
 	if isDesktopKeyringLockedError(err) {
-		return "secure storage is present but locked on this Linux machine; unlock the default keyring and then run: ha-nova setup"
+		return "secure storage is present but locked on this Linux machine; unlock the default keyring and then run: ha-nova setup — or, if no one ever unlocks a desktop session on this machine, run: ha-nova setup --service <client>"
 	}
 	if isDesktopKeyringSetupRequiredError(err) {
 		return "secure storage is present but not ready on this Linux machine; rerun `ha-nova setup` interactively to finish local secure storage setup"
@@ -444,9 +445,6 @@ func relayAuthTokenSetupOperationError(action string, err error) error {
 }
 
 func localSecureStorageRecoveryError(err error) error {
-	if errors.Is(err, errLocalSecureStoragePasswordRejected) {
-		return err
-	}
 	err = normalizeLinuxKeyringError(err)
 	if isDesktopKeyringSessionUnavailableError(err) {
 		return desktopKeyringSessionUnavailableError("local secure storage is unavailable in this Linux session")

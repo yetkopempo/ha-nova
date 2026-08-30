@@ -7,9 +7,9 @@ The NOVA Relay ships two ways from **one** codebase:
 | **HA OS / Supervised** | The **NOVA Relay App** (Settings > Apps). `ha-nova setup` walks you through it. |
 | **HA Container / HA Core** | This **standalone container** — those installs have no Supervisor, so they cannot install Apps. |
 
-Same source, same endpoints, same version line (`nova/config.yaml`). There is no second implementation to drift.
+Same source, same endpoints, same version line (`nova/config.yaml`). There is no second implementation to drift. The pairing endpoint therefore exists in this image too, but Container/Core setup remains explicit-token-first: without Supervisor ingress there is no NOVA console page, and `RELAY_AUTH_TOKEN` stays required.
 
-One difference worth knowing: file access (`/files`, relay 0.4.0) needs the Home Assistant configuration directory mounted. The App does that for you; for the container, mount it yourself and set `FILE_ACCESS` — see Environment below. Without a mount it stays off, whatever the setting says.
+One difference worth knowing: file access (`/files`) needs the Home Assistant configuration directory mounted. The App does that for you; for the container, mount it yourself and set `FILE_ACCESS` — see Environment below. Without a mount it stays off, whatever the setting says.
 
 ## Run it
 
@@ -19,6 +19,7 @@ docker run -d --name ha-nova-relay --restart unless-stopped \
   -e RELAY_AUTH_TOKEN='<your relay token>' \
   -e HA_LLAT='<your Home Assistant long-lived access token>' \
   -e HA_URL='http://<home-assistant-host>:8123' \
+  -v ha-nova-snapshots:/data/ha_nova_snapshots \
   ghcr.io/markusleben/ha-nova-relay:latest
 ```
 
@@ -36,6 +37,11 @@ services:
       RELAY_AUTH_TOKEN: "<your relay token>"
       HA_LLAT: "<your Home Assistant long-lived access token>"
       HA_URL: "http://homeassistant:8123"
+    volumes:
+      - ha-nova-snapshots:/data/ha_nova_snapshots
+
+volumes:
+  ha-nova-snapshots:
 ```
 
 If Home Assistant runs in the same Compose project, `HA_URL` can use its service name; otherwise use the host's IP.
@@ -45,12 +51,15 @@ If Home Assistant runs in the same Compose project, `HA_URL` can use its service
 | Variable | Required | Default | Meaning |
 |----------|----------|---------|---------|
 | `RELAY_AUTH_TOKEN` | yes | — | Shared secret between the `ha-nova` CLI and the relay. Any long random secret (see Setup order). |
+| `SNAPSHOT_DIR` | no | `/data/ha_nova_snapshots` | Where config snapshots (`POST /backups`) are stored. Mount a volume there to persist them. |
 | `HA_LLAT` | yes | — | Home Assistant long-lived access token. **Stays on the server** — the AI client never sees it. |
 | `HA_URL` | no | `http://homeassistant:8123` | Where Home Assistant lives. |
 | `RELAY_PORT` | no | `8791` | Listen port. |
 | `RELAY_VERSION` | no | baked in | Version reported by `/health`. The published image bakes it in at build time — do not set it yourself. |
 | `FILE_ACCESS` | no | `off` | `off` / `read` / `readwrite`. Enables the `/files` endpoint for YAML-only configuration. Requires the Home Assistant config directory to be mounted (see below); without it, the relay stays `off` and says so in its log. |
 | `CONFIG_ROOT` | no | auto | Where the config directory is mounted inside the container. Only needed if you mount it somewhere other than `/config`. |
+
+At startup the shared relay emits one short-lived pairing code. That is useful to pairing-capable clients, but it does not replace the required `RELAY_AUTH_TOKEN` environment variable for this distribution. Codes and rate-limit state are in memory and rotate on restart.
 
 ## Setup order
 
@@ -76,7 +85,11 @@ The interactive wizard is built around the Supervisor App (it walks you through 
 
 A guided "Docker" branch in the interactive wizard is planned; until then this is the supported path, and it is the one the documentation and tests cover.
 
-The security model is identical to the App: the LLAT lives only on the server side (in the container's environment), and the relay token is stored in your OS keychain — the AI client never sees your Home Assistant token.
+The credential boundary matches the App even though the upstream credential differs: the container keeps its LLAT only in the server environment, the App keeps its Supervisor token only in its process, and the relay token is stored in your OS keychain. The AI client never sees an upstream Home Assistant credential.
+
+## Config snapshots
+
+The relay stores config snapshots (relay 0.5.0, `POST /backups`) under `/data/ha_nova_snapshots`. The image creates that directory writable, but it is EPHEMERAL unless you mount a volume there (the `-v ha-nova-snapshots:...` line above / the Compose volume). `SNAPSHOT_DIR` overrides the location. On App installs this needs no setup — the App data directory persists and full HA backups sweep it up.
 
 ## File access (optional)
 

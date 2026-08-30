@@ -37,7 +37,9 @@ Some clients can run from a service, gateway, SSH, or headless session where the
 
 This enables `ha-nova setup --service <client>` and lets interactive setup offer a service token file when the selected client declares the capability. The setup flow must stay generic: do not hardcode a Hermes-only branch for this prompt.
 
-The service token file stores only the Relay Auth Token. It does not store the Home Assistant Long-Lived Access Token.
+The service token file stores only the Relay Auth Token. It never stores upstream Home Assistant credentials: the App keeps `SUPERVISOR_TOKEN` process-local and standalone relays keep `HA_LLAT` server-side.
+
+The paired **device credential** has its own file-backend equivalent: `setup --service` forces it, and `ha-nova pair --credential-store=file` opts in without a full setup. Both route the device credential to a private 0600 file under `~/.config/ha-nova/secrets/` — the explicit answer for machines whose desktop keyring exists but is never unlocked (headless VMs, autologin boxes, systemd user services). A present-but-locked keyring without one of these opt-ins stays a hard error by design; the storage never downgrades silently.
 
 ## OS Overrides
 

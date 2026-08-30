@@ -30,7 +30,7 @@ func TestVerifySetupConnectionOnceKeepsTransportFailureGeneric(t *testing.T) {
 	_, issue, ok := verifySetupConnectionOnce(output, runtimeConfig{
 		HAURL:        "http://ha",
 		RelayBaseURL: "http://relay",
-	}, "token")
+	}, "token", false)
 	if ok {
 		t.Fatal("did not expect ready state")
 	}
@@ -45,7 +45,7 @@ func TestVerifySetupConnectionOnceKeepsTransportFailureGeneric(t *testing.T) {
 	}
 }
 
-func TestVerifySetupConnectionReuseTokenLLATIssueOffersRepairActions(t *testing.T) {
+func TestVerifySetupConnectionReuseTokenUpstreamAuthIssueOffersRepairActions(t *testing.T) {
 	originalProbeHTTP := probeHTTPForSetup
 	originalFetchRelayHealth := fetchRelayHealthForSetup
 	originalProbeRelayWSPing := probeRelayWSPingForSetup
@@ -67,7 +67,7 @@ func TestVerifySetupConnectionReuseTokenLLATIssueOffersRepairActions(t *testing.
 	issue, ok, err := verifySetupConnection(bufio.NewReader(strings.NewReader("back\n")), output, runtimeConfig{
 		HAURL:        "http://ha",
 		RelayBaseURL: "http://relay",
-	}, "token", true, true)
+	}, "token", true, setupCredentialRepairToken, false)
 	if err != errSetupBack {
 		t.Fatalf("expected errSetupBack, got %v", err)
 	}
@@ -79,14 +79,57 @@ func TestVerifySetupConnectionReuseTokenLLATIssueOffersRepairActions(t *testing.
 	}
 	for _, want := range []string{
 		"This device's Relay Auth Token worked.",
-		"Only the Home Assistant access token still needs attention.",
-		"Open Home Assistant Security page",
+		"Only the Relay's upstream Home Assistant authentication still needs attention.",
+		"Open Security page (standalone LLAT only)",
 		"Open NOVA Relay settings",
 		"Retry now",
 	} {
 		if !strings.Contains(output.String(), want) {
 			t.Fatalf("expected repair guidance %q in output:\n%s", want, output.String())
 		}
+	}
+}
+
+func TestVerifySetupConnectionPairedUpstreamAuthIssueRoutesToAppPage(t *testing.T) {
+	t.Setenv("HA_NOVA_NO_BROWSER", "1")
+	originalProbeHTTP := probeHTTPForSetup
+	originalFetchRelayHealth := fetchRelayHealthForSetup
+	originalProbeRelayWSPing := probeRelayWSPingForSetup
+	defer func() {
+		probeHTTPForSetup = originalProbeHTTP
+		fetchRelayHealthForSetup = originalFetchRelayHealth
+		probeRelayWSPingForSetup = originalProbeRelayWSPing
+	}()
+
+	probeHTTPForSetup = func(string) error { return nil }
+	fetchRelayHealthForSetup = func(string, string) ([]byte, error) {
+		return []byte(`{"status":"ok","data":{"ha_ws_connected":false}}`), nil
+	}
+	probeRelayWSPingForSetup = func(string, string) (relayWSPingResponse, error) {
+		return relayWSPingResponse{StatusCode: 502, Body: []byte("LLAT is required")}, nil
+	}
+
+	output := &bytes.Buffer{}
+	issue, ok, err := verifySetupConnection(bufio.NewReader(strings.NewReader("1\nback\n")), output, runtimeConfig{
+		HAURL:        "http://ha",
+		RelayBaseURL: "http://relay",
+	}, "paired-token", false, setupCredentialRepairPairing, true)
+	if err != errSetupBack {
+		t.Fatalf("error = %v, want errSetupBack", err)
+	}
+	if ok || issue != setupIssueWSDegraded {
+		t.Fatalf("ok/issue = %v/%q, want false/%q", ok, issue, setupIssueWSDegraded)
+	}
+	// Paired installs have no LLAT: upstream auth trouble is the App's problem,
+	// so recovery opens the App page — never the Security page, never pairing.
+	if !strings.Contains(output.String(), haRelayAppPageURL("http://ha")) {
+		t.Fatalf("upstream-auth recovery did not open the App page:\n%s", output.String())
+	}
+	if strings.Contains(output.String(), haProfileSecurityURL("http://ha")) {
+		t.Fatalf("paired install must not route to the Security page:\n%s", output.String())
+	}
+	if strings.Contains(output.String(), "pair this device again") {
+		t.Fatalf("upstream-auth failure must not route to pairing:\n%s", output.String())
 	}
 }
 
@@ -112,7 +155,7 @@ func TestVerifySetupConnectionReuseTokenRelayAuthIssueCanRouteBackToTokenStep(t 
 	issue, ok, err := verifySetupConnection(bufio.NewReader(strings.NewReader("1\n")), output, runtimeConfig{
 		HAURL:        "http://ha",
 		RelayBaseURL: "http://relay",
-	}, "token", true, true)
+	}, "token", true, setupCredentialRepairToken, false)
 	if err != errSetupRelayTokenStep {
 		t.Fatalf("expected errSetupRelayTokenStep, got %v", err)
 	}
@@ -124,6 +167,50 @@ func TestVerifySetupConnectionReuseTokenRelayAuthIssueCanRouteBackToTokenStep(t 
 	}
 	if !strings.Contains(output.String(), "Back to Relay token step") {
 		t.Fatalf("expected relay-token repair choice in output:\n%s", output.String())
+	}
+}
+
+func TestVerifySetupConnectionRevokedTokenRoutesToNovaPairing(t *testing.T) {
+	t.Setenv("HA_NOVA_NO_BROWSER", "1")
+	originalProbeHTTP := probeHTTPForSetup
+	originalFetchRelayHealth := fetchRelayHealthForSetup
+	originalProbeRelayWSPing := probeRelayWSPingForSetup
+	defer func() {
+		probeHTTPForSetup = originalProbeHTTP
+		fetchRelayHealthForSetup = originalFetchRelayHealth
+		probeRelayWSPingForSetup = originalProbeRelayWSPing
+	}()
+
+	probeHTTPForSetup = func(string) error { return nil }
+	fetchRelayHealthForSetup = func(string, string) ([]byte, error) {
+		return nil, errors.New("HTTP 401")
+	}
+	probeRelayWSPingForSetup = func(string, string) (relayWSPingResponse, error) {
+		return relayWSPingResponse{}, nil
+	}
+
+	output := &bytes.Buffer{}
+	issue, ok, err := verifySetupConnection(bufio.NewReader(strings.NewReader("1\n")), output, runtimeConfig{
+		HAURL:        "http://ha",
+		RelayBaseURL: "http://relay",
+	}, "revoked-token", true, setupCredentialRepairPairing, false)
+	if err != errSetupPairingStep {
+		t.Fatalf("error = %v, want errSetupPairingStep", err)
+	}
+	if ok || issue != setupIssueRelayUnreachable {
+		t.Fatalf("ok/issue = %v/%q, want false/%q", ok, issue, setupIssueRelayUnreachable)
+	}
+	for _, want := range []string{
+		"Open NOVA and pair this device again",
+		haRelayAppPageURL("http://ha"),
+		`choose "Open Web UI"`,
+	} {
+		if !strings.Contains(output.String(), want) {
+			t.Fatalf("pairing repair output missing %q:\n%s", want, output.String())
+		}
+	}
+	if strings.Contains(output.String(), "Open Home Assistant Security page") {
+		t.Fatalf("relay-token failure must not route to upstream-token recovery:\n%s", output.String())
 	}
 }
 
@@ -150,7 +237,7 @@ func TestVerifySetupConnectionReuseTokenConnectionIssueCanRouteToHostStep(t *tes
 		HAHost:       "homeassistant.local",
 		HAURL:        "http://homeassistant.local:8123",
 		RelayBaseURL: "http://homeassistant.local:8791",
-	}, "token", true, true)
+	}, "token", true, setupCredentialRepairToken, false)
 	if err != errSetupHostStep {
 		t.Fatalf("expected errSetupHostStep, got %v", err)
 	}
@@ -192,7 +279,7 @@ func TestVerifySetupConnectionReuseTokenRelayUnreachableKeepsRepairCopyTruthful(
 	issue, ok, err := verifySetupConnection(bufio.NewReader(strings.NewReader("back\n")), output, runtimeConfig{
 		HAURL:        "http://ha",
 		RelayBaseURL: "http://relay",
-	}, "token", true, true)
+	}, "token", true, setupCredentialRepairToken, false)
 	if err != errSetupBack {
 		t.Fatalf("expected errSetupBack, got %v", err)
 	}
@@ -232,7 +319,7 @@ func TestVerifySetupConnectionReuseTokenAmbiguousIssueUsesFallbackRepairPage(t *
 	issue, ok, err := verifySetupConnection(bufio.NewReader(strings.NewReader("back\n")), output, runtimeConfig{
 		HAURL:        "http://ha",
 		RelayBaseURL: "http://relay",
-	}, "token", true, true)
+	}, "token", true, setupCredentialRepairToken, false)
 	if err != errSetupBack {
 		t.Fatalf("expected errSetupBack, got %v", err)
 	}
@@ -280,7 +367,7 @@ func TestVerifySetupConnectionRepairPromptInputEndStopsWithProgressSaved(t *test
 	issue, ok, err := verifySetupConnection(bufio.NewReader(strings.NewReader("n\n")), output, runtimeConfig{
 		HAURL:        "http://ha",
 		RelayBaseURL: "http://relay",
-	}, "token", false, true)
+	}, "token", false, setupCredentialRepairToken, false)
 	if err != nil {
 		t.Fatalf("expected stop-for-now (nil error) on input end, got %v", err)
 	}

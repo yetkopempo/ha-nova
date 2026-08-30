@@ -59,7 +59,6 @@ func maybeOfferGuidedTeardown(reader *bufio.Reader, out io.Writer, preflight uni
 		renderSetupParagraphTight(out, "Home Assistant is not reachable right now — the server-side cleanup checklist is included at the end for when it is back online.")
 		return teardownNotOffered, nil
 	}
-
 	stage := teardownStageOffer
 	// Trust-the-user default: only a probe that POSITIVELY shows the relay
 	// still answering downgrades the outcome — repo removal and LLAT
@@ -152,9 +151,10 @@ func maybeOfferGuidedTeardown(reader *bufio.Reader, out io.Writer, preflight uni
 			stage = teardownStageLLAT
 
 		case teardownStageLLAT:
-			renderSetupStep(out, 3, 3, "Revoke the Home Assistant access token")
+			renderSetupStep(out, 3, 3, "Remove a legacy Home Assistant access token")
 			renderSetupLink(out, "This will open:", haProfileSecurityURL(preflight.haURL))
-			_, err := promptWizardLineFromReader(reader, out, "Press Enter to open your browser", "")
+			renderSetupParagraphTight(out, "Current App installs use Supervisor access and create no LLAT. Continue only to remove a NOVA token from an older or standalone setup.")
+			_, err := promptWizardLineFromReader(reader, out, "Press Enter to review legacy tokens", "")
 			if err == errSetupBack {
 				stage = teardownStageRepo
 				continue
@@ -166,12 +166,12 @@ func maybeOfferGuidedTeardown(reader *bufio.Reader, out io.Writer, preflight uni
 				return teardownNotOffered, err
 			}
 			deps.openURL(out, haProfileSecurityURL(preflight.haURL))
-			renderSetupIndentedBlock(out, "On your profile's Security tab:", "    ",
+			renderSetupIndentedBlock(out, "If a NOVA token exists on your profile's Security tab:", "    ",
 				"1. Scroll to \"Long-lived access tokens\"",
 				"2. Find the token named \"NOVA\"",
 				"3. Delete it",
 			)
-			_, err = promptWizardLineFromReader(reader, out, "Press Enter when the token is revoked", "")
+			_, err = promptWizardLineFromReader(reader, out, "Press Enter when the legacy-token check is complete", "")
 			if err == errSetupBack {
 				stage = teardownStageRepo
 				continue
@@ -199,7 +199,26 @@ func maybeOfferGuidedTeardown(reader *bufio.Reader, out io.Writer, preflight uni
 // token) it stays trust-the-user, like the repo and LLAT steps. The token
 // revocation step stays deliberately unverifiable: the CLI never held the LLAT.
 func verifyRelayGone(out io.Writer, preflight uninstallPreflight, deps teardownDeps) bool {
-	if preflight.config.RelayBaseURL == "" || preflight.relayToken == "" {
+	probe := func() bool { return false }
+	stillAt := preflight.config.RelayBaseURL
+	switch {
+	case preflight.config.RelaySecureBaseURL != "" &&
+		preflight.config.RelaySpkiPin != "" &&
+		defaultUninstallDeviceCredentialExists():
+		// Device wins, matching transport resolution everywhere else: a
+		// leftover legacy token may have been rotated server-side long ago,
+		// while the device credential is what this install actually uses.
+		probe = func() bool {
+			return verifyDefaultUninstallDeviceHealth(preflight.config)
+		}
+		stillAt = preflight.config.RelaySecureBaseURL
+	case preflight.config.RelayBaseURL != "" && preflight.relayToken != "":
+		probe = func() bool {
+			_, err := deps.relayHealth(preflight.config.RelayBaseURL, preflight.relayToken)
+			return err == nil
+		}
+	default:
+		// Nothing to probe with — trust the user, like the repo and LLAT steps.
 		return true
 	}
 	session := resolveStatusUISession(out)
@@ -207,20 +226,34 @@ func verifyRelayGone(out io.Writer, preflight uninstallPreflight, deps teardownD
 		if attempt > 0 {
 			deps.sleep(2 * time.Second)
 		}
-		if _, err := deps.relayHealth(preflight.config.RelayBaseURL, preflight.relayToken); err != nil {
+		if !probe() {
 			fmt.Fprintf(out, "  %s Relay no longer answers — app removed.\n", session.style("success", session.successMarker()))
 			return true
 		}
 	}
-	fmt.Fprintf(out, "  %s The relay still answers at %s. If you run more than one instance this is expected; otherwise finish the app removal in Home Assistant.\n", session.style("warning", session.warningMarker()), preflight.config.RelayBaseURL)
+	fmt.Fprintf(out, "  %s The relay still answers at %s. If you run more than one instance this is expected; otherwise finish the app removal in Home Assistant.\n", session.style("warning", session.warningMarker()), stillAt)
 	return false
+}
+
+func defaultUninstallDeviceCredentialExists() bool {
+	_, exists, err := readCredentialSlot(
+		deviceCredentialServiceForProfile(defaultServerProfileName),
+	)
+	return err == nil && exists
+}
+
+func verifyDefaultUninstallDeviceHealth(cfg runtimeConfig) bool {
+	originalProfile := activeServerProfile()
+	setActiveServerProfile(defaultServerProfileName)
+	defer setActiveServerProfile(originalProfile)
+	return verifyDeviceHealth(cfg)
 }
 
 // teardownCompletedNoteLines replaces the server-side checklist after a
 // completed guided teardown. Standard mode keeps the connection config on
 // purpose, so it gets the pointing-at-nothing hint.
 func teardownCompletedNoteLines(mode uninstallMode) []string {
-	notes := []string{"Server side removed in Home Assistant (app, repository, access token)."}
+	notes := []string{"Server side removed in Home Assistant (app, repository, and any legacy access token)."}
 	if mode != uninstallModePurge {
 		notes = append(notes, "The kept connection config now points at nothing. Run 'ha-nova uninstall --purge' to clear it, or keep it for a reinstall.")
 	}

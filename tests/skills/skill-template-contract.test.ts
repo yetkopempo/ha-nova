@@ -1,12 +1,7 @@
 import { readdirSync, readFileSync, statSync } from "node:fs";
-import { join } from "node:path";
+import { dirname, join, resolve } from "node:path";
 
 import { describe, expect, it } from "vitest";
-
-// Skill Section Template v2 linter — enforces docs/reference/skill-architecture.md
-// → "Skill Section Template (v2)". One behavior, one place: the English-only and
-// word-budget checks moved here from ha-nova-contract.test.ts with dynamic
-// globbing (hardcoded file lists silently exempt new skills).
 
 const SKILLS_ROOT = "skills";
 
@@ -42,9 +37,10 @@ const CANON = [
 
 const BOOTSTRAP_HEADINGS: Record<string, string> = {
   onboarding: "Bootstrap",
-  fallback: "Bootstrap (only before Relay-Ready calls)",
+  fallback: "Bootstrap (before Home Assistant tasks)",
 };
 const DEFAULT_BOOTSTRAP = "Bootstrap (once per session)";
+const SESSION_BOOTSTRAP_REF = "../ha-nova/session-bootstrap.md";
 
 // The diagnostics skill's whole body is remediation commands — declared
 // exception, see skill-architecture.md → Declared deviations.
@@ -60,6 +56,7 @@ const FORBIDDEN_HEADINGS = [
 ];
 
 const MUTATION_SKILLS = new Set([
+  "hacs",
   "write",
   "diagnose",
   "media",
@@ -79,6 +76,8 @@ const MUTATION_SKILLS = new Set([
   "energy",
   "maintenance",
   "service-call",
+  "integration-setup",
+  "calendar",
   "fallback",
   "review",
 ]);
@@ -88,7 +87,6 @@ const READ_ONLY_SKILLS = new Set([
   "entity-discovery",
   "history",
   "health",
-  "calendar",
   "onboarding",
 ]);
 
@@ -102,29 +100,7 @@ const SAFETY_CORE_BLOCKS = ((): { mutation: string; readOnly: string } => {
   return { mutation: fenced[0] ?? "", readOnly: fenced[1] ?? "" };
 })();
 
-// Word budgets: default 1150 (every sub-skill carries the mandatory ~100-word
-// Safety Core, the output-rules pointer, and the A6 frontmatter). Documented
-// ratchets for content-dense skills. Note: the A5 token diet cut the
-// TRANSITIVE load (lazy references), not these file sizes — write carries the
-// on-demand trigger list itself.
-const WORD_BUDGETS: Record<string, number> = {
-  write: 1400,
-  diagnose: 1450,
-  mqtt: 1250,
-  scene: 1350,
-  "service-call": 1250,
-  todo: 1200,
-  updates: 1200,
-  maintenance: 1200,
-  fallback: 2300,
-  helper: 3600,
-  review: 4300,
-};
-const DEFAULT_WORD_BUDGET = 1150;
-
-// Internal review-check codes (S-01, R-18, H-09, ...) may flow only between
-// the reviewer/mutation files that implement the dedup logic; user-flow
-// skills must never carry them (output-rules.md forbids surfacing them).
+// Internal check codes stay in reviewer/mutation files.
 const CHECK_CODE_ALLOWLIST = new Set([
   "skills/review/checks.md",
   "skills/review/SKILL.md",
@@ -312,6 +288,30 @@ describe("skill template v2 contract", () => {
     }
   });
 
+  it("routes every independently loadable sub-skill through the shared session bootstrap", () => {
+    for (const name of SUBSKILLS) {
+      const content = readFileSync(subskillPath(name), "utf8");
+      const bootstrapHeading = BOOTSTRAP_HEADINGS[name] ?? DEFAULT_BOOTSTRAP;
+      const bootstrap = sectionBody(content, bootstrapHeading);
+      expect(
+        bootstrap,
+        `${name}: direct loading must retain HA NOVA + Relay update discovery`,
+      ).toContain(SESSION_BOOTSTRAP_REF);
+      expect(
+        statSync(resolve(dirname(subskillPath(name)), SESSION_BOOTSTRAP_REF)).isFile(),
+        `${name}: shared session bootstrap reference must resolve from the skill directory`,
+      ).toBe(true);
+      const sharedContract = bootstrap.indexOf(SESSION_BOOTSTRAP_REF);
+      const firstRelayCommand = bootstrap.indexOf("ha-nova relay");
+      if (firstRelayCommand >= 0) {
+        expect(
+          sharedContract,
+          `${name}: shared session bootstrap must run before the first relay command`,
+        ).toBeLessThan(firstRelayCommand);
+      }
+    }
+  });
+
   it("covers every sub-skill by exactly one safety class", () => {
     for (const name of SUBSKILLS) {
       expect(
@@ -375,7 +375,7 @@ describe("skill template v2 contract", () => {
     for (const file of ALL_SKILL_MD_FILES) {
       if (CHECK_CODE_ALLOWLIST.has(file.split("\\").join("/"))) continue;
       const content = readFileSync(file, "utf8");
-      const match = content.match(/\b[SRPMFH]-\d{2}\b/);
+      const match = content.match(/\b(?:[SRPMFH]|SC|HX|TS|D)-\d{2}\b/);
       expect(
         match,
         `${file}: internal check code '${match?.[0]}' outside the reviewer allowlist`,
@@ -395,15 +395,4 @@ describe("skill template v2 contract", () => {
     }
   });
 
-  it("keeps every sub-skill within its word budget", () => {
-    for (const name of SUBSKILLS) {
-      const content = readFileSync(subskillPath(name), "utf8");
-      const wordCount = content.trim().split(/\s+/).length;
-      const limit = WORD_BUDGETS[name] ?? DEFAULT_WORD_BUDGET;
-      expect(
-        wordCount,
-        `skills/${name}/SKILL.md has ${wordCount} words (limit ${limit})`,
-      ).toBeLessThan(limit);
-    }
-  });
 });

@@ -9,6 +9,74 @@ The format follows [Keep a Changelog](https://keepachangelog.com/) and [Semantic
 Recent changes are tracked in [GitHub releases](https://github.com/markusleben/ha-nova/releases)
 and merged PRs. This changelog will be updated with the next tagged relay version.
 
+## [Relay 0.9.0] - 2026-08-04
+
+- NOVA page device list: two-step arm/confirm for revoke, legacy revoke, and
+  registry reset (device-bound CSRF tokens; typed RESET for the strongest
+  gate); per-device added/last-used timestamps; cloud badge and bound HA user
+  on the confirm screen.
+- Device registry: throttled last-used tracking that survives a broken disk;
+  atomic writes clean up their temp files on failure.
+
+## [Relay 0.8.0] - 2026-07-29
+
+### Added
+- Optional Home Assistant Cloud ingress for the existing Relay routes, with user-bound device authentication and separately revocable pairings.
+- Persistent Relay instance identity so local and Cloud routes cannot silently bind to different App installations.
+
+### Security
+- Functional Cloud routes require the Supervisor ingress peer, one Home Assistant user identity, the matching active device, and the current Relay instance.
+- Credential-bearing Home Assistant and Supervisor HTTP clients reject redirects.
+- Disabled builds expose only Cloud capability discovery and self-revocation; setup and functional Cloud routes remain unavailable.
+
+## [Relay 0.7.1] - 2026-07-23
+
+### Changed
+- Migrated the certificate runtime to `@peculiar/x509` 2.0 while preserving existing TLS identities and SPKI pins byte-for-byte. Partial identity recovery now remains retryable after an interrupted write. (#421)
+- Updated `ws` to 8.21.1 for corrected fragment accounting and lower defensive fragment/chunk ceilings. (#424)
+
+### Fixed
+- Invalid UTF-8, UTF-16, and ambiguous byte-order marks are rejected before Relay route dispatch instead of being decoded with replacement characters. Valid Unicode, including umlauts, remains unchanged. (#423)
+
+## [Relay 0.7.0] - 2026-07-20
+
+### Added
+- Secure device pairing: OPAQUE (RFC 9807) handshake over an SPKI-pinned TLS 1.3 device listener; every device gets its own credential and can be revoked individually. (#374)
+- NOVA console via Supervisor ingress: generate one-time six-digit pairing codes ("Connect a device"), list paired devices, revoke any one, and manage migrated legacy access. (#374)
+- Supervisor-token upstream in App mode — no `HA_LLAT` in the App anymore; standalone Container/Core keeps its server-side token. (#374)
+- Automatic legacy migration: the pre-pairing shared relay token is imported as a digest on first start and the stored plaintext is cleared; legacy access keeps working until revoked. (#374)
+- The App enables its NOVA sidebar entry once on first start (also right after this update); hiding it afterwards is always respected. (#384)
+
+### Fixed
+- Fresh App installs could fail to start because a required option had no default. (#376)
+
+## [Relay 0.6.0] - 2026-07-15
+
+### Added
+- Home Base: an admin-only Home Assistant sidebar page with Relay status, the current pairing code, and install guidance.
+- `POST /pair`: exchange a short-lived, single-use six-digit code for the Relay token during local setup.
+- App-managed persistent Relay tokens when the advanced `relay_auth_token` option is left empty. Existing configured tokens remain compatible.
+
+### Changed
+- `/health` now reports the Home Assistant WebSocket disconnect reason (`auth`, `network`, or `never_connected`) and snapshot-store status.
+- `LOG_LEVEL` is applied at runtime; rejected auth requests and unexpected request failures now produce useful logs without exposing secrets.
+- HTTP request, header, keep-alive, and upstream response limits are explicit and configurable where appropriate.
+
+### Security
+- Pairing is peer- and globally rate-limited, returns generic failures, rotates codes after success or expiry, and marks every response `no-store`.
+- Home Base requires the real Supervisor ingress peer plus authenticated user headers; direct-port header spoofing is rejected.
+- Secret comparisons no longer reveal length through an early return.
+
+## [Relay 0.5.0] - 2026-07-14
+
+### Added
+- `POST /backups`: a bearer-authenticated, generic gzip JSON store for named and automatic config snapshots, with bounded save/load/list/delete/prune actions and no Home Assistant business logic.
+- Snapshot storage persists in the App data directory and can use a mounted `SNAPSHOT_DIR` in the standalone container.
+
+## [Relay 0.4.1] - 2026-07-12
+
+- The App info page now explains what the NOVA Relay is, what it deliberately does not do, and where the security model lives — instead of a one-line stub. No functional changes.
+
 ## [Relay 0.4.0] - 2026-07-11
 
 ### Added

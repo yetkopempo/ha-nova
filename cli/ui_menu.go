@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"time"
 
 	"golang.org/x/term"
 )
@@ -79,8 +80,8 @@ func promptSetupTokenChoiceInteractive(reader *bufio.Reader, out io.Writer, hasE
 	})
 }
 
-func promptSetupRepairActionInteractive(reader *bufio.Reader, out io.Writer, mode setupRepairMode, allowRelayTokenStep bool) (setupRepairAction, error) {
-	choices, defaultChoice := setupRepairChoices(mode, allowRelayTokenStep)
+func promptSetupRepairActionInteractive(reader *bufio.Reader, out io.Writer, mode setupRepairMode, credentialRepair setupCredentialRepairMode) (setupRepairAction, error) {
+	choices, defaultChoice := setupRepairChoices(mode, credentialRepair)
 	spec := setupMenuSpec{
 		Title:        "Next step:",
 		Prompt:       "Use ↑/↓ or j/k, Enter to select, Esc to go back, Ctrl+C to exit",
@@ -94,7 +95,7 @@ func promptSetupRepairActionInteractive(reader *bufio.Reader, out io.Writer, mod
 		})
 	}
 	answer, err := promptSetupMenu(reader, out, spec, func() (string, error) {
-		action, err := promptSetupRepairActionFromReader(reader, out, mode, allowRelayTokenStep)
+		action, err := promptSetupRepairActionFromReader(reader, out, mode, credentialRepair)
 		return string(action), err
 	})
 	if err != nil {
@@ -136,6 +137,7 @@ func (terminalSetupMenuRunner) Run(out io.Writer, spec setupMenuSpec) (string, e
 	if index < 0 {
 		return "", errSetupMenuUnavailable
 	}
+	staleBlankDeadline := beginSetupStaleBlankInputWindow()
 
 	lines := renderSetupMenuBlock(out, session, spec, index)
 	for {
@@ -149,6 +151,9 @@ func (terminalSetupMenuRunner) Run(out io.Writer, spec setupMenuSpec) (string, e
 		case "down":
 			index = moveSetupMenuIndex(spec.Options, index, 1)
 		case "enter":
+			if setupInputIsStaleBlank(staleBlankDeadline, true) {
+				continue
+			}
 			return spec.Options[index].Value, nil
 		case "back":
 			if spec.AllowBack {
@@ -159,6 +164,7 @@ func (terminalSetupMenuRunner) Run(out io.Writer, spec setupMenuSpec) (string, e
 		default:
 			continue
 		}
+		staleBlankDeadline = time.Time{}
 		fmt.Fprintf(out, "\033[%dA\033[J", lines)
 		lines = renderSetupMenuBlock(out, session, spec, index)
 	}

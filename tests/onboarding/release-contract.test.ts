@@ -1,45 +1,114 @@
+import { spawnSync } from "node:child_process";
 import { existsSync, readFileSync } from "node:fs";
 
 import { describe, expect, it } from "vitest";
 
+import { registerCloudReleaseGateContractTests } from "./cloud-release-gate-contract.js";
+
 describe("release contract", () => {
   const goreleaser = readFileSync(".goreleaser.yml", "utf8");
   const installer = readFileSync("install.ps1", "utf8");
-  const bundleBuilder = readFileSync("scripts/release/build-install-bundle.sh", "utf8");
+  const bundleBuilder = readFileSync(
+    "scripts/release/build-install-bundle.sh",
+    "utf8",
+  );
+  const relayImageVerifier = readFileSync(
+    "scripts/release/verify-relay-image.sh",
+    "utf8",
+  );
+  const releaseAssetVerifier = readFileSync(
+    "scripts/release/verify-release-assets.sh",
+    "utf8",
+  );
+  const censusDeploymentVerifier = readFileSync(
+    "scripts/release/verify-census-deployment.sh",
+    "utf8",
+  );
+  const censusFunctionalVerifier = readFileSync(
+    "scripts/release/verify-census-functional.sh",
+    "utf8",
+  );
+  const censusDeployer = readFileSync(
+    "scripts/release/deploy-census-worker.sh",
+    "utf8",
+  );
+  const censusDeploymentState = readFileSync(
+    "scripts/release/census-deployment-state.sh",
+    "utf8",
+  );
   const releaseWorkflow = readFileSync(".github/workflows/release.yml", "utf8");
-  const rcWorkflow = readFileSync(".github/workflows/release-candidate.yml", "utf8");
+  const rcWorkflow = readFileSync(
+    ".github/workflows/release-candidate.yml",
+    "utf8",
+  );
+  const censusWorkerReadme = readFileSync("census-worker/README.md", "utf8");
   const releasing = readFileSync("docs/releasing.md", "utf8");
-  const linuxHeadlessHelper = readFileSync("scripts/smoke/linux-headless-setup-check.sh", "utf8");
+  const readme = readFileSync("README.md", "utf8");
+  const linuxHeadlessHelper = readFileSync(
+    "scripts/smoke/linux-headless-setup-check.sh",
+    "utf8",
+  );
   const pkg = JSON.parse(readFileSync("package.json", "utf8")) as {
+    dependencies?: Record<string, string>;
+    devDependencies?: Record<string, string>;
     scripts?: Record<string, string>;
   };
 
-  it("keeps release notes aligned to the single supported Windows install path", () => {
-    expect(goreleaser).toContain("Stable install commands are release-pinned for this tag.");
-    expect(goreleaser).toContain("https://raw.githubusercontent.com/markusleben/ha-nova/{{ .Tag }}/install.sh");
-    expect(goreleaser).toContain("HA_NOVA_VERSION={{ .Tag }}");
-    expect(goreleaser).toContain("https://raw.githubusercontent.com/markusleben/ha-nova/{{ .Tag }}/install.ps1");
-    expect(goreleaser).toContain("Windows uses a single supported install path: `install.ps1`.");
-    expect(goreleaser).toContain("Home Assistant Relay setup and token steps remain guided in the browser");
-    expect(goreleaser).not.toContain("raw.githubusercontent.com/markusleben/ha-nova/main/install.sh");
-    expect(goreleaser).not.toContain("raw.githubusercontent.com/markusleben/ha-nova/main/install.ps1");
-    expect(goreleaser).not.toContain("$ProgressPreference = 'SilentlyContinue'");
-    expect(goreleaser).not.toContain("winget");
-  });
-
   it("keeps local RC packaging focused on install bundles only", () => {
     expect(pkg.scripts?.["release:rc:local"]).toBe(
-      "goreleaser build --snapshot --clean && bash scripts/release/build-install-bundle.sh"
+      'bash scripts/release/build-sign-darwin-binaries.sh "${HA_NOVA_RC_TAG:?set HA_NOVA_RC_TAG to vX.Y.Z-rcN}" && bash scripts/release/build-rc-binaries.sh "${HA_NOVA_RC_TAG}" && bash scripts/release/build-install-bundle.sh "${HA_NOVA_RC_TAG#v}"',
     );
+    expect(pkg.scripts?.["release:rc:local"]).not.toContain("snapshot");
     expect(pkg.scripts?.["release:winget:stage-submission"]).toBeUndefined();
     expect(existsSync("scripts/release/build-install-bundle.sh")).toBe(true);
     expect(existsSync("scripts/release/build-winget-manifest.sh")).toBe(false);
-    expect(existsSync("scripts/release/prepare-winget-pkgs-submission.sh")).toBe(false);
+    expect(
+      existsSync("scripts/release/prepare-winget-pkgs-submission.sh"),
+    ).toBe(false);
     expect(existsSync("release/winget-publication-state.json")).toBe(false);
   });
 
+  it("accepts only the exact expected Windows negative provenance result", () => {
+    for (const workflow of [releaseWorkflow, rcWorkflow]) {
+      expect(workflow).toContain("$provenanceExitCode -ne 1 -or");
+      expect(workflow).toContain(
+        '$provenanceOutput -ne "[ha-nova] ERROR: official Cloud release provenance is not enabled"',
+      );
+      expect(workflow).toContain("$global:LASTEXITCODE = 0");
+    }
+  });
+
+  it.each(["v0.22.0-rc0", "v0.22.0-rc01", "v01.22.0-rc1"])(
+    "rejects non-canonical RC tag %s across release entry points",
+    (tag) => {
+      for (const [script, args] of [
+        ["scripts/release/verify-release-metadata.sh", [tag]],
+        ["scripts/release/verify-next-release-version.sh", [tag]],
+        ["scripts/release/verify-release-assets.sh", [tag]],
+        ["scripts/release/build-rc-binaries.sh", [tag]],
+        ["scripts/release/build-sign-darwin-binaries.sh", [tag]],
+      ] as const) {
+        const result = spawnSync("bash", [script, ...args], {
+          encoding: "utf8",
+        });
+        expect(
+          result.status,
+          `${script}\n${result.stdout}\n${result.stderr}`,
+        ).not.toBe(0);
+      }
+    },
+  );
+
   it("builds Unix install bundles without macOS copyfile metadata noise", () => {
-    expect(bundleBuilder).toContain('COPYFILE_DISABLE=1 tar --format ustar -czf "${output}" -C "${stage_dir}" ha-nova');
+    expect(bundleBuilder).toContain(
+      'COPYFILE_DISABLE=1 tar --format ustar -czf "${output}" -C "${stage_dir}" ha-nova',
+    );
+  });
+
+  it("ships the privacy document targeted by bundled relative links", () => {
+    expect(bundleBuilder).toContain(
+      'cp "${ROOT_DIR}/PRIVACY.md" "${bundle_root}/PRIVACY.md"',
+    );
   });
 
   it("keeps the final release workflow free of winget artifacts and validation", () => {
@@ -53,31 +122,128 @@ describe("release contract", () => {
     expect(releaseWorkflow).not.toContain("dist/winget");
   });
 
-  it("keeps v0.14.1 release-facing wording user-centric", () => {
-    // Shipped release-note bodies are archived (docs/archive/work/) and
-    // non-normative per documentation governance; only the active GoReleaser
-    // template is contract-checked here.
-    expect(goreleaser).toContain("9 new skills — coverage across the whole home");
-    expect(goreleaser).toContain("Runs on every Home Assistant install now");
-    expect(goreleaser).toContain("ghcr.io/markusleben/ha-nova-relay");
-    expect(goreleaser).toContain("YAML configuration you can finally edit");
-    expect(goreleaser).toContain("The NOVA Relay must be updated to 0.4.0 or newer");
-    expect(goreleaser).toContain("HA_NOVA_NO_UPDATE_NUDGE=1");
-    expect(goreleaser).toContain("`ha-nova doctor` now really checks the relay version");
-    expect(goreleaser).not.toContain("Use `v0.7.1` or the latest release command");
+  it("keeps README install commands visible and versionless", () => {
+    expect(readme).toContain(
+      "curl -fsSL https://raw.githubusercontent.com/markusleben/ha-nova/main/install.sh | bash",
+    );
+    expect(readme).toContain(
+      "irm https://raw.githubusercontent.com/markusleben/ha-nova/main/install.ps1 | iex",
+    );
+    expect(readme).toContain(
+      "The installer selects the latest stable release.",
+    );
+    expect(readme).not.toMatch(/HA_NOVA_VERSION=v\d/);
+    expect(readme).not.toMatch(/\$env:HA_NOVA_VERSION\s*=\s*['\"]v\d/);
   });
 
   it("pins the GoReleaser release tag to the triggering workflow ref", () => {
-    expect(releaseWorkflow).toContain("GORELEASER_CURRENT_TAG: ${{ github.ref_name }}");
+    expect(releaseWorkflow).toContain(
+      "GORELEASER_CURRENT_TAG: ${{ github.ref_name }}",
+    );
+  });
+
+  registerCloudReleaseGateContractTests();
+
+  it("keeps releases private until every required asset is present", () => {
+    expect(goreleaser).toMatch(/^\s*draft:\s*true\s*$/m);
+    expect(goreleaser).toMatch(/^\s*replace_existing_draft:\s*true\s*$/m);
+    expect(goreleaser).toMatch(/^\s*mode:\s*replace\s*$/m);
+    expect(releaseWorkflow).toContain("publish-release:");
+    expect(releaseWorkflow).toContain(
+      "name: Verify complete draft and publish",
+    );
+    expect(releaseWorkflow).toContain('version: "v2.17.0"');
+    expect(releaseWorkflow).not.toContain('version: "~> v2"');
+    expect(releaseWorkflow).toContain("Detect an already-published retry");
+    expect(releaseWorkflow).toContain(
+      "gh api --paginate --slurp 'repos/markusleben/ha-nova/releases?per_page=100'",
+    );
+    expect(releaseWorkflow).not.toMatch(/if release_json=.*gh release view/);
+    expect(releaseWorkflow).toContain(
+      "if: steps.release-state.outputs.published != 'true'",
+    );
+    expect(
+      releaseWorkflow.match(/verify-release-assets\.sh "\$GITHUB_REF_NAME"/g),
+    ).toHaveLength(2);
+    expect(releaseAssetVerifier).toContain('repository="markusleben/ha-nova"');
+    expect(releaseAssetVerifier).toContain(
+      "(.assets | length) == ($expected | length)",
+    );
+    expect(releaseAssetVerifier).toContain(
+      "([.assets[].name] | sort) == $expected",
+    );
+    expect(releaseAssetVerifier).toContain('.state == "uploaded"');
+    expect(releaseAssetVerifier).toContain(
+      '.size | type == "number" and . > 0',
+    );
+    expect(releaseAssetVerifier).toContain('test("^sha256:[0-9a-f]{64}$")');
+    expect(releaseWorkflow).toContain(
+      'gh release edit "$GITHUB_REF_NAME" --draft=false',
+    );
+    expect(releaseWorkflow).toMatch(
+      /if \[\[ "\$expected_prerelease" == "true" \]\]; then[\s\S]*?else\s+# Re-assert Latest[\s\S]*?gh release edit "\$GITHUB_REF_NAME" --draft=false --latest --verify-tag\s+fi/,
+    );
+    expect(releaseWorkflow).toContain(
+      "gh api 'repos/markusleben/ha-nova/releases/latest' --jq '.tag_name'",
+    );
+    expect(releaseWorkflow).toContain(
+      '[[ "$latest_tag" != "$GITHUB_REF_NAME" ]]',
+    );
+    expect(releaseWorkflow).toContain("needs: publish-release");
+    expect(releaseWorkflow).toContain("smoke-release-bundles:");
+    expect(releaseWorkflow).toContain("needs: smoke-release-bundles");
+    expect(releaseWorkflow).toContain(
+      'gh release download "$GITHUB_REF_NAME"',
+    );
+    expect(releaseWorkflow).toContain("internal-cloud-release-check");
+    expect(releaseWorkflow.indexOf("Upload install bundles")).toBeLessThan(
+      releaseWorkflow.indexOf("smoke-release-bundles:"),
+    );
+    expect(releaseWorkflow.indexOf("smoke-release-bundles:")).toBeLessThan(
+      releaseWorkflow.indexOf("publish-release:"),
+    );
+    expect(releaseWorkflow.indexOf("publish-release:")).toBeLessThan(
+      releaseWorkflow.indexOf("smoke-installers:"),
+    );
+  });
+
+  it("uses only the curated release header as the changelog", () => {
+    expect(goreleaser).toMatch(
+      /changelog:\n\s+#[^\n]*\n(?:\s+#[^\n]*\n)*\s+disable: true/,
+    );
+    expect(goreleaser).not.toContain("regexp: '^feat");
+    expect(goreleaser).not.toContain("regexp: '^fix");
   });
 
   it("keeps the next-release-version check immune to release-payload growth", () => {
     // The default spawnSync maxBuffer (1 MiB) failed the v0.14.0 publish with
     // ENOBUFS once the release list outgrew it. The gh call must project the
     // payload down to the fields it reads and carry an explicit buffer.
-    const versionCheck = readFileSync("scripts/release/verify-next-release-version.sh", "utf8");
+    const versionCheck = readFileSync(
+      "scripts/release/verify-next-release-version.sh",
+      "utf8",
+    );
     expect(versionCheck).toContain('".[] | {tag_name, draft, prerelease}"');
     expect(versionCheck).toContain("maxBuffer: 64 * 1024 * 1024");
+  });
+
+  it("rejects non-canonical Relay image release selectors before external checks", () => {
+    expect(relayImageVerifier).toContain(
+      "relay version must be canonical X.Y.Z",
+    );
+    const result = spawnSync(
+      "bash",
+      [
+        "scripts/release/verify-relay-image.sh",
+        "0000000000000000000000000000000000000000",
+        "01.2.3",
+      ],
+      { encoding: "utf8" },
+    );
+    expect(result.status).not.toBe(0);
+    expect(`${result.stdout}\n${result.stderr}`).toContain(
+      "relay version must be canonical X.Y.Z",
+    );
   });
 
   it("keeps the RC workflow free of winget artifacts and guidance", () => {
@@ -88,8 +254,18 @@ describe("release contract", () => {
     expect(rcWorkflow).not.toContain("Upload RC winget manifests");
     expect(rcWorkflow).not.toContain("Download RC winget manifests");
     expect(rcWorkflow).not.toContain("winget validate");
-    expect(rcWorkflow).not.toContain("$ProgressPreference = 'SilentlyContinue'");
+    expect(rcWorkflow).not.toContain(
+      "$ProgressPreference = 'SilentlyContinue'",
+    );
     expect(rcWorkflow).not.toContain("dist/winget");
+    expect(rcWorkflow).toContain('platform="darwin"');
+    expect(rcWorkflow).toContain('platform="linux"');
+    expect(rcWorkflow).toContain(
+      'elif HOME="$smoke_home" "$root/ha-nova" internal-cloud-release-check; then',
+    );
+    expect(rcWorkflow).toContain(
+      "unlisted Windows runtime returned an unexpected provenance result",
+    );
   });
 
   it("keeps the RC workflow build-and-smoke only, never publishing a release", () => {
@@ -113,13 +289,17 @@ describe("release contract", () => {
     // The tag-first rehearsal publishes the -rcN tag via release.yml, so the
     // GoReleaser header must switch to preview framing for prerelease tags
     // rather than reusing the stable "Why This Release Exists" copy.
-    expect(goreleaser).toContain("{{ if .Prerelease }}## Preview / Release Candidate");
+    expect(goreleaser).toContain(
+      "{{ if .Prerelease }}## Preview / Release Candidate",
+    );
     expect(goreleaser).toContain("Stable users should ignore this prerelease");
   });
 
   it("keeps the Windows installer bundle-managed while preserving quiet download UX", () => {
     expect(installer).toContain("Invoke-DownloadFile");
-    expect(installer).toContain('$global:ProgressPreference = "SilentlyContinue"');
+    expect(installer).toContain(
+      '$global:ProgressPreference = "SilentlyContinue"',
+    );
     expect(installer).not.toContain("Stop-ForWingetInstall");
     expect(installer).not.toContain("Get-Command winget");
     expect(installer).not.toContain("winget upgrade --id");
@@ -127,61 +307,357 @@ describe("release contract", () => {
   });
 
   it("keeps release docs aligned to the pinned stable install contract", () => {
-    expect(releasing).toContain("Windows uses a single supported install path: `install.ps1`");
+    expect(releasing).toContain(
+      "Windows uses a single supported install path: `install.ps1`",
+    );
     expect(releasing).toContain("Supported stable selection:");
-    expect(releasing).toContain("curl -fsSL https://raw.githubusercontent.com/markusleben/ha-nova/<stable-tag>/install.sh | HA_NOVA_VERSION=vX.Y.Z bash");
-    expect(releasing).toContain("irm https://raw.githubusercontent.com/markusleben/ha-nova/<stable-tag>/install.ps1 | iex");
-    expect(releasing).toContain("stable release notes must publish tag-pinned install commands, never `main` bootstrap URLs");
+    expect(releasing).toContain(
+      "curl -fsSL https://raw.githubusercontent.com/markusleben/ha-nova/<stable-tag>/install.sh | HA_NOVA_VERSION=vX.Y.Z bash",
+    );
+    expect(releasing).toContain(
+      "irm https://raw.githubusercontent.com/markusleben/ha-nova/<stable-tag>/install.ps1 | iex",
+    );
+    expect(releasing).toContain(
+      "stable release notes must publish tag-pinned install commands, never `main` bootstrap URLs",
+    );
     expect(releasing).toContain("npm run dev:validation:harness");
-    expect(releasing).not.toContain("raw.githubusercontent.com/markusleben/ha-nova/main/install.sh");
-    expect(releasing).not.toContain("raw.githubusercontent.com/markusleben/ha-nova/main/install.ps1");
+    expect(releasing).not.toContain(
+      "raw.githubusercontent.com/markusleben/ha-nova/main/install.sh",
+    );
+    expect(releasing).not.toContain(
+      "raw.githubusercontent.com/markusleben/ha-nova/main/install.ps1",
+    );
     expect(releasing).not.toContain("winget");
     expect(releasing).not.toContain("$ProgressPreference = 'SilentlyContinue'");
   });
 
   it("documents the mandatory tag-first release rehearsal and its drift guard", () => {
     expect(releasing).toContain("tag-first dress rehearsal");
-    expect(releasing).toContain("bash scripts/release/verify-release-pipeline.sh");
+    expect(releasing).toContain(
+      "bash scripts/release/verify-release-pipeline.sh",
+    );
     expect(releasing).toContain("HA_NOVA_RELEASE_AUDIT_REQUIRE_BYPASS=1");
     expect(releasing).toContain("release-pipeline-audit.yml");
     expect(releasing).toContain("GORELEASER_CURRENT_TAG");
   });
 
+  it("gates a Relay release on the exact successful push run and immutable GHCR digest", () => {
+    expect(relayImageVerifier).toContain("^[0-9a-f]{40}$");
+    expect(relayImageVerifier).toContain(
+      "actions/workflows/relay-image.yml/runs",
+    );
+    expect(relayImageVerifier).toContain("head_sha=${commit_sha}");
+    expect(relayImageVerifier).toContain("-f branch=main");
+    expect(relayImageVerifier).toContain("-f event=push");
+    expect(relayImageVerifier).toContain("-f status=success");
+    expect(relayImageVerifier).toContain(".head_sha == $sha");
+    expect(relayImageVerifier).toContain('.head_branch == "main"');
+    expect(relayImageVerifier).toContain('.conclusion == "success"');
+    expect(relayImageVerifier).toContain(
+      'latest_ref="${image_repository}:latest"',
+    );
+    expect(relayImageVerifier).toContain(
+      'version_ref="${image_repository}:${relay_version}"',
+    );
+    expect(relayImageVerifier).toContain(
+      'sha_ref="${image_repository}:sha-${commit_sha}"',
+    );
+    expect(relayImageVerifier).toContain("docker buildx imagetools inspect");
+    expect(relayImageVerifier).toContain(".manifest.digest");
+    expect(relayImageVerifier).toContain(
+      '[[ "$latest_digest" == "$version_digest" ]]',
+    );
+    expect(relayImageVerifier).toContain(
+      '[[ "$version_digest" == "$sha_digest" ]]',
+    );
+    expect(relayImageVerifier).toContain("{{json .Provenance}}");
+    expect(relayImageVerifier).toContain('repository="markusleben/ha-nova"');
+    expect(relayImageVerifier).not.toContain("HA_NOVA_GITHUB_REPOSITORY");
+    expect(relayImageVerifier).toContain('"linux/amd64", "linux/arm64"');
+    expect(relayImageVerifier).toContain('["vcs:revision"] == $sha');
+    expect(relayImageVerifier).toContain(
+      '["vcs:source"] == "https://github.com/markusleben/ha-nova"',
+    );
+    expect(relayImageVerifier).toContain(
+      '["label:org.opencontainers.image.source"] == "https://github.com/markusleben/ha-nova"',
+    );
+    expect(relayImageVerifier).toContain('["vcs:localdir:context"] == "nova"');
+    expect(relayImageVerifier).toContain('startswith($run + "/attempts/")');
+    expect(relayImageVerifier).toContain("<= $max_attempt");
+    expect(relayImageVerifier).toContain(
+      '["build-arg:RELAY_VERSION"] == $version',
+    );
+    expect(relayImageVerifier).toContain(
+      '["label:org.opencontainers.image.version"] == $version',
+    );
+  });
+
+  it("verifies private Census stats and exact deployment READ-ONLY (#446)", () => {
+    expect(censusDeploymentVerifier).toContain(
+      'base_url="https://ha-nova-census.markusleben.workers.dev"',
+    );
+    expect(censusDeploymentVerifier).toContain(
+      "/stats/api?ha_nova_release_gate=",
+    );
+    expect(censusDeploymentVerifier).toContain("CF-Access-Client-Id");
+    expect(censusDeploymentVerifier).toContain("CF-Access-Client-Secret");
+    expect(censusDeploymentVerifier).toContain("--proto '=https'");
+    expect(censusDeploymentVerifier).toContain(
+      '"$deployment_sha" == "$expected_sha"',
+    );
+    expect(censusDeploymentVerifier).toContain(
+      '"$version_id" == "$expected_version_id"',
+    );
+    expect(censusDeploymentVerifier).toContain("x-ha-nova-deployment-sha:");
+    expect(censusDeploymentVerifier).toContain("x-ha-nova-version-id:");
+    expect(censusDeploymentVerifier).toContain(".schema == 2");
+    expect(censusDeploymentVerifier).toContain(
+      ".client_installations.active_21_days",
+    );
+    expect(censusDeploymentVerifier).toContain(
+      ".client_installations.known_60_days",
+    );
+    expect(censusDeploymentVerifier).toContain(".relay_app_installations.slug");
+    expect(censusDeploymentVerifier).toContain(
+      '.relay_app_installations.status == "available"',
+    );
+    expect(censusDeploymentVerifier).toContain(
+      '.relay_app_installations.status == "unavailable"',
+    );
+    expect(censusDeploymentVerifier).toContain(
+      ".client_installations.release_smoke_installations",
+    );
+    expect(censusDeploymentVerifier).not.toContain(
+      ".client_installations.by_version[$version]",
+    );
+    // #446: production verification is read-only — it must never build a
+    // mutation URL or send a POST. Functional checks live in
+    // verify-census-functional.sh against the isolated test worker.
+    expect(censusDeploymentVerifier).toContain("READ-ONLY by contract");
+    expect(censusDeploymentVerifier).not.toContain("/ping");
+    expect(censusDeploymentVerifier).not.toContain("/withdraw");
+    expect(censusDeploymentVerifier).not.toContain("--request POST");
+    expect(censusFunctionalVerifier).toContain(
+      'base_url="https://ha-nova-census-test.markusleben.workers.dev"',
+    );
+    // The functional proof is bound to the reviewed deployment: a stale but
+    // healthy test worker must never green-light broken mutation routes.
+    expect(censusFunctionalVerifier).toContain(
+      '"$deployment_sha" == "$expected_sha"',
+    );
+    expect(censusFunctionalVerifier).toContain(
+      '"$version_id" == "$expected_version_id"',
+    );
+    expect(censusFunctionalVerifier).not.toContain(
+      "https://ha-nova-census.markusleben.workers.dev",
+    );
+    expect(censusFunctionalVerifier).toContain("${base_url}/ping");
+    expect(censusFunctionalVerifier).toContain("${base_url}/withdraw");
+    expect(censusFunctionalVerifier).toContain("baseline_smoke_count + 1");
+  });
+
+  it("deploys the census only through one exact-target fail-closed wrapper", () => {
+    expect(censusDeployer).toContain("set -euo pipefail");
+    expect(censusDeployer).toContain("status --porcelain");
+    expect(censusDeployer).toContain("rev-parse HEAD");
+    expect(censusDeployer).toContain(
+      "repos/markusleben/ha-nova/compare/${reviewed_sha}...main",
+    );
+    expect(censusDeployer).toContain("gh auth status --hostname github.com");
+    expect(censusDeployer).toContain("gh api --hostname github.com");
+    expect(censusDeployer).toContain(".merge_base_commit.sha == $sha");
+    expect(censusDeployer).toContain("Node.js 22 or newer");
+    expect(censusDeployer).toContain(
+      "require an Access challenge or denial before deployment",
+    );
+    expect(censusDeployer).toContain(
+      "Cloudflare Access service token did not reach",
+    );
+    expect(censusDeployer).toContain("HA_NOVA_CENSUS_BROWSER_ACCESS_VERIFIED");
+    expect(censusDeployer).toContain("wrangler@4.113.0 secret list");
+    expect(censusDeployer).toContain('"ACCESS_TEAM_DOMAIN"');
+    expect(censusDeployer).toContain('"ACCESS_AUD"');
+    expect(censusDeployer).toContain("npx --yes wrangler@4.113.0 dev");
+    expect(censusDeployer).toContain("--local");
+    expect(censusDeployer).toContain("--persist-to");
+    expect(censusDeployer).toContain("--request POST");
+    expect(censusDeployer).toContain('"0.0.0"');
+    expect(censusDeployer).toContain("CLOUDFLARE_ACCOUNT_ID");
+    expect(censusDeployer).toContain('expected_worker="ha-nova-census"');
+    expect(censusDeployer).toContain(
+      'expected_target="https://ha-nova-census.markusleben.workers.dev"',
+    );
+    expect(censusDeployer).toContain("WRANGLER_OUTPUT_FILE_PATH");
+    expect(censusDeployer).toContain("$deploys[0].targets == [$target]");
+    expect(censusDeployer).toContain("census_single_deployment_version_id");
+    expect(censusDeployer).toContain(
+      "census_deployment_output_version_id",
+    );
+    expect(censusDeployer).toContain("census-deployment-state.sh");
+    expect(censusDeployer).toContain(
+      "census_wait_for_settled_current_version",
+    );
+    expect(censusDeploymentState).toContain("select(length == 1)");
+    expect(censusDeploymentState).toContain("attempt <= 15");
+    expect(censusDeploymentState).toContain("sleep 2");
+    expect(censusDeploymentState).toContain(
+      'test("^[0-9A-Za-z][0-9A-Za-z._-]{0,127}$")',
+    );
+    expect(censusDeploymentState).toContain(
+      "wrangler@4.113.0 deployments status",
+    );
+    const censusDeploymentScripts = `${censusDeployer}\n${censusDeploymentState}`;
+    expect(censusDeploymentScripts).not.toContain(
+      "wrangler@4.113.0 deployments list",
+    );
+    expect(censusDeploymentScripts).not.toContain(".[0].versions");
+    expect(
+      censusDeployer.trimEnd().split("\n").length,
+      // 440: the mandatory isolated test-worker gate folded into the wrapper
+      // (Codex P1 on #497) — production promotion without the functional
+      // proof must be impossible, and the gate lives in the same file so it
+      // cannot be skipped.
+    ).toBeLessThanOrEqual(440);
+    expect(
+      censusDeploymentState.trimEnd().split("\n").length,
+    ).toBeLessThanOrEqual(400);
+    expect(censusDeployer).toContain("rollback not needed");
+    expect(censusDeployer).toContain(
+      "active Worker version changed outside this deploy",
+    );
+    expect(releasing).toContain("serialized single-writer operation");
+    expect(censusDeployer).toContain('--tag "$reviewed_sha"');
+    expect(censusDeployer).toContain("--strict");
+    expect(censusDeployer).toContain("--no-autoconfig");
+    expect(censusDeployer).toContain("verify-census-deployment.sh");
+  });
+
+  it("orders external publication gates around the RC and final tag", () => {
+    const rehearsal = releasing.slice(
+      releasing.indexOf("**Rehearsal steps.**"),
+      releasing.indexOf("The weekly `release-pipeline-audit.yml`"),
+    );
+    const orderedMarkers = [
+      "Merge the reviewed PR state",
+      "verify-relay-image.sh <reviewed-merge-sha> <relay-version>",
+      "HA_NOVA_RELEASE_AUDIT_REQUIRE_BYPASS=1",
+      "production census Worker is still the old reviewed deployment",
+      "Verify the published RC over the real",
+      "deploy-census-worker.sh <reviewed-merge-sha>",
+      "cut the final tag",
+    ];
+    let previousIndex = -1;
+    for (const marker of orderedMarkers) {
+      const markerIndex = rehearsal.indexOf(marker);
+      expect(
+        markerIndex,
+        `missing release-order marker: ${marker}`,
+      ).toBeGreaterThan(previousIndex);
+      previousIndex = markerIndex;
+    }
+    expect(rehearsal).toContain(
+      "whose `headSha` equals `<reviewed-merge-sha>`",
+    );
+    expect(rehearsal).toContain("does not replace the dispatched run");
+  });
+
+  it("pins reproducible census Worker deployments without adding an unlocked CLI dependency", () => {
+    const pinnedDeploy = "npx --yes wrangler@4.113.0 deploy";
+    expect(censusDeployer).toContain(pinnedDeploy);
+    expect(releasing).toContain(
+      "bash scripts/release/deploy-census-worker.sh <reviewed-merge-sha>",
+    );
+    expect(censusWorkerReadme).toContain(
+      "bash scripts/release/deploy-census-worker.sh <reviewed-merge-sha>",
+    );
+    expect(releasing).toContain("requires Node.js 22 or newer");
+    expect(censusWorkerReadme).toContain("fully reviewed merge");
+    expect(releasing).not.toMatch(/npx(?:\s+--yes)?\s+wrangler\s+deploy/);
+    expect(censusWorkerReadme).not.toMatch(
+      /npx(?:\s+--yes)?\s+wrangler\s+deploy/,
+    );
+    expect(releasing).toContain("steps 1–2 of the rehearsal completed");
+    expect(pkg.dependencies?.["wrangler"]).toBeUndefined();
+    expect(pkg.devDependencies?.["wrangler"]).toBeUndefined();
+  });
+
+  it("requires a dispatched live e2e run as release evidence", () => {
+    // The weekly cron is monitoring, not release evidence: v0.14.0 shipped
+    // before the workflow had ever fired. The rehearsal must dispatch it on
+    // the exact commit being tagged and wait for green.
+    expect(releasing).toContain("gh workflow run e2e-disposable-ha.yml");
+    expect(releasing).toContain(
+      "one green `e2e-disposable-ha.yml` run (dispatched, not the weekly cron) on the commit being tagged",
+    );
+    const e2e = readFileSync("scripts/e2e/disposable-ha/run.sh", "utf8");
+    expect(e2e).toContain("readwrite roundtrip");
+    expect(e2e).toContain("secrets.yaml stays unreachable even with readwrite");
+  });
+
   it("keeps the Linux real-machine onboarding lane documented for Linux setup changes", () => {
     expect(releasing).toContain("Linux real-machine onboarding:");
     expect(releasing).toContain("scripts/smoke/linux-headless-setup-check.sh");
-    expect(releasing).toContain("by default the helper runs `HA_NOVA_NO_BROWSER=1 ha-nova setup`");
+    expect(releasing).toContain(
+      "by default the helper runs `HA_NOVA_NO_BROWSER=1 ha-nova setup`",
+    );
     expect(releasing).toContain("npm run test:desktop:linux:antigravity");
-    expect(releasing).toContain("HA_NOVA_LIVE_SETUP_CMD='HA_NOVA_NO_BROWSER=1 ha-nova setup antigravity'");
-    expect(releasing).toContain("HA_NOVA_LIVE_SETUP_CMD='HA_NOVA_NO_BROWSER=1 ha-nova setup hermes'");
-    expect(releasing).toContain("HA_NOVA_LIVE_SETUP_CMD='HA_NOVA_NO_BROWSER=1 ha-nova setup --service hermes'");
+    expect(releasing).toContain(
+      "HA_NOVA_LIVE_SETUP_CMD='HA_NOVA_NO_BROWSER=1 ha-nova setup antigravity'",
+    );
+    expect(releasing).toContain(
+      "HA_NOVA_LIVE_SETUP_CMD='HA_NOVA_NO_BROWSER=1 ha-nova setup hermes'",
+    );
+    expect(releasing).toContain(
+      "HA_NOVA_LIVE_SETUP_CMD='HA_NOVA_NO_BROWSER=1 ha-nova setup --service hermes'",
+    );
     expect(releasing).toContain("HA_NOVA_LIVE_SKIP_INSTALL=1");
     expect(releasing).toContain("Secret Service");
     expect(releasing).toContain("GNOME Keyring");
-    expect(releasing).toContain("non-GNOME");
-    expect(releasing).toContain("local Linux keyring password");
-    expect(releasing).toContain("headlessly over SSH");
+    expect(releasing).toContain("KWallet Secrets");
+    expect(releasing).toContain("provider-owned desktop prompt");
+    expect(releasing).toContain(
+      "CLI terminal never asks for, reads, or confirms the keyring master password",
+    );
+    expect(releasing).toContain(
+      "validate the fail-closed SSH/headless path separately",
+    );
+    expect(releasing).toContain("SSH (including X11 forwarding)");
+    expect(releasing).toContain("never launch a prompt");
     expect(releasing).toContain("repairable Hermes mismatch");
-    expect(releasing).toContain("run `ha-nova setup hermes` and confirm the Hermes route repairs cleanly");
-    expect(releasing).toContain("run `ha-nova setup --service hermes`, then `ha-nova doctor`, then one authenticated relay call from a fresh SSH/service-like shell without an unlocked desktop keyring");
+    expect(releasing).toContain(
+      "run `ha-nova setup hermes` and confirm the Hermes route repairs cleanly",
+    );
+    expect(releasing).toContain(
+      "run `ha-nova setup --service hermes`, then `ha-nova doctor`, then one authenticated relay call from a fresh SSH/service-like shell without an unlocked desktop keyring",
+    );
     expect(releasing).toContain("confirm the service token file is removed");
     expect(releasing).toContain("Hermes Agent ready now");
-    expect(releasing).toContain("when Linux setup or secure-storage behavior changes, the release-bound manual matrix must include the Linux real-machine onboarding lane above");
+    expect(releasing).toContain(
+      "when Linux setup or secure-storage behavior changes, the release-bound manual matrix must include the Linux real-machine onboarding lane above",
+    );
   });
 
   it("keeps the Linux live helper generic by default and Hermes-specific only by override", () => {
-    expect(linuxHeadlessHelper).toContain("default: HA_NOVA_NO_BROWSER=1 ha-nova setup");
-    expect(linuxHeadlessHelper).toContain("HA_NOVA_LIVE_SETUP_CMD='HA_NOVA_NO_BROWSER=1 ha-nova setup hermes'");
-    expect(pkg.scripts?.["test:desktop:linux:antigravity"]).toContain("linux-headless-setup-check.sh");
-    expect(pkg.scripts?.["test:desktop:linux:antigravity"]).toContain("ha-nova setup antigravity");
+    expect(linuxHeadlessHelper).toContain(
+      "default: HA_NOVA_NO_BROWSER=1 ha-nova setup",
+    );
+    expect(linuxHeadlessHelper).toContain(
+      "HA_NOVA_LIVE_SETUP_CMD='HA_NOVA_NO_BROWSER=1 ha-nova setup hermes'",
+    );
+    expect(pkg.scripts?.["test:desktop:linux:antigravity"]).toContain(
+      "linux-headless-setup-check.sh",
+    );
+    expect(pkg.scripts?.["test:desktop:linux:antigravity"]).toContain(
+      "ha-nova setup antigravity",
+    );
     expect(linuxHeadlessHelper).toContain("release-lane proof");
     expect(linuxHeadlessHelper).toContain("remote user D-Bus session");
     expect(linuxHeadlessHelper).toContain("remote gdbus");
     expect(linuxHeadlessHelper).toContain(
-      'setup_cmd="${HA_NOVA_LIVE_SETUP_CMD:-HA_NOVA_NO_BROWSER=1 ha-nova setup}"'
+      'setup_cmd="${HA_NOVA_LIVE_SETUP_CMD:-HA_NOVA_NO_BROWSER=1 ha-nova setup}"',
     );
     expect(linuxHeadlessHelper).not.toContain(
-      'setup_cmd="${HA_NOVA_LIVE_SETUP_CMD:-HA_NOVA_NO_BROWSER=1 ha-nova setup hermes}"'
+      'setup_cmd="${HA_NOVA_LIVE_SETUP_CMD:-HA_NOVA_NO_BROWSER=1 ha-nova setup hermes}"',
     );
   });
 });

@@ -10,7 +10,7 @@ Underlying HTTP contract (reference only, not for direct use): `Authorization: B
 
 ## Bounded Event Collection (envelope)
 
-Window mode (`on_limit`) and binary responses require **Relay 0.3.0 or newer**. An older relay silently ignores `on_limit` and falls back to strict mode (a timeout then fails the call instead of returning partial events). Check the running version with `ha-nova relay health` before relying on either feature, and tell the user to update the NOVA Relay App if it is older.
+Window mode (`on_limit`) and binary responses are supported by every relay at or above the skills' enforced floor — `min_relay_version` in `version.json`, currently **Relay 0.9.0**. The CLI checks that floor on every relay call and prints a relay-outdated warning when the installed relay is older; surface that warning and offer the update instead of version-gating manually. Do not infer individual endpoint support from the floor: unsupported legacy behavior still fails through its documented Relay error or timeout path.
 
 
 Some WS commands answer with events instead of a single response. Wrap them:
@@ -28,7 +28,9 @@ The events come back as `.data.events`.
 - omit it (or `"error"`): the call fails — use this when a finish event is expected.
 - `"on_limit": "return"`: window mode — the relay returns what it saw and sets `.data.truncated: true`. Use this to sniff a stream that never finishes (for example `mqtt/subscribe`).
 
-Subscription commands are permitted **only inside this envelope** (the relay unsubscribes and bounds the window). A bare subscription without the envelope is rejected with `UNSUPPORTED_WS_TYPE`.
+`max_events` and `timeout_ms` are hard caps, not tuning suggestions: valid ranges are 1–100 events and 1–10000 ms; anything above is rejected with `VALIDATION_ERROR`.
+
+Subscription commands are permitted **only inside this envelope** (the relay unsubscribes and bounds the window). A bare subscription without the envelope is rejected with `UNSUPPORTED_WS_TYPE`. The same bare-call ban and envelope exemption apply to `render_template` — skills keep using `POST /api/template` for rendering.
 
 ## Binary Responses
 
@@ -45,6 +47,10 @@ Write the raw bytes with `ha-nova relay core --method GET --path <path> --out-bi
 - `GET /health`
 - `POST /ws`
 - `POST /core`
+- `POST /files` — opt-in filesystem ops (`list_dir` / `read_file` / `write_file` / `delete_file`), default off; CLI: `ha-nova relay files` (flows owned by `skills/yaml-config/SKILL.md`)
+- `POST /backups` — config-snapshot blob store (`save` / `load` / `list` / `delete` / `prune`); CLI: `ha-nova relay backups` (flows owned by `skills/ha-nova/config-snapshots.md`)
+
+Relay-enforced limits: request bodies up to 1 MiB (413 above); text/JSON `/core` responses and individual upstream WS frames up to 256 MiB — a `collect_events` response aggregates up to 100 events with no additional aggregate cap; binary responses up to 8 MiB; `/files` reads up to 1 MiB and writes up to 768 KiB.
 
 ## Relay CLI Wrapper
 
@@ -52,6 +58,32 @@ For agent-dispatched flows, use the CLI wrapper instead of raw curl:
 
 1. Write request JSON with the client's native file-writing tool.
    - POSIX heredocs are examples only; on Windows/PowerShell use the native file-writing equivalent while preserving the same JSON and jq file contents.
+   - Write JSON and jq files as UTF-8. One leading UTF-8 BOM is accepted. UTF-16 and invalid/ambiguous UTF-8 are rejected before configuration lookup, authentication, or a Relay request.
+   - Windows PowerShell 5.1 has inconsistent defaults: BOM-less `Get-Content` uses the active legacy code page, bare `Set-Content` uses that code page for a new file, and `Out-File`/`>` write UTF-16LE. A wrong read followed by a UTF-8 write produces valid but already-corrupted UTF-8 that no CLI can detect. For mutation JSON, do not use those default encoding boundaries.
+   - On Windows PowerShell 5.1, prefer `ha-nova relay ... --out <result-file>` over shell redirection. Read and write mutation JSON with explicit strict UTF-8:
+
+     ```powershell
+     $strictUtf8 = New-Object -TypeName System.Text.UTF8Encoding -ArgumentList $false, $true
+     $bytes = [System.IO.File]::ReadAllBytes((Join-Path $PWD "result.json"))
+     $offset = 0
+     if ($bytes.Length -ge 3 -and $bytes[0] -eq 0xEF -and $bytes[1] -eq 0xBB -and $bytes[2] -eq 0xBF) {
+         $offset = 3
+     }
+     if ($bytes.Length -ge ($offset + 3) -and $bytes[$offset] -eq 0xEF -and $bytes[$offset + 1] -eq 0xBB -and $bytes[$offset + 2] -eq 0xBF) {
+         throw "More than one leading UTF-8 BOM is unsupported"
+     }
+     $text = $strictUtf8.GetString($bytes, $offset, $bytes.Length - $offset)
+     $document = $text | ConvertFrom-Json
+     # Apply the intended in-memory change here.
+     $json = $document | ConvertTo-Json -Depth 100
+     $utf8NoBom = New-Object -TypeName System.Text.UTF8Encoding -ArgumentList $false
+     [System.IO.File]::WriteAllText((Join-Path $PWD "payload.json"), $json, $utf8NoBom)
+     ```
+
+     `ReadAllText` is not strict enough here because .NET may honor a UTF-16/32
+     BOM instead of the supplied UTF-8 decoder. `--out` always writes BOM-less
+     UTF-8. PowerShell 7 defaults to BOM-less UTF-8, but the explicit file-based
+     contract remains preferred for cross-platform mutation work.
    - Write the final request body directly. Do not create placeholder payload templates such as `REPLACE_ENTITY_ID` and patch them later with `perl -0pi`, `sed -i`, or similar in-place rewrite commands.
 2. Use file-based relay flags as the default contract:
    - `ha-nova relay ws --data-file <payload-file>`
@@ -72,8 +104,7 @@ ha-nova relay core --method POST --path /api/services/light/turn_on --body-file 
 ```
 
 The wrapper handles auth (OS credential store), headers, timeouts, and base URL internally.
-Inline `--body` is not supported for WebSocket relay calls; WS request bodies MUST use `--data-file`.
-Inline `--body` may be used only for tiny `ha-nova relay core` diagnostics when quoting is already known-good; it is not the canonical cross-platform path.
+Inline JSON (`-d`/`--data` for ws, `-d`/`--body` for core; ws has no `--body` flag) is acceptable only for tiny, unambiguously read-only diagnostics when quoting is already known-good; it is never the canonical cross-platform path. Mutations, complex bodies, reusable payloads, and cross-platform examples use `--data-file` (ws) / `--body-file` (core).
 Relay API examples are not write authorization. Any live write still needs the owning skill's active-preview confirmation flow before execution.
 
 ## Standard Envelope
@@ -84,6 +115,7 @@ Relay API examples are not write authorization. Any live write still needs the o
 Parsing varies by endpoint:
 - `/ws` responses: upstream payload is in `.data` directly; the exact shape depends on the WS message type
 - `/core` responses: upstream payload is in `.data.body` (with `.data.status` for HTTP status)
+- Example: `--jq '.data.version'` on a ws `get_config` result; `--jq '.data.body.state'` on a core `GET /api/states/<entity_id>` result
 
 ## ID Types & Resolution
 
@@ -144,12 +176,12 @@ Request examples:
 
 Expected success body:
 - `ok=true`
-- Compact entity registry (`config/entity_registry/list_for_display`): `data.entities[]` with abbreviated keys (`ei`=entity_id, `en`=name, `ai`=area_id)
+- Compact entity registry (`config/entity_registry/list_for_display`): `data.entities[]` with abbreviated keys — measured against a 4209-entity instance: `ei`=entity_id, `en`=name, `ai`=area_id, `di`=device_id, `pl`=platform, `ec`=entity_category, `lb`=labels, `ic`=icon, `hb`=hidden_by, `hn`=has_entity_name, `dp`=display_precision, `tk`=translation_key. No `config_entry_id` — ownership questions need the full registry list
 - Full entity registry (`config/entity_registry/list`): `data[]`
 - Area registry (`config/area_registry/list`): `data[]` with canonical `area_id`; do not expect a generic `id`
 - Recorder statistics (`recorder/statistics_during_period`): `data.<statistic_id>[]`
 - `search/related` for `item_type:"area"`: `data` is a keyed object such as `automation[]`, `script[]`, `entity[]`, `device[]`
-- `search/related` for `item_type:"entity"`: `data` is a related-item collection; filter by the requested target family before counting or follow-up reads
+- `search/related` for `item_type:"entity"`: `data` is the same kind of keyed object (`automation[]`, `script[]`, `scene[]`, `device[]`, ...); a target with no linked items yields an EMPTY object `{}` — the keys themselves are absent, which is not an error
 - `get_states`: `data` is an array of full state objects (thousands of entries — avoid for discovery)
 
 Parsing rule:
@@ -160,6 +192,11 @@ Parsing rule:
   - script shortlist -> `(.data.script // [])[]`
   - entity shortlist -> `(.data.entity // [])[]`
   - `.data.entity` is only a fallback seed when automation/script arrays are absent
+- `search/related` consumer scan (`item_type:"entity"`): use `skills/ha-nova/search-related-consumers.jq`; if unavailable (flat-copy installs), recreate exactly:
+  ```jq
+  if .ok and (.data | type == "object") then ((.data.automation // []) + (.data.script // []) + (.data.scene // [])) else error("search/related failed: \(.error.message // "unexpected response shape")") end
+  ```
+  It errors loudly on `ok=false` or a non-object `data`, so an empty result is distinguishable from a wrong read path. A hand-written filter that misses the documented path returns empty and is indistinguishable from "no consumers" — never improvise beyond this exact recreate. Scans that also need further families (`group[]`, dashboards via their own scan, ...) project those keys the same way under the same `ok`/object guard.
 - `get_states`: treat as `(.data // [])[]`, filter only object entries with string `entity_id`.
 
 ## /core Contract
@@ -191,6 +228,15 @@ Parsing rule:
 - Upstream status: `.data.status`
 - Upstream payload: `.data.body`
 - Preferred config-body jq file: `skills/ha-nova/config-body-filter.jq`
+
+### Write-Probing Asymmetry (WS vs /core)
+
+The two transports react in OPPOSITE ways to an empty or partial write body:
+
+- `relay ws`: commands WITH required fields validate fail-closed — an empty body returns a validation error naming them, and nothing changes. But a parameterless command IS already complete: sending its bare `type` EXECUTES it (`backup/generate_with_automatic_settings` immediately starts a backup). The transport is not protection.
+- `relay core` HTTP POST: many endpoints have NO schema check. A missing identifier is read as "create a new object" — `POST` with `{}` can silently create an empty object instead of returning an error (observed: an empty Alarmo area plus its entity from `POST /api/alarmo/area {}`).
+
+Therefore: NEVER send an empty or partial body to a `/core` POST path to discover its schema, and never send a bare WS `type` you have not verified to be read-only. Schema discovery for unfamiliar write endpoints belongs in `ha-nova:fallback` (web search first); empty-body probing is limited to WS commands already documented as read-only — the write schema still comes from web search or documentation.
 
 ## Frequent HA API Paths
 
@@ -263,6 +309,8 @@ Supported helper domains:
 - `group`
 - `history_stats`
 - `template`
+- `generic_thermostat`
+- `switch_as_x`
 
 `group` is menu-driven; the live-proven end-to-end subtype is `sensor`, and other subtypes must stay anchored to the live step schema instead of guessed fields.
 
@@ -336,6 +384,34 @@ Observed locally on a real HA instance on 2026-03-19:
 
 See `skills/ha-nova/helper-flow-schemas.md` for the observed field sets and domain-specific notes.
 
+## Integration Config Flows
+
+`ha-nova:integration-setup` uses the generic config-flow surface:
+
+```json
+{"method":"GET","path":"/api/config/config_entries/flow_handlers"}
+{"type":"manifest/list"}
+{"type":"config_entries/flow/progress"}
+{"type":"config_entries/get"}
+{"method":"POST","path":"/api/config/config_entries/flow","body":{"handler":"hue"}}
+{"method":"GET","path":"/api/config/config_entries/flow/{flow_id}"}
+{"method":"POST","path":"/api/config/config_entries/flow/{flow_id}","body":{"step_field":"value"}}
+{"method":"DELETE","path":"/api/config/config_entries/flow/{flow_id}"}
+```
+
+Rules:
+
+- available handler domains come from `flow_handlers`; join them to `manifest/list` by `domain` for display-name resolution and never guess between matches
+- pending reauthentication comes from `config_entries/flow/progress` with `context.source == "reauth"` and a matching `context.entry_id`; never create a replacement reauth flow
+- each response's `type`, `data_schema`, `menu_options`, `flow_id`, and `step_id` define the next action
+- form submit bodies contain only fields exposed by the current live step
+- `config_entries/flow/progress` omits flows whose `context.source` is `user`; a relay-started add flow cannot rely on appearing as an in-progress UI card
+- a credential-bearing, external/OAuth, or progress step from a relay-started add flow is canceled and restarted in the HA UI; the Relay also does not provide the frontend-origin header used to construct OAuth redirects
+- pre-existing reauth flows are preserved and continue through their matching Home Assistant UI card when one of those UI-only steps is reached
+- add verification uses terminal `result.entry_id`, or a constrained before/after `config_entries/get` diff when it is absent
+- successful reauth uses terminal abort reason `reauth_successful`, the same surviving `entry_id`, and absence of the completed pending flow
+- credential recovery with no pending reauth flow (`ha-nova:integration-setup` → Credential Recovery) uses `POST /api/config/config_entries/entry/<entry_id>/reload` as its only trigger, then re-reads `config_entries/flow/progress` with a settle re-read
+
 ## Domain Payload Rules
 
 Automation fields: `alias`, `triggers`, `conditions`, `actions`, `mode`
@@ -362,6 +438,55 @@ Call with response data:
 
 Supported target fields: `entity_id` (string or array), `area_id`, `device_id`.
 
+## Runtime Events And Webhooks
+
+Fire a custom event with an event-data JSON object:
+
+```json
+{"method":"POST","path":"/api/events/example_event","body":{"source":"ha_nova"}}
+```
+
+Inspect registered webhook metadata through WS without exposing the returned IDs:
+
+```json
+{"type":"webhook/list"}
+```
+
+Run that payload only with `ha-nova relay ws --data-file <payload-file> --out <result-file>`, with both files in client-private scratch storage. Never print the full response to stdout; inspect the saved result internally and expose only redacted metadata.
+
+Trigger a known JSON webhook only after the owning skill resolves the exact ID internally:
+
+```json
+{"method":"POST","path":"/api/webhook/<webhook_id>","body":{"example":"value"}}
+```
+
+Rules:
+
+- `/api/events/{event_type}` requires an exact custom event name and an object body; a successful response proves bus acceptance, not listener completion
+- automation webhook triggers default to POST/PUT and `local_only: true`; inspect the registered `allowed_methods` and locality before calling
+- multiple automation triggers can share one webhook ID and all will run
+- webhook IDs are authentication secrets; keep them in client-private scratch storage and out of previews, stdout, user-facing results, and logs
+- Home Assistant intentionally answers unknown IDs, blocked non-local requests, and handler failures with HTTP 200; verify matched automation runs instead
+- events and webhooks may already have fired when transport evidence is ambiguous; never retry automatically
+
+## Calendar Event Writes
+
+`ha-nova:calendar` creates events through the service API and updates/deletes them through WS:
+
+```json
+{"method":"POST","path":"/api/services/calendar/create_event","body":{"entity_id":"calendar.example","summary":"Event","start_date_time":"2026-07-15T14:00:00+02:00","end_date_time":"2026-07-15T15:00:00+02:00"}}
+{"type":"calendar/event/update","entity_id":"calendar.example","uid":"<uid>","event":{"summary":"Event","dtstart":"2026-07-15T14:00:00+02:00","dtend":"2026-07-15T15:00:00+02:00"}}
+{"type":"calendar/event/delete","entity_id":"calendar.example","uid":"<uid>"}
+```
+
+Rules:
+
+- read the calendar entity state first; feature bits are create `1`, delete `2`, update `4`
+- REST event reads return `uid` and optional `recurrence_id`; update/delete require exact identity
+- update's `event` is a full replacement object with `summary`, `dtstart`, `dtend`, and any retained optional `description`, `location`, or `rrule`
+- recurring instances add `recurrence_id` and `recurrence_range`: `""` for one occurrence, `THISANDFUTURE` for that occurrence and later ones
+- the create service has no recurrence field; recurring creates go through WS `calendar/event/create` with an RFC 5545 `rrule` in the `event` object
+
 ## Registry Queries (via /ws)
 
 List areas:
@@ -378,6 +503,20 @@ List entity registry (includes area/device assignment):
 ```json
 {"type":"config/entity_registry/list"}
 ```
+
+## Device Trigger Queries (via /ws)
+
+List the triggers a device advertises (type/subtype rows; the advertised action set for input devices):
+```json
+{"type":"device_automation/trigger/list","device_id":"{device_id}"}
+```
+
+Extra fields a trigger supports:
+```json
+{"type":"device_automation/trigger/capabilities","trigger":{"platform":"device","domain":"mqtt","device_id":"{device_id}","type":"action","subtype":"single"}}
+```
+
+For event-entity devices, the advertised set is the `event.*` entity's `event_types` attribute — read `/api/states/{entity_id}`. An empty trigger list is a valid answer (the integration advertises nothing), not an error. Advertised metadata is not proof an action fires — see `skills/ha-nova/input-capability-preflight.md`.
 
 ## Trace Queries (via /ws)
 
@@ -401,19 +540,24 @@ Trace response includes: `trace.trigger`, `trace.condition`, `trace.action` node
 
 Relay errors and upstream HA errors arrive differently. Agents must distinguish them.
 
+If the CLI says a request was already sent or its outcome is unknown, verify the target state and do not retry automatically.
+
 ### Relay Errors (HTTP-level)
 
 These are top-level HTTP errors produced by the relay itself. The response has `ok: false` and an HTTP status >= 400.
 
+- `400 / INVALID_UTF8`: request body bytes are not valid UTF-8
 - `400 / INVALID_JSON`: request body is not valid JSON
 - `400 / VALIDATION_ERROR`: missing required fields (e.g. ws `type`, core `method`/`path`)
 - `400 / CORE_PATH_INVALID`: core API path failed validation
 - `401 / UNAUTHORIZED`: relay auth token missing or invalid
 - `404 / NOT_FOUND`: unknown relay route
 - `500 / INTERNAL_ERROR`: unexpected relay server error
+- `502 / UPSTREAM_WS_CONNECT_ERROR`: the Relay could not establish the HA WebSocket connection; inspect the post-call health reason
+- `502 / UPSTREAM_WS_AUTH_REJECTED`: HA rejected the upstream WebSocket credential; App installs should refresh Supervisor access, standalone installs should repair `HA_LLAT`
 - `502 / UPSTREAM_WS_ERROR`: relay could not reach HA websocket
 - `502 / UPSTREAM_WS_TIMEOUT`: WS request to HA timed out
-- `502 / UPSTREAM_WS_COMMAND_ERROR` (Relay App >= 0.2.4): HA answered the WS command with a structured error; the message contains HA's own error code and text (e.g. `HA rejected 'x': unknown_command: ...`). The connection stays healthy — treat this as a command problem, not a connectivity problem. Older relays report these as generic `UPSTREAM_WS_ERROR`.
+- `502 / UPSTREAM_WS_COMMAND_ERROR`: HA answered the WS command with a structured error; the message contains HA's own error code and text (e.g. `HA rejected 'x': unknown_command: ...`). The connection stays healthy — treat this as a command problem, not a connectivity problem. Legacy relays below the enforced floor report these as generic `UPSTREAM_WS_ERROR`.
 - `502 / UPSTREAM_HTTP_ERROR`: core HTTP request to HA failed
 - `502 / UPSTREAM_HTTP_TIMEOUT`: core HTTP request to HA timed out
 
@@ -427,8 +571,11 @@ When the relay successfully proxies to HA but HA itself returns an error, the re
 - `422`: HA rejected payload semantics (unprocessable entity)
 - `404`: HA resource not found at the requested API path
 - `405`: HA does not support the HTTP method for that path
+- `500`: generic upstream failure; a service call backed by invalid credentials can answer this while HA opens a reauth flow — `ha-nova:service-call` → Generic 500 with a reauth side effect reconciles the two
 
 Check: envelope `.ok == true`, then inspect `.data.status` for non-2xx values.
+
+Exit codes: upstream 5xx always exits nonzero; `ha-nova relay core --strict-status` exits nonzero for any upstream error status (`.data.status` >= 400). The response envelope is still printed either way.
 
 ## Timeout and Retry Guidance
 
@@ -440,7 +587,7 @@ The relay server has its own internal upstream timeout of 10 seconds per WS/HTTP
 
 On `502 / UPSTREAM_*_TIMEOUT` or CLI-level timeout:
 - verify state/config first before retrying
-- retry exactly once only when verification shows no state change
+- for a SERVICE call: retry exactly once only when verification shows no state change AND the call is a direct, consumer-free state-changing action whose read-back proves non-application — never for indirect or asynchronous runs (their effects are delayed), never for consumer-bearing calls (a listener can have fired on the first accepted call), and never for disruptive or restart-class actions (`skills/ha-nova/outcome-verification.md`). Config writes verified by read-back and reload retries keep their own adjacent rules — this clause narrows service-call retries only
 - if config read-back succeeded but reload timed out, treat it as partial verification and confirm registry/state before retrying
 
 ## Safe Bulk Patterns
@@ -451,7 +598,7 @@ For bulk inspection or review preparation:
 3. iterate over the saved shortlist with native file/loop tools
 4. follow selector semantics, stable ordering, and workset limits from `skills/ha-nova/bulk-patterns.md`
 
-Do not rely on external `jq` pipes as the canonical path.
+Do not rely on external `jq` pipes as the canonical path. Never call external `jq`; use `--jq`, `--jq-file`, or `ha-nova relay jq`.
 
 ## `relay jq` Usage
 

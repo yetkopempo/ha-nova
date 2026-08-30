@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -93,11 +94,19 @@ func saveState(paths runtimePaths, state installState) error {
 }
 
 type bundleMetadata struct {
-	BundleFormatVersion int    `json:"bundle_format_version"`
-	Version             string `json:"version"`
-	OS                  string `json:"os"`
-	Arch                string `json:"arch"`
-	BinaryName          string `json:"binary_name"`
+	BundleFormatVersion int                         `json:"bundle_format_version"`
+	Version             string                      `json:"version"`
+	OS                  string                      `json:"os"`
+	Arch                string                      `json:"arch"`
+	BinaryName          string                      `json:"binary_name"`
+	CloudRelease        *cloudReleaseBundleEvidence `json:"cloud_release,omitempty"`
+}
+
+type cloudReleaseBundleEvidence struct {
+	Schema        int    `json:"schema"`
+	SourceTreeSHA string `json:"source_tree_sha"`
+	BinarySHA256  string `json:"binary_sha256"`
+	Signature     string `json:"signature"`
 }
 
 func loadBundleMetadata(paths runtimePaths) (bundleMetadata, error) {
@@ -113,31 +122,170 @@ func loadBundleMetadata(paths runtimePaths) (bundleMetadata, error) {
 }
 
 func writeJSONFile(path string, value interface{}, mode os.FileMode) error {
+	return writeJSONFileOpts(path, value, mode, true)
+}
+
+// writeJSONFileNoHTMLEscape keeps <, >, & readable instead of \u003c-style
+// escapes — for files parsed textually outside Go (the session-start hook
+// greps the update cache's highlight text).
+func writeJSONFileNoHTMLEscape(path string, value interface{}, mode os.FileMode) error {
+	return writeJSONFileOpts(path, value, mode, false)
+}
+
+func writeJSONFileOpts(path string, value interface{}, mode os.FileMode, escapeHTML bool) error {
+	return writeJSONFileOptsIfUnchanged(
+		path,
+		value,
+		mode,
+		escapeHTML,
+		nil,
+	)
+}
+
+func writeJSONFileIfUnchanged(
+	path string,
+	value interface{},
+	mode os.FileMode,
+	expected []byte,
+) error {
+	_, err := writeJSONFileOptsIfUnchangedSnapshot(
+		path,
+		value,
+		mode,
+		true,
+		expected,
+	)
+	return err
+}
+
+func writeJSONFileIfUnchangedSnapshot(
+	path string,
+	value interface{},
+	mode os.FileMode,
+	expected []byte,
+) ([]byte, error) {
+	return writeJSONFileOptsSnapshot(
+		path,
+		value,
+		mode,
+		true,
+		expected,
+		false,
+	)
+}
+
+func writeJSONFileOptsIfUnchanged(
+	path string,
+	value interface{},
+	mode os.FileMode,
+	escapeHTML bool,
+	expected []byte,
+) error {
+	_, err := writeJSONFileOptsIfUnchangedSnapshot(
+		path,
+		value,
+		mode,
+		escapeHTML,
+		expected,
+	)
+	return err
+}
+
+func writeJSONFileOptsIfUnchangedSnapshot(
+	path string,
+	value interface{},
+	mode os.FileMode,
+	escapeHTML bool,
+	expected []byte,
+) ([]byte, error) {
+	return writeJSONFileOptsSnapshot(
+		path,
+		value,
+		mode,
+		escapeHTML,
+		expected,
+		false,
+	)
+}
+
+func writeJSONFileIfAbsentSnapshot(
+	path string,
+	value interface{},
+	mode os.FileMode,
+) ([]byte, error) {
+	return writeJSONFileOptsSnapshot(
+		path,
+		value,
+		mode,
+		true,
+		nil,
+		true,
+	)
+}
+
+func writeJSONFileOptsSnapshot(
+	path string,
+	value interface{},
+	mode os.FileMode,
+	escapeHTML bool,
+	expected []byte,
+	requireAbsent bool,
+) ([]byte, error) {
 	dir := filepath.Dir(path)
 	if err := os.MkdirAll(dir, 0o755); err != nil {
-		return err
+		return nil, err
+	}
+
+	var encoded bytes.Buffer
+	enc := json.NewEncoder(&encoded)
+	enc.SetIndent("", "  ")
+	enc.SetEscapeHTML(escapeHTML)
+	if err := enc.Encode(value); err != nil {
+		return nil, err
+	}
+	if requireAbsent {
+		if err := createFileIfAbsentDurably(
+			path,
+			encoded.Bytes(),
+			mode,
+		); err != nil {
+			return nil, err
+		}
+		return encoded.Bytes(), nil
 	}
 
 	tmp, err := os.CreateTemp(dir, filepath.Base(path)+".tmp.*")
 	if err != nil {
-		return err
+		return nil, err
 	}
 	tmpPath := tmp.Name()
 	defer os.Remove(tmpPath)
 
-	enc := json.NewEncoder(tmp)
-	enc.SetIndent("", "  ")
-	if err := enc.Encode(value); err != nil {
+	if _, err := tmp.Write(encoded.Bytes()); err != nil {
 		tmp.Close()
-		return err
+		return nil, err
+	}
+	if err := tmp.Chmod(mode); err != nil {
+		tmp.Close()
+		return nil, err
+	}
+	if err := tmp.Sync(); err != nil {
+		tmp.Close()
+		return nil, err
 	}
 	if err := tmp.Close(); err != nil {
-		return err
+		return nil, err
 	}
-	if err := os.Chmod(tmpPath, mode); err != nil {
-		return err
+	if expected == nil {
+		if err := replaceFileDurably(tmpPath, path); err != nil {
+			return nil, err
+		}
+		return encoded.Bytes(), nil
 	}
-	return os.Rename(tmpPath, path)
+	if err := replaceFileConditionally(path, tmpPath, expected); err != nil {
+		return nil, err
+	}
+	return encoded.Bytes(), nil
 }
 
 func normalizeClients(values []string) []string {

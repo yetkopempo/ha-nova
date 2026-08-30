@@ -38,11 +38,14 @@ Best-practice freshness (`bp_status`) is an **internal gate input only**:
 ## Pre-Write Diff (`## Changes`)
 
 The diff is rendered by the CLI, not by you — so it is byte-identical on every
-run, every model, every client. Treat the `ha-nova diff` output like `git diff`:
-a stable artifact you print **verbatim**. Do not hand-format, reorder, relabel,
-translate, or summarize the change lines. The `-` change lines come ONLY from the
-command's stdout this turn — if you did not just run `ha-nova diff`, do not print
-a Changes block at all. There is no hand-computed fallback. `## Changes` is the
+run, every model, every client. It emits GFM table data rows
+(`| Field | before | after |`; an empty side shows `—`). Treat the `ha-nova diff`
+output like `git diff`: a stable artifact you print **verbatim** (sole exception: webhook-id
+masking, output-rules.md → Technical Noise). Do not
+hand-format, reorder, relabel, translate, merge, or summarize the rows —
+do not re-align pipes or pad cells. The table rows come ONLY from the command's
+output this turn — if you did not just run `ha-nova diff`, do not print a
+Changes block at all. There is no hand-computed fallback. `## Changes` is the
 historical slot name, not a required literal Markdown heading; in terminal-like
 clients prefer a plain localized label for the changes slot.
 
@@ -50,14 +53,36 @@ clients prefer a plain localized label for the changes slot.
 1. Write the current config (resolve `CURRENT_CONFIG`) and the proposed draft to
    two files.
 2. Prefer `ha-nova diff --before <current-file> --after <draft-file> --out <diff-file>`, then read `<diff-file>` with the native file-reading tool. If `--out` is unavailable, use stdout only when the client will not truncate the command output.
-3. Print a localized label for the changes slot, then the diff file/stdout lines verbatim. If the
-   diff is empty, there is nothing to change — say so plainly instead of showing
-   an empty block.
+3. Print a localized label for the changes slot, then exactly two hand-written
+   lines — the localized table header row (field / before / after) and the
+   literal separator `|---|---|---|` (never localized, never re-aligned) — then
+   the diff file/stdout rows verbatim beneath. If the diff is empty, there is
+   nothing to change — say so plainly instead of showing an empty table.
 
 **create**: no diff (there is no "before") — give a one-line plain-language
 summary of what the new item does.
 
 **delete**: no `## Changes` (the consumer-check result already covers it).
+
+### Drift check before apply
+
+Applies to every write that replaces a whole document or whole list: an
+automation or script update, a scene, a dashboard config, energy preferences,
+and a YAML file. Home Assistant has no optimistic locking anywhere — the last
+writer wins, silently.
+
+Confirmation binds to the previewed BASIS, not only the payload. If the
+conversation paused between preview and confirmation, or the target may have
+been edited outside this session (HA UI open, another client), re-read the
+target immediately before the write and structurally compare it against the
+basis the preview was computed from. On any foreign change: STOP — the
+confirmation has expired; recompute against the live state and show the
+updated preview. Never silently overwrite an external edit — a full-document
+write would revert it without a trace.
+
+Verifying afterwards is not a substitute. A post-write deep-equal check tells
+the user their colleague's edit is already gone; the re-read before the write
+is what keeps it.
 
 ### Behavior narrative (required with every update preview)
 
@@ -71,11 +96,22 @@ the narrative before showing the preview — never show both and let the user
 guess.
 
 Confirmation quality depends on it: a user who cannot tell what the payload
-changes cannot meaningfully confirm it. If the diff still contains a
-count-only or `… and N more` line for something the user's request touched,
-the summary MUST name what was added, removed, or nested there. If you cannot
-explain the behavioral effect of your own draft, stop and re-derive it —
-never ask for confirmation of a change you cannot describe.
+changes cannot meaningfully confirm it. The narrative covers every collection
+the diff touches — including ones the merge changed that the user never
+mentioned. If the diff still contains a count-only or `… and N more` line — or
+a truncated (`…`) value — for a touched collection, the summary MUST name what
+was added, removed, replaced, modified, or nested there, and spell out what a
+cut-off value says in full. Each added, removed, replaced, or modified entry
+gets a plain-language line on what it does; entries with one shared effect may
+share a line ("all three notify actions now go to Anna's phone"). Describe a
+nested change at the depth needed to understand its effect ("the new choose
+branch skips heating when a window is open") — container counts alone never
+qualify, and echoing diff type names ("condition state", "platform: time") is
+not a description. A preview that explains a touched collection only as a
+count or type change is not a valid confirmation basis (context skill →
+Active Preview Confirmation) — fix the draft or the narrative before asking.
+If you cannot explain the behavioral effect of your own draft, stop and
+re-derive it — never ask for confirmation of a change you cannot describe.
 
 ### User-authored notification copy
 
@@ -91,11 +127,11 @@ user explicitly asks to change notification wording or notification behavior:
 Do not silently restyle, relocalize, shorten, expand, or restructure existing
 notification text during a rename, refactor, timing change, trigger/condition
 change, helper change, or service-call change. If the copy looks improvable,
-offer it as a separate suggestion before preview; do not merge it into the draft
-unless the user accepts it.
+offer it as a separate Suggestion Block item (output-rules.md) before preview;
+do not merge it into the draft unless the user accepts it.
 
 If notification copy does change, the Changes slot must show the old and new text or
-payload. A count-only array line such as `Actions: 7 → 8 items` is not enough
+payload. A count-only array line such as `| Actions | 7 items | 8 items |` is not enough
 when an existing notification title, message, or notification payload changed.
 
 ### Fixed update-preview shape
@@ -103,12 +139,17 @@ when an existing notification title, message, or notification payload changed.
 Render a terminal-friendly preview in this exact order, nothing extra — users
 should learn one shape and always recognize it:
 
-1. Preview-summary slot: target name and one to three plain-language sentences
-   (the behavior narrative lives here).
-2. Changes slot: the `ha-nova diff` file/stdout lines, verbatim.
+1. Preview-summary slot: 📝 title line (localized preview label + item type +
+   name), then the plain-language behavior narrative (one to three sentences;
+   it may run longer when per-entry coverage requires it).
+2. Changes slot: your localized header row + `|---|---|---|`, then the
+   `ha-nova diff` file/stdout rows, verbatim.
 3. Pre-write-check/impact slot: one or two short lines.
-4. Save-status slot: explicitly say that nothing has been saved yet.
+4. Save-status slot: explicitly say that nothing has been saved yet (the ⚠️ line).
 5. Options slot: explicit choices with literal `apply`, `show yaml`, and `cancel`.
+
+This is the Preview Card of `skills/ha-nova/output-rules.md` → Cards; the
+Result Card and Delete Card there frame the post-write and delete sides.
 
 Do **not** re-describe the whole automation (entities, every trigger/action) —
 the diff already states what changes. Keep it scannable.
@@ -125,18 +166,21 @@ A non-technical user reads the Changes slot, not raw YAML. So:
 Present the confirm/apply choice via the menu-or-numbered convention (see
 `skills/ha-nova/SKILL.md` → Interactive Choices).
 
-Shape (the `-` lines are exactly what `ha-nova diff` produced this turn — never
+Shape (the table rows are exactly what `ha-nova diff` produced this turn — never
 invent, shorten, pre-fill, or copy these from an example). The labels below are
 semantic placeholders; localize them before showing the user:
 
 ```
-<localized changes label>:
+📝 <localized preview label>: <type> "<name>"
+<behavior narrative, one to three sentences>
+
+| <localized field label> | <localized before label> | <localized after label> |
+|---|---|---|
 <paste the ha-nova diff file/stdout here, unchanged>
 
-<localized options label>:
-1. apply — save exactly this preview.
-2. show yaml — show the full proposed config.
-3. cancel — do not save anything.
+<pre-write check / impact line>
+⚠️  <localized: nothing saved yet>
+<localized options label>: apply · show yaml · cancel
 ```
 
 ## Verification Honesty (post-write wording)
@@ -154,9 +198,37 @@ Wording rules for the result and the collapsed no-findings line:
   entity live. Runtime behavior was not exercised."
 - Where a real run is meaningful, offer it as an explicit optional step: a
   manual trigger via `ha-nova:service-call` (its own preview + confirmation —
-  it may actuate real devices; never run it unrequested). If the user
+  it may actuate real devices; never run it unrequested). For automations and
+  scripts, structure that offer as the Test Plan Card in
+  `skills/ha-nova/test-run.md` (write flow → Phase 5); helper writes keep
+  this plain single offer. If the user
   declines, the uncertainty stays in the final wording — do not let the
   closing sentence sound more conclusive than the checks were.
+
+## Time-Window Evidence (window-derived claims)
+
+A configured window is a MAXIMUM, not proof of coverage (#596). Any claim
+derived from a bounded time window — statistics helpers (`max_age`),
+`history_stats`, history/statistics queries, calibration evidence —
+distinguishes:
+
+- the configured maximum window vs the actual oldest-to-newest sample span,
+- sample count and density when available,
+- source validity and `unknown`/`unavailable` states in the source series,
+- explicit coverage attributes when the platform exposes them (the statistics
+  platform exposes `age_coverage_ratio` and `source_value_valid`),
+- a retained last sample (`keep_last_sample`) vs evidence spanning the window
+  — one persisted value proves persistence of that value, never stability
+  across the full window.
+
+Read coverage and source-validity attributes when present BEFORE describing a
+result as covering "the last N hours"; when coverage is partial, qualify the
+claim — "based on samples covering X% of the window" (semantic slot, localized
+at runtime per output-rules.md). When the source history is sparse,
+discontinuous, or Recorder data is unavailable, the observed evidence span —
+not the configured window — bounds the claim. After a helper write, partial
+coverage is an advisory in the result, never a verification failure: the
+helper is created and valid.
 
 ## Multi-Target Changes (one logical change, several items)
 
@@ -164,7 +236,8 @@ When one logical change spans multiple automations/scripts/helpers, per-target
 previews alone hide the whole picture. Before the FIRST per-target preview:
 
 1. Present the change plan: every target, what changes in each, the intended
-   combined behavior, and the apply order (dependencies first).
+   combined behavior, and the apply order (dependencies first). The plan must
+   satisfy the active user decisions (context skill → Decision Memory).
 2. State revert coverage honestly BEFORE starting: update-revert keeps the
    last 5 updated targets (one snapshot per target) — a logical change with
    more update targets than that loses auto-revert for the oldest ones; say
@@ -172,6 +245,10 @@ previews alone hide the whole picture. Before the FIRST per-target preview:
    `ha-nova:backup` first (proportionality rules apply).
 3. Get plan-level consent, then run the normal per-target flow (each target
    still gets its own preview + confirmation — the plan does not replace them).
+   Exception: where the owning skill declares grouped support and the workset
+   is non-destructive with at most 10 operations, the per-target previews
+   render without intermediate menus and ONE final action block confirms the
+   whole set (`skills/ha-nova/grouped-change-set.md`).
 4. Close with a combined summary: all targets applied, the still-revertible
    targets named (`ha-nova snapshot show --list`), and the
    verification-honesty wording for the whole change.
@@ -179,15 +256,22 @@ previews alone hide the whole picture. Before the FIRST per-target preview:
 If a mid-sequence target fails or is cancelled, stop and show which targets
 are already applied — never continue silently into a half-applied state.
 
+This section covers multi-target updates. Deleting a reviewed multi-item
+workset routes through `skills/ha-nova/batch-safety.md`: one immutable
+manifest, one typed confirmation code, per-target impact checks and
+verification retained, one resource family per manifest.
+
 ## Update-Revert (durable, identity-preserving)
 
 Scope: **update only**. A create is undone by deleting the new item through the
 normal HA NOVA delete flow; that delete still requires a delete preview, exact
 `confirm:<token>`, and absence verification, even when the item was created earlier in the same session.
 Do not call this `revert`, and do not imply that manual deletion or a full Home Assistant Backup restore is the only cleanup path.
-A delete has no HA NOVA `revert`; rollback requires restoring a suitable existing
-Home Assistant Backup, or recreating the item. Point the user to HA Backups
-(Settings > System > Backups) for that case.
+A delete has no HA NOVA `revert`; a snapshot-covered delete restores from its
+auto config snapshot (`skills/ha-nova/config-snapshots.md`) — that is the
+first rollback path. When no config snapshot was captured, rollback requires
+restoring a suitable existing Home Assistant Backup (Settings > System >
+Backups), or recreating the item.
 
 ### 1. Capture the snapshot (after a verified update)
 
@@ -223,8 +307,17 @@ Record shape:
 
 ```json
 {"op":"update","domain":"automation","target_id":"<config id>",
+ "name":"<the item's alias/friendly name>",
  "before_config":{ ... },"expected_after":{ ... }}
 ```
+
+Include `name` so the checkpoint stays recognizable in listings. The CLI
+prints a structured receipt with the keys `action` (`created` | `replaced`),
+`op`, `domain`, `target_id`, `name`, `saved_at`, `coverage`, and `evicted[]`
+(each evicted entry carries the same listing keys) — repeat its essence in
+the result line: a `replaced` receipt means the target's PREVIOUS checkpoint
+is gone and only the newest update stays revertible; name evicted targets as
+no longer revertible.
 
 ### 2. Offer the revert
 
@@ -249,19 +342,37 @@ skill does not have; when only Backups remain, say so before the write. For
 far-reaching changes (irreversible deletes, full-document overwrites, bulk
 operations) offer to create one first via `ha-nova:backup` — its safety-backup
 flow checks for a recent full backup before creating, because full backups are
-expensive. Never suggest a backup for routine small edits.
+expensive. EXCEPTION: when the operation auto-captures a config snapshot
+(`skills/ha-nova/config-snapshots.md`) and the store is available, the snapshot
+IS the recovery net — skip the full-backup offer for that config-level op.
+Never suggest a backup for routine small edits.
+
+Config-level recovery: relays with the snapshot store (`POST /backups`) let the
+covered families auto-capture a config snapshot before deletes/full-document
+overwrites and restore selectively through their own write path —
+`skills/ha-nova/config-snapshots.md` is the SSOT (capture rules, restore
+fidelity, honest limits). The full-backup offer stays for system-level
+operations and for relays whose `/backups` answers 404.
 
 | Skill / family | Pre-write diff | Update-revert | Fallback recovery path |
 |---|---|---|---|
-| `write` (automation/script) | yes (`ha-nova diff`) | yes (verified updates, last 5 targets) | HA Backups |
-| `helper` storage family | yes | yes (verified updates, last 5 targets) | HA Backups |
+| `write` (automation/script) | yes (`ha-nova diff`) | yes (verified updates, last 5 targets) | config snapshot (auto before delete, identity-preserving restore); HA Backups |
+| `helper` storage family | yes | yes (verified updates, last 5 targets) | config snapshot (auto before delete; recreate mints a new id); HA Backups |
 | `helper` config-entry family | diff only | no (multi-step options flow) | HA Backups |
-| `dashboard` | preview + read-back verify | no | HA Backups |
-| `scene` | preview + read-back verify | no | HA Backups |
+| `integration-setup` | flow-step preview + config-entry read-back; credential-recovery reload previews the entry reload (non-destructive, entities briefly drop) | no (multi-step add/reauth flow) | cancel only an unfinished add flow started in this session; after entry creation, manage or remove it in Home Assistant UI |
+| `calendar` | event-field preview + bounded event read-back | no (provider event mutation) | provider recycle bin when available; otherwise recreate from the approved preview |
+| `hacs` | repository/category/version preview + category-appropriate read-back | no (package lifecycle) | reinstall the previous pinned version from recorded pre-change state; HA Backup for migrations (config entries sit outside config snapshots) |
+| `dashboard` | preview + read-back verify | no | config snapshot (auto before delete / content-dropping save); HA Backups |
+| `scene` | preview + read-back verify | no | config snapshot (auto before delete, identity-preserving restore); HA Backups |
 | `todo` | preview + read-back verify | no (list delete irreversible) | re-add items; HA Backups for lists |
 | `updates` | preview + entity re-read verify | no (updates not downgradable) | HA Backups (offered pre-install for core/OS) |
-| `energy` | change preview + read-back & validate verify | no (corrective save) | HA Backups |
+| `energy` | change preview + read-back & validate verify | no (corrective save) | config snapshot (auto before entry-removing saves, whole-doc restore); HA Backups |
 | `maintenance` | grouped preview + re-validate verify | spike adjust only (inverse call); clears/purges/removals irreversible | HA Backups (offered pre-bulk) |
-| `organize` | field preview | no (registry deletes irreversible) | HA Backups |
+| `organize` | field preview | no (registry deletes irreversible) | config snapshot (auto before rename/disable, in-place field write-back); registry deletes: HA Backups |
 | `service-call` | state-delta preview | no (runtime action, not config) | re-run corrective service call |
+| `admin` (persons/zones/tags/users) | field preview | no (deletes irreversible; user credentials/tokens unrecoverable) | recreate from previewed fields (tags keep their physical `tag_id`; other recreates mint new ids); HA Backups |
+| `assist` (pipelines/exposure) | change preview | no | re-toggle exposure / resend prior pipeline fields; deleted pipelines recreate with a new id |
+| `yaml-config` | File-Change Preview + `check_config` | one-step `.bak` restore (writes only; a second write overwrites it) | config snapshot with stored path (auto before overwrites/deletes, multi-step history); `.bak`; HA Backups |
+| `mqtt` (publish) | payload preview | no (broker/device state) | clear a retained message by publishing an empty retained payload; corrective publish |
+| `backup` (delete) | delete preview | no | none — a deleted archive is gone |
 | `fallback` (experimental writes) | payload preview + read-back verify | no | HA Backups |

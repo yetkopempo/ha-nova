@@ -23,9 +23,15 @@ describe("project docs contract", () => {
   });
 
   it("tracks the active architecture surfaces and current skill inventory", () => {
-    expect(project).toContain("fallback");
-    expect(project).toContain("automation-patterns.md");
+    expect(project).toContain("docs/work/2026-08-09-skill-audit.md");
+    expect(project).toContain("#513–#522");
+    expect(project).toContain("the dispatch table in `skills/ha-nova/SKILL.md` is the authoritative inventory");
+    expect(project).toContain("`POST /files` (opt-in, default off)");
     expect(project).toContain("documentation-governance.md");
+    expect(project).toContain(
+      "Release metadata enables it\nonly for exact candidates",
+    );
+    expect(project).not.toContain("Release metadata keeps it disabled");
     expect(project).not.toContain("## Active Documentation");
     expect(project).not.toContain("## Current Product Surfaces");
   });
@@ -54,12 +60,18 @@ describe("project docs contract", () => {
     expect(support).not.toContain("private GitHub issue");
   });
 
-  it("keeps nova/README.md as a pointer instead of a second relay truth surface", () => {
-    expect(novaReadme).toContain("Use:");
-    expect(novaReadme).toContain("`README.md` for the public product/install/support view");
-    expect(novaReadme).toContain("`nova/DOCS.md` for Home Assistant App / relay setup");
+  it("keeps nova/README.md a friendly pointer instead of a second relay truth surface", () => {
+    // Home Assistant renders this file as the App's info page, so it reads
+    // like a product page — but it stays a pointer: the governance comment
+    // (invisible in HA) anchors the rule, and the negative pins keep
+    // operational truth (endpoints, ports, connection details) out.
+    expect(novaReadme).toContain("server-side half of [HA NOVA]");
+    expect(novaReadme).toContain("access token stays here on the server");
+    expect(novaReadme).toContain("**Documentation** tab");
     expect(novaReadme).toContain("intentionally only a pointer");
+    expect(novaReadme).toContain("off by default");
     expect(novaReadme).not.toContain("Persistent WebSocket connection");
+    expect(novaReadme).not.toContain("8791");
   });
 
   it("keeps nova/DOCS.md aligned with the relay architecture reference", () => {
@@ -73,6 +85,10 @@ describe("project docs contract", () => {
     expect(novaDocs).not.toContain("raw.githubusercontent.com/markusleben/ha-nova/main/install.sh");
     expect(novaDocs).toContain('"ok": true');
     expect(novaDocs).toContain('"data": {');
+    expect(novaDocs).toContain("Enabled release builds support Cloud Remote");
+    expect(novaDocs).not.toContain(
+      "Release metadata currently keeps Cloud Remote disabled",
+    );
   });
 
   it("treats superpowers docs as archive-only history", () => {

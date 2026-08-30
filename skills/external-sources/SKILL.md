@@ -23,6 +23,7 @@ Instead, this skill queries InfluxDB's own HTTP API **directly from this machine
 
 ## Bootstrap (once per session)
 
+Read and follow `../ha-nova/session-bootstrap.md`.
 1. Confirm the integration exists: `ha-nova relay core --method GET --path /api/components` and look for `influxdb`. If it is absent, Home Assistant is not writing to InfluxDB and there is nothing to query.
 2. Credentials come from the user's environment, never from chat and never from a file in the repo:
    - `HANOVA_INFLUXDB_URL` (e.g. `http://192.168.1.10:8086`)
@@ -55,6 +56,7 @@ If the user keeps asking for the same InfluxDB series, the better answer is a Ho
 ## Error Handling
 
 - Missing credentials: a configuration gap, not an error. Say what to set, stop.
+- Connection refused / timeout / DNS failure: the most likely real failure — this machine may have no route to the store (separate VLAN, firewall, a hostname only resolvable inside HA's network). Name the exact host:port that failed, suggest verifying reachability from THIS machine and that the store listens beyond localhost; do not retry blindly.
 - `401`/`403`: the token is wrong or lacks read permission on that bucket — the user fixes it in InfluxDB, not here.
 - Empty result: usually the full entity ID in the `entity_id` tag (it holds only the object id) or a wrong measurement name (InfluxDB names measurements after the unit, e.g. `°C`). Show what you queried before concluding the data does not exist.
 
@@ -62,7 +64,7 @@ If the user keeps asking for the same InfluxDB series, the better answer is a Ho
 
 Apply `skills/ha-nova/output-rules.md` to all user-facing output.
 
-Name the source explicitly (InfluxDB, queried directly — not Home Assistant), the time range, and the query in short form. Answer the question; do not paste raw rows.
+Render the Report shape (output-rules.md). Name the source explicitly (InfluxDB, queried directly — not Home Assistant), the time range, and the query in short form; answer the question, do not paste raw rows.
 
 ## Safety
 

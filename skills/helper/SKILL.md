@@ -1,6 +1,6 @@
 ---
 name: helper
-description: Use when creating, updating, deleting, or listing Home Assistant helpers (storage-based helpers plus the supported config-entry helper family) through HA NOVA Relay.
+description: Use when creating, updating, deleting, or listing Home Assistant helpers — timers, counters, toggles, dropdowns, text and number inputs, schedules, plus template, threshold, utility-meter and other config-entry helpers — through HA NOVA Relay.
 license: MIT
 compatibility: Requires the ha-nova CLI (run 'ha-nova setup' first) and the HA NOVA Relay in Home Assistant (App, or standalone container on Container/Core).
 ---
@@ -13,20 +13,22 @@ compatibility: Requires the ha-nova CLI (run 'ha-nova setup' first) and the HA N
 
 - **Storage-based family** — full CRUD for:
   - `input_boolean`, `input_number`, `input_text`, `input_select`, `input_datetime`, `input_button`, `counter`, `timer`, `schedule`
-- **Config-entry family** — CRUD support for 10 domains:
-  - `utility_meter`, `derivative`, `integration`, `min_max`, `threshold`, `tod`, `statistics`, `group`, `history_stats`, `template`
+- **Config-entry family** — CRUD support for 12 domains:
+  - `utility_meter`, `derivative`, `integration`, `min_max`, `threshold`, `tod`, `statistics`, `group`, `history_stats`, `template`, `generic_thermostat`, `switch_as_x`
+  - `generic_thermostat` / `switch_as_x` note: promoted without an observed field inventory — every field comes from the live form per `skills/ha-nova/live-schema-preflight.md`; a `switch_as_x` create hides the source switch entity behind the new one, and its target domain is create-only (changing it means delete + recreate) — say both in the preview
   - `group` note: handled through the live menu-driven flow; end-to-end support is verified for the `sensor` subtype, and other subtypes must stay anchored to the live step schema instead of guessed fields
   - `template` note: same menu-driven flow (17 entity types); end-to-end support is verified for the `sensor` subtype. The `state` field is a Jinja template — author it per `skills/ha-nova/template-guidelines.md` and apply the template-level reliability checks (missing `float`/`int` defaults, boolean-string comparisons) BEFORE submitting; a broken template renders the entity `unavailable`, so post-write verification must read the rendered state, not just entry existence
 
 Not handled here:
 
 - other config-entry helper families:
-  - `trend`, `random`, `filter`, `generic_thermostat`, `switch_as_x`, `generic_hygrostat`
+  - `trend`, `random`, `filter`, `generic_hygrostat`
 - `local_todo` list config entries (use `ha-nova:todo`)
 - automations/scripts config mutations (use `ha-nova:write`)
 
 ## Bootstrap (once per session)
 
+Read and follow `../ha-nova/session-bootstrap.md`.
 Verify relay CLI: `ha-nova relay health`
 If this fails: `ha-nova setup`
 
@@ -46,6 +48,9 @@ Family-specific transport:
 
 ## Flow
 
+Drafts follow `skills/ha-nova/smallest-solution.md`: the complete requested outcome in the simplest safe design — never an extra helper, option, or abstraction the request does not need.
+
+
 ### Family 1: Storage-based helpers
 
 #### Listing helpers
@@ -61,7 +66,8 @@ ha-nova relay ws --data-file <payload-file> --jq-file <filter-file>
 Write `<filter-file>` with:
 
 ```jq
-[.data.entities[] | (.ei | split(".")[0]) as $domain | select(["input_boolean","input_number","input_text","input_select","input_datetime","input_button","counter","timer","schedule"] | index($domain)) | {entity_id: .ei, name: .en, area_id: .ai}] | .[0:30]
+[.data.entities[] | (.ei | split(".")[0]) as $domain | select(["input_boolean","input_number","input_text","input_select","input_datetime","input_button","counter","timer","schedule"] | index($domain)) | {entity_id: .ei, name: .en, area_id: .ai}]
+| {total: length, shown: (.[0:30] | length), omitted: ([length - 30, 0] | max), truncated: (length > 30), matches: .[0:30]}
 ```
 
 If user filters by type, narrow the domain filter to that single storage-based domain.
@@ -75,10 +81,12 @@ ha-nova relay ws --data-file <payload-file> --jq-file <filter-file>
 Write `<filter-file>` with:
 
 ```jq
-[.data.entities[] | (.ei | split(".")[0]) as $domain | select(["input_boolean","input_number","input_text","input_select","input_datetime","input_button","counter","timer","schedule"] | index($domain)) | select((.ei + " " + (.en // "")) | test("KEYWORD";"i")) | {entity_id: .ei, name: .en, area_id: .ai}] | .[0:20]
+[.data.entities[] | (.ei | split(".")[0]) as $domain | select(["input_boolean","input_number","input_text","input_select","input_datetime","input_button","counter","timer","schedule"] | index($domain)) | select((.ei + " " + (.en // "")) | test("KEYWORD";"i")) | {entity_id: .ei, name: .en, area_id: .ai}]
+| {total: length, shown: (.[0:20] | length), omitted: ([length - 20, 0] | max), truncated: (length > 20), matches: .[0:20]}
 ```
 
 If 0 results: try synonyms or shorter stems. Never dump entire domains.
+While `truncated` is true the list proves neither absence nor uniqueness — narrow further until it is false; the counts are exact, the cap trims display only.
 
 #### Reading a single helper
 
@@ -95,13 +103,13 @@ If 0 results: try synonyms or shorter stems. Never dump entire domains.
 
 #### Creating a helper
 
-1. Validate intent against `skills/ha-nova/helper-schemas.md` for required/optional fields.
+1. Validate intent against `skills/ha-nova/helper-schemas.md` for required/optional fields. Validate cross-field constraints pre-write too, instead of leaving them to the post-write review: `input_number` `min` < `max`; `counter` `minimum` < `maximum`; `input_select` `initial` must be in `options`; `input_datetime` needs `has_date` and/or `has_time`; `timer` `duration` in `HH:MM:SS`. Fix or ask before writing.
 2. Use-case defaults (create only, skip on update/delete):
    - Infer use-case from helper name + type using general HA knowledge.
    - Consult `skills/ha-nova/helper-schemas.md` → Suggested Defaults for principles and field name reminders.
-   - If sensible defaults can be inferred: show max 4 as numbered list. Group related fields into one item.
+   - If sensible defaults can be inferred: render them as the Suggestion Block (output-rules.md), max 4 as numbered list (value defaults fill the requested item; feature-style improvement offers follow `skills/ha-nova/smallest-solution.md` — max 2). Group related fields into one item.
      ```
-     Suggested defaults for "{name}" ({type}):
+     💡 Suggested defaults for "{name}" ({type}):
      1. min: 16, max: 30, step: 0.5
      2. unit_of_measurement: "°C"
      3. mode: slider
@@ -126,15 +134,16 @@ If 0 results: try synonyms or shorter stems. Never dump entire domains.
 
 1. Resolve target from `{type}/list` by `name` or internal `id`.
 2. Extract `id` from the list response (this is the `{type}_id` for the update command).
-3. Preview current vs proposed in the Changes slot with `ha-nova diff` (see `skills/ha-nova/write-safety.md` → Pre-Write Diff). Then run a pre-write impact check — `search/related` on this helper entity (max 3 related configs) — and surface affected automations/scripts as an advisory. Advisory only; never block. Include an explicit not-saved-yet line and Options block (`apply`, `show yaml`, `cancel`).
+3. Validate the merged current+proposed fields against the same cross-field constraints as create (Creating step 1) — an update can break `min`/`max`, `minimum`/`maximum`, `initial` ∈ `options`, or datetime/timer constraints just as easily. Then preview current vs proposed in the Changes slot with `ha-nova diff` (see `skills/ha-nova/write-safety.md` → Pre-Write Diff) plus the behavior narrative (write-safety → Behavior narrative) — a count-only diff row never stands alone. Then run a pre-write impact check — `search/related` on this helper entity (max 3 related configs) — and surface affected automations/scripts as an advisory. Advisory only; never block. Include an explicit not-saved-yet line and Options block (`apply`, `show yaml`, `cancel`).
 4. Ask for natural confirmation bound to this exact preview (see context skill → Active Preview Confirmation).
-5. Execute:
+5. If the conversation paused since the preview, re-read the list item; a changed basis expires the confirmation (`write-safety.md` → Drift check before apply).
+6. Execute:
    ```text
    ha-nova relay ws --data-file <payload-file>
    ```
-6. Verify by re-reading the same list item.
-7. Run storage-family post-write review (see below).
-8. Update-Revert: after the verified update, capture the snapshot and offer `revert` — see `skills/ha-nova/write-safety.md` → Update-Revert. Storage-family restore rebuilds a schema-valid `{type}/update` from `before_config` (typed `{type}_id` from its `id` + writable fields only — never the raw list item, which lacks `{type}_id` and carries read-only `id`/`entity_id`); `expected_after` is the post-update read-back.
+7. Verify by re-reading the same list item.
+8. Run storage-family post-write review (see below).
+9. Update-Revert: after the verified update, capture the snapshot and offer `revert` — see `skills/ha-nova/write-safety.md` → Update-Revert. Storage-family restore rebuilds a schema-valid `{type}/update` from `before_config` (typed `{type}_id` from its `id` + writable fields only — never the raw list item, which lacks `{type}_id` and carries read-only `id`/`entity_id`); `expected_after` is the post-update read-back.
 
 #### Deleting a helper
 
@@ -143,12 +152,14 @@ If 0 results: try synonyms or shorter stems. Never dump entire domains.
    - name
    - type
    - entity_id
-3. Token confirmation: `confirm:<token>` (strict: only exact token accepted; see context skill → Safety Baseline).
-4. Execute:
+3. Confirmation code: `confirm:<token>` (strict: only the exact code accepted; see context skill → Safety Baseline).
+4. Capture the auto config snapshot of the current list item first (`skills/ha-nova/config-snapshots.md`; on capture failure follow its capture-failure stop). Say in the result that a recreate from it mints a new entity_id.
+5. Execute:
    ```text
    ha-nova relay ws --data-file <payload-file>
    ```
-5. Verify absence from `{type}/list`.
+6. Verify absence from `{type}/list`.
+7. Run storage-family post-write review (see below).
 
 ### Family 2: Config-entry helpers
 
@@ -164,6 +175,8 @@ Canonical config-entry helper item:
 `entry_id` is the canonical identity for config-entry helper writes.
 If the user gives only a linked `entity_id`, resolve it back to `config_entry_id` through the full entity registry before continuing.
 
+Config-entry flow orchestration follows the shared contract in `skills/ha-nova/live-schema-preflight.md`: live-form previews, non-persisting pre-confirmation navigation only, stop before the terminal submit, and nested `result.entry_id` extraction.
+
 #### Supported domains
 
 - `utility_meter`
@@ -176,6 +189,8 @@ If the user gives only a linked `entity_id`, resolve it back to `config_entry_id
 - `group`
 - `history_stats`
 - `template`
+- `generic_thermostat`
+- `switch_as_x`
 
 #### Listing helpers
 
@@ -189,15 +204,13 @@ If the user gives only a linked `entity_id`, resolve it back to `config_entry_id
    ha-nova relay ws --data-file <payload-file> --out <registry-file>
    ```
    with `{"type":"config/entity_registry/list"}`.
-3. Filter config entries to the ten supported domains.
+3. Filter config entries to the twelve supported domains.
 4. Join linked entities by matching `config_entry_id`.
-5. Present a compact table with:
-   - title
-   - domain
-   - `entry_id`
-   - state
-   - `supports_options`
-   - linked entities (compact comma-separated summary)
+5. Present the List Frame table (output-rules.md): title, domain, `entry_id`,
+   state. Options-flow support and linked entities stay in the per-helper
+   detail read; when several entries share a domain or similar titles, add a
+   short disambiguation line under the table with each candidate's linked
+   entities (compact comma-separated summary).
 
 #### Keyword search
 
@@ -248,7 +261,7 @@ If multiple matches remain, present max 5 candidates and ask one blocking questi
 #### Creating a helper
 
 1. Confirm the requested domain is supported in `skills/ha-nova/helper-flow-schemas.md`.
-   - treat that file as observed field inventory, not a full validation schema
+   - treat that file as observed field inventory for the DRAFT, not a full validation schema — the live form is the authority, enforced by the drift check in step 8
    - if required field semantics remain uncertain, fail loud and ask one blocking question
 2. Prepare the full create plan using `skills/ha-nova/helper-flow-schemas.md`:
    - for one-step domains, the plan is one submit body
@@ -263,7 +276,13 @@ If multiple matches remain, present max 5 candidates and ask one blocking questi
    - all fields already known at this point
    - for unobserved `group` or `template` subtypes, say that the final subtype form will be previewed after the menu step returns live fields
    - include an explicit not-saved-yet line and Options block (`apply`, `show yaml`, `cancel`)
-4. Ask for natural confirmation bound to this exact preview (see context skill → Active Preview Confirmation).
+4. Start the flow BEFORE confirming (steps 5-7 below run first; reading a
+   form step persists nothing — only the terminal submit does), then re-render
+   the preview from the LIVE form: label every field live-confirmed or
+   draft-only, and ask for natural confirmation bound to that live preview
+   (context skill → Active Preview Confirmation;
+   `skills/ha-nova/live-schema-preflight.md`). On cancel or expiry, abandon
+   the transient flow without submitting (DELETE the `flow_id`).
 5. Capture a pre-create baseline:
    ```text
    ha-nova relay ws --data-file <entries-request-file> --out <entries-before-file>
@@ -281,7 +300,7 @@ If multiple matches remain, present max 5 candidates and ask one blocking questi
    - if the current response is a menu step, submit only the selected `next_step_id`
    - if that menu step leads to an unobserved `group` or `template` subtype form, stop and preview the live subtype fields before the terminal submit
    - after that live subtype preview, ask for a second natural confirmation before sending the terminal subtype-specific payload
-   - if the current response is a form step, submit only the fields exposed for that step
+   - if the current response is a form step, compare its live `data_schema` against the confirmed draft BEFORE submitting: identical fields → the confirmation carries and the submit contains those fields only — but ONLY for steps the confirmed preview actually displayed live; a LATER form the preview never showed (multi-step `statistics`/`history_stats`) re-previews from its live schema and re-confirms even when it matches the observed draft. ANY divergence (fields, defaults, enum options, extra or reordered steps) → stop, re-preview from the live form, and re-confirm — a live form never silently narrows or widens the confirmed payload (`skills/ha-nova/live-schema-preflight.md`)
    - the submit body for a form step must contain form fields only
    - if a required field is still unresolved and there is no safe value, stop and ask one blocking question
    - if HA returns a form with validation errors, fail loud instead of guessing
@@ -334,13 +353,13 @@ If multiple matches remain, present max 5 candidates and ask one blocking questi
    - for `history_stats`, preserve HA's two-key window invariant across `start`, `end`, and `duration`
    - for `history_stats`, if the requested change switches to a different valid window pair, drop the old third key explicitly so the submit body still contains exactly two of `start`, `end`, and `duration`
    - for `template`, when the change touches the `state` template, resolve every entity ID referenced in the NEW template before submitting (entity registry, then `/api/states/<entity_id>` fallback — YAML/manual entities are absent from the registry but valid) — a typo like `is_state('binary_sensor.typo','on')` renders a clean boolean, so the post-write rendered-state read cannot catch it; a reference missing from both is a blocking question, not a submit
-7. Preview current vs proposed in the Changes slot with `ha-nova diff` (see `skills/ha-nova/write-safety.md` → Pre-Write Diff). Include an explicit not-saved-yet line and Options block (`apply`, `show yaml`, `cancel`).
+7. For a `threshold` helper whose `lower`, `upper`, or `hysteresis` changes against a physical-process sensor — or whose compared `entity_id` is swapped while boundaries stay — run the calibration preflight per `skills/ha-nova/threshold-calibration.md` first and carry its findings into the preview. Then preview current vs proposed in the Changes slot with `ha-nova diff` (see `skills/ha-nova/write-safety.md` → Pre-Write Diff) plus the behavior narrative (write-safety → Behavior narrative). Include an explicit not-saved-yet line and Options block (`apply`, `show yaml`, `cancel`).
 8. Ask for natural confirmation bound to this exact preview (see context skill → Active Preview Confirmation).
 9. Submit the current step:
    ```text
    ha-nova relay core --method POST --path /api/config/config_entries/options/flow/{flow_id} --body-file <submit-payload-file>
    ```
-10. If HA returns another form step, repeat the same merge-and-submit rule until terminal `create_entry` or explicit failure.
+10. If HA returns another form step, the confirmed preview covered only the forms it displayed live: a later form re-previews from its live `data_schema` and re-confirms before its submit (same rule as creates, `skills/ha-nova/live-schema-preflight.md`); then repeat the merge-and-submit rule until terminal `create_entry` or explicit failure.
 11. Verify success:
    - re-read `config_entries/get`
    - `passed=true` only when the same `entry_id` still exists
@@ -360,7 +379,7 @@ If multiple matches remain, present max 5 candidates and ask one blocking questi
    - if multiple candidates remain after resolution, stop and ask one blocking question
    - never guess between duplicate titles or ambiguous linked-entity matches
 2. Enforce the helper-domain allowlist before any delete:
-   - allowed here: `utility_meter`, `derivative`, `integration`, `min_max`, `threshold`, `tod`, `statistics`, `group`, `history_stats`, `template`
+   - allowed here: `utility_meter`, `derivative`, `integration`, `min_max`, `threshold`, `tod`, `statistics`, `group`, `history_stats`, `template`, `generic_thermostat`, `switch_as_x`
    - if the resolved `domain` is outside that allowlist, stop
    - do not call `DELETE /api/config/config_entries/entry/{entry_id}` for out-of-scope domains
    - hand off to `ha-nova:fallback` for any other config-entry domain
@@ -369,12 +388,12 @@ If multiple matches remain, present max 5 candidates and ask one blocking questi
    - domain
    - linked entities if known
    - `entry_id` only when needed to disambiguate duplicate titles/domains
-   - explicit not-deleted-yet line before the confirmation token
+   - explicit not-deleted-yet line before the confirmation code
 4. Run a pre-delete dependency check:
    - if linked entities are known, run `search/related` against up to 3 linked entities before confirmation
    - summarize any related automations/scripts in the preview
    - if linked entities are unknown, say that dependency check coverage is limited
-5. Token confirmation: `confirm:<token>` (strict exact-token rule). This still applies to cleanup and helpers created earlier in the same session.
+5. Confirmation code: `confirm:<token>` (strict exact-code rule). This still applies to cleanup and helpers created earlier in the same session. Multi-helper deletes within ONE family follow `skills/ha-nova/batch-safety.md`; storage and config-entry families never mix. Deleting a helper together with its consumers (cross-family) — and removing a retired device's entities FROM a config-entry group helper as one item of such a cleanup — follows `skills/ha-nova/grouped-change-set.md` → Cross-Family Destructive Cleanup: one manifest, one code; the group-member removal keeps this skill's normal update preview and drift check inside the manifest.
 6. Execute:
    ```text
    ha-nova relay core --method DELETE --path /api/config/config_entries/entry/{entry_id}
@@ -391,20 +410,21 @@ Do NOT report results to user until complete.
 
 #### Storage-based family
 
-1. Apply `skills/review/checks.md` → Application (storage family: H-01..H-10).
+1. Apply `skills/review/checks.md` → Application (storage family: H-01..H-11; H-11 only when a consuming automation/template is in the thread context).
 2. Apply H-01..H-08 directly to the written helper config.
 3. Only evaluate H-09/H-10 if the collision scan finds a referencing automation/script with a direct helper-backed threshold and you also read live helper state per `skills/review/checks.md`.
 4. Collision scan: `search/related` for the helper entity, max 3 related automations/scripts.
 
 #### Config-entry family
 
-Do not pretend H-01..H-10 apply here.
+Do not pretend H-01..H-11 apply here; H-12/H-13/H-15 apply where the entry's fields are readable, and H-14 when the energy prefs are already loaded in the thread (see checks.md).
 Instead, run the minimal config-entry post-write contract:
 
 1. **Verification**
    - create: config entry now exists and the requested `entry_id`/diff verification passed
    - update: the same `entry_id` still exists and the reopened options-flow snapshot reflects the requested field changes
    - for `template` creates and `state`-changing updates, additionally read the linked entity via `GET /api/states/<entity_id>`. A clean numeric/string render confirms the template works. Treat `unavailable`/`unknown` as INCONCLUSIVE, not proof of breakage — a source entity can be legitimately `unknown`, or the template may intentionally return a sentinel; only call it a template defect when the options-flow template or an HA error proves a failure. Either way the config-entry write itself still counts as passed
+   - for `statistics` and `history_stats` writes, also read the linked entity's state attributes and apply `skills/ha-nova/write-safety.md` → Time-Window Evidence: partial window coverage (`age_coverage_ratio` below 1) or an invalid source is an advisory in the result, never a failed create — and never describe the value as covering the configured window without that coverage evidence
    - delete: config entry is absent
 2. **Current editable snapshot**
    - if an options flow is available, summarize only the editable fields exposed by the final current step readback
@@ -414,14 +434,14 @@ Instead, run the minimal config-entry post-write contract:
 4. **Collision check**
    - if linked entities were found, run `search/related` against up to 3 linked entities
 5. **Advisory**
-   - say that storage-helper H-01..H-10 checks do not apply to this family
+   - say that storage-helper H-01..H-11 checks do not apply to this family
    - config-entry updates are not auto-revertible (options-flow writes are multi-step); for undo, point the user to Home Assistant Backups
 
-Report only what has substance (same rule as the write flow — see `skills/write/SKILL.md` Phase 4): keep **Verification** (and the editable snapshot when present), but omit an empty **Collision check** or **Advisory** — never an empty "none" bucket. When the write is clean, the verification plus a single scope-honest confirmation line suffices (`skills/ha-nova/write-safety.md` → Verification Honesty). Multi-target logical changes: plan first per write-safety → Multi-Target Changes.
+Report only what has substance (same rule as the write flow — see `skills/write/SKILL.md` Phase 4): keep **Verification** (and the editable snapshot when present), but omit an empty **Collision check** or **Advisory** — never an empty "none" bucket. When the write is clean, the verification plus a single scope-honest confirmation line suffices (`skills/ha-nova/write-safety.md` → Verification Honesty). Multi-target logical changes: plan first per write-safety → Multi-Target Changes. Non-destructive helper worksets (max 10) may confirm as one grouped change set per `skills/ha-nova/grouped-change-set.md` — the per-step Options block and confirmation then collapse into the group's single final action block.
 
 ## Output Format
 
-Apply `skills/ha-nova/output-rules.md` to all user-facing output.
+Apply `skills/ha-nova/output-rules.md` to all user-facing output. Write previews, delete prompts, and results render as the Cards defined there. The bold labels in both read templates below are semantic slots — localize them at runtime, never print them as literal English headings.
 
 ### Storage-based family
 
@@ -435,7 +455,7 @@ After reading a helper config, present:
 - {type-specific fields}
 ```
 
-For list operations, use:
+For list operations, render the List Frame (output-rules.md):
 
 ```text
 | Entity ID | Name | Type | Area |
@@ -456,11 +476,11 @@ After reading a helper config, present:
 - **Current editable fields:** {field summary from the current options step when available}
 ```
 
-For list operations, use:
+For list operations, render the List Frame (output-rules.md; options-flow support and linked entities stay in the per-helper detail read above):
 
 ```text
-| Title | Domain | Entry ID | State | Supports Options-Flow Editing | Linked Entities |
-|-------|--------|----------|-------|--------------------------------|-----------------|
+| Title | Domain | Entry ID | State |
+|-------|--------|----------|-------|
 ```
 
 Never show raw JSON to the user.
@@ -470,14 +490,16 @@ Never show raw JSON to the user.
 - Preview before write: nothing is saved until the user confirms the shown preview.
 - Confirmation binds to the displayed preview and expires on any change to target, payload, endpoint, or scope (context skill → Active Preview Confirmation).
 - Pre-preview phrases ("do it", "go ahead", "implement the plan") authorize drafting and preview only — never the write itself.
-- Delete and destructive operations require the typed token `confirm:<token>` verbatim; "yes" or any natural-language reply is invalid.
+- Delete and destructive operations require the typed confirmation code `confirm:<token>` verbatim; "yes" or any natural-language reply is invalid.
 - Never guess entity, service, or config IDs — resolve them or ask.
 - Home Assistant is reached exclusively through `ha-nova relay`.
 - For any HA write this skill does not cover, STOP and invoke `ha-nova:fallback` first — never probe unfamiliar write endpoints.
+- `search/related` verdicts fail closed: verify `ok=true` and `data` is an object before projecting family keys (`skills/ha-nova/relay-api.md` → Parsing rule); a failed or unexecuted scan is inconclusive — never a no-consumer result.
 
 - No guessing entity IDs, linked entities, or config entry IDs; resolve or ask
 - `entry_id` is the canonical write identity for the config-entry family
 - Destructive cleanup still requires `confirm:<token>`, even for helpers created earlier in the same session.
+- Declared exception to the core delete rule above: abandoning an unfinished create flow this skill started (cancel or expired confirmation) DELETEs only that ephemeral `flow_id` — transient flow state, never a config entry; the user's cancel is sufficient, and this exception never applies to anything already created.
 - Every write MUST end with the Post-Write Review slot; use terminal-friendly labels where Markdown headings add noise.
 
 ## Guardrails
@@ -495,3 +517,4 @@ Never show raw JSON to the user.
 - Config-entry helper schemas: `skills/ha-nova/helper-flow-schemas.md`
 - Review Checks: `skills/review/checks.md` (self-contained catalog + Application)
 - On demand: `skills/ha-nova/update-revert.md` — when the user asks to revert, undo, or restore a verified update
+- On demand: `skills/ha-nova/config-snapshots.md` — capturing the pre-delete snapshot, or restoring from a config snapshot

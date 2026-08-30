@@ -1,3 +1,8 @@
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { gzipSync } from "node:zlib";
+
 import { afterEach, describe, expect, it } from "vitest";
 
 import { createHealthHandler } from "../../nova/src/http/handlers/health.js";
@@ -21,8 +26,8 @@ describe("health endpoint", () => {
               }
               resolve();
             });
-          })
-      )
+          }),
+      ),
     );
     servers.length = 0;
   });
@@ -36,15 +41,18 @@ describe("health endpoint", () => {
         version: "1.0.0",
         wsClient: { isConnected: () => true },
         startedAtMs: 1_000,
-        now: () => 4_500
-      })
+        fileAccessMode: "off",
+        snapshotRoot: "/nonexistent-snapshot-root-for-tests",
+        relayInstanceId: "hanova-relay-v1.AAAAAAAAAAAAAAAAAAAAAA",
+        now: () => 4_500,
+      }),
     );
 
     const { baseUrl } = await startServer(servers, router);
     const response = await fetch(`${baseUrl}/health`, {
       headers: {
-        authorization: `Bearer ${TEST_AUTH_TOKEN}`
-      }
+        authorization: `Bearer ${TEST_AUTH_TOKEN}`,
+      },
     });
 
     expect(response.status).toBe(200);
@@ -53,10 +61,65 @@ describe("health endpoint", () => {
       data: {
         status: "ok",
         ha_ws_connected: true,
+        ha_ws_disconnect_reason: null,
         version: "1.0.0",
-        uptime_s: 3
-      }
+        uptime_s: 3,
+        file_access: "off",
+        snapshots: { files: 0, bytes: 0 },
+        relay_instance_id: "hanova-relay-v1.AAAAAAAAAAAAAAAAAAAAAA",
+      },
     });
+  });
+
+  it("surfaces the disconnect reason and snapshot counters", async () => {
+    const snapshotRoot = mkdtempSync(join(tmpdir(), "nova-health-snapshots-"));
+    mkdirSync(join(snapshotRoot, "scenes"), { recursive: true });
+    writeFileSync(
+      join(snapshotRoot, "scenes", "movie-20260714T120000000Z.json.gz"),
+      gzipSync("{}"),
+    );
+
+    const router = createRouter();
+    router.register(
+      "GET",
+      "/health",
+      createHealthHandler({
+        version: "1.0.0",
+        wsClient: {
+          isConnected: () => false,
+          getConnectionStatus: () => ({
+            connected: false,
+            disconnect_reason: "auth",
+          }),
+        },
+        startedAtMs: 1_000,
+        fileAccessMode: "readwrite",
+        snapshotRoot,
+        now: () => 4_500,
+      }),
+    );
+
+    try {
+      const { baseUrl } = await startServer(servers, router);
+      const response = await fetch(`${baseUrl}/health`, {
+        headers: { authorization: `Bearer ${TEST_AUTH_TOKEN}` },
+      });
+      const payload = (await response.json()) as {
+        data: {
+          ha_ws_connected: boolean;
+          ha_ws_disconnect_reason: string | null;
+          file_access: string;
+          snapshots: { files: number; bytes: number };
+        };
+      };
+      expect(payload.data.ha_ws_connected).toBe(false);
+      expect(payload.data.ha_ws_disconnect_reason).toBe("auth");
+      expect(payload.data.file_access).toBe("readwrite");
+      expect(payload.data.snapshots.files).toBe(1);
+      expect(payload.data.snapshots.bytes).toBeGreaterThan(0);
+    } finally {
+      rmSync(snapshotRoot, { recursive: true, force: true });
+    }
   });
 
   it("returns 401 without token", async () => {
@@ -68,8 +131,10 @@ describe("health endpoint", () => {
         version: "1.0.0",
         wsClient: { isConnected: () => false },
         startedAtMs: 1_000,
-        now: () => 2_000
-      })
+        fileAccessMode: "off",
+        snapshotRoot: "/nonexistent-snapshot-root-for-tests",
+        now: () => 2_000,
+      }),
     );
 
     const { baseUrl } = await startServer(servers, router);
@@ -80,19 +145,19 @@ describe("health endpoint", () => {
       ok: false,
       error: {
         code: "UNAUTHORIZED",
-        message: "Missing authorization header"
-      }
+        message: "Missing authorization header",
+      },
     });
   });
 });
 
 async function startServer(
   servers: Array<ReturnType<typeof createHttpServer>>,
-  router: ReturnType<typeof createRouter>
+  router: ReturnType<typeof createRouter>,
 ): Promise<{ baseUrl: string }> {
   const server = createHttpServer({
     authToken: TEST_AUTH_TOKEN,
-    router
+    router,
   });
 
   servers.push(server);
@@ -110,6 +175,6 @@ async function startServer(
   });
 
   return {
-    baseUrl: `http://127.0.0.1:${address.port}`
+    baseUrl: `http://127.0.0.1:${address.port}`,
   };
 }

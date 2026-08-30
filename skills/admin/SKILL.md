@@ -19,6 +19,7 @@ Not in scope: areas, floors, labels, categories (`ha-nova:organize`), automation
 
 ## Bootstrap (once per session)
 
+Read and follow `../ha-nova/session-bootstrap.md`.
 Verify relay CLI: `ha-nova relay health`
 If this fails: `ha-nova setup`
 
@@ -40,6 +41,7 @@ If this fails: `ha-nova setup`
 4. **Users**: WS `config/auth/list` shows accounts (`id`, `name`, `username`, `is_owner`, `is_active`, `system_generated`, `group_ids`).
    - listing and reviewing access is the safe, common case
    - `config/auth/create` / `config/auth/delete` exist, and are the most dangerous writes in HA NOVA
+   - create payload: `{"type":"config/auth/create","name":"<display name>","group_ids":["system-users"],"local_only":false}` — `system-admin` in `group_ids` makes the account an administrator, so name that in the preview. The password is NOT set here: Home Assistant issues the credential separately, so tell the user to finish in Settings → People rather than offering to set one
    - before any delete: WS `auth/current_user` returns the account this relay's token belongs to — that account is never deletable
 5. Verify every write by re-reading the list — never from the command response alone.
 
@@ -54,27 +56,33 @@ If this fails: `ha-nova setup`
 ## Error Handling
 
 Full relay/upstream error taxonomy: `skills/ha-nova/relay-api.md` -> Error Handling. Admin specifics:
-- `config/auth/*` requires an owner-level token: a permission error here means the LLAT belongs to a non-admin account, not that the command is wrong.
+- `config/auth/*` requires owner/admin rights upstream: a permission error here means the Relay's upstream credential lacks HA admin (App: Supervisor credential; container: the host-side `HA_LLAT`), not that the command is wrong.
 - Deleting a zone that automations reference succeeds — Home Assistant does not stop you. The damage shows up later, which is exactly why the impact advisory runs before the write.
 
 ## Output Format
 
-Apply `skills/ha-nova/output-rules.md` to all user-facing output.
+Apply `skills/ha-nova/output-rules.md` to all user-facing output. Write previews, delete confirmations, and results render as the Cards defined there.
 
-For persons: name, device trackers, linked user. For zones: name, radius, and which automations depend on them. For users: name, whether they are owner/active/system-generated — never their tokens or credentials. State what was verified after the write.
+Render the Report shape (output-rules.md); person/zone/user inventories render the List Frame. For persons: name, device trackers, linked user. For zones: name, radius, and which automations depend on them. For users: name, whether they are owner/active/system-generated — never their tokens or credentials. State what was verified after the write.
 
 ## Safety
 
 - Preview before write: nothing is saved until the user confirms the shown preview.
 - Confirmation binds to the displayed preview and expires on any change to target, payload, endpoint, or scope (context skill → Active Preview Confirmation).
 - Pre-preview phrases ("do it", "go ahead", "implement the plan") authorize drafting and preview only — never the write itself.
-- Delete and destructive operations require the typed token `confirm:<token>` verbatim; "yes" or any natural-language reply is invalid.
+- Delete and destructive operations require the typed confirmation code `confirm:<token>` verbatim; "yes" or any natural-language reply is invalid.
 - Never guess entity, service, or config IDs — resolve them or ask.
 - Home Assistant is reached exclusively through `ha-nova relay`.
 - For any HA write this skill does not cover, STOP and invoke `ha-nova:fallback` first — never probe unfamiliar write endpoints.
 
-- Zone and person deletes take the typed token, and the preview must first name the automations that depend on them (`search/related`).
-- User deletion is the strictest operation in HA NOVA: owner, system-generated, and the relay's own account are refused outright, and everything else needs the typed token plus a plain statement of what is lost.
+- Drafts follow `skills/ha-nova/smallest-solution.md`: the complete requested outcome in the simplest safe design, nothing for hypothetical future needs.
+- `search/related` verdicts fail closed: verify `ok=true` and `data` is an object before projecting family keys (`skills/ha-nova/relay-api.md` → Parsing rule); a failed or unexecuted scan is inconclusive — never a no-consumer result.
+
+- Zone and person deletes take the typed confirmation code, and the preview must first name the automations that depend on them (`search/related`).
+- User deletion is the strictest operation in HA NOVA: owner, system-generated, and the relay's own account are refused outright, and everything else needs the typed confirmation code plus a plain statement of what is lost.
+- Creating a user account grants durable system access, so it takes the typed confirmation code too — not the ordinary create tier. The preview names the login name, whether the account is an administrator (`group_ids`), and that the password is set in the Home Assistant UI, never here.
+- No delete here has a `revert`. Zones, persons, and tags are recreatable from their previewed fields — a tag keeps its physical `tag_id`, but other recreates mint new internal ids, so inbound references stay broken. A deleted user's password, tokens, and history are unrecoverable; the delete preview must say so.
+- Offer a safety backup via `ha-nova:backup` before zone, person, and user deletes (not for tag deletes or routine updates).
 - Never surface credentials, tokens, or password state in output.
 
 ## Guardrails

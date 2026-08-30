@@ -2,7 +2,7 @@
 
 ## Overview
 
-HA NOVA uses a flat skill layout with one context skill and 28 independent sub-skills under `skills/`.
+HA NOVA uses a flat skill layout with one context skill and 30 independent sub-skills under `skills/`.
 
 The repo skill tree is the single source of truth. Client installers adapt that same tree to each client's packaging rules:
 - Claude: plugin marketplace payload
@@ -14,6 +14,7 @@ Installed skill tree:
 ```
 skills/
   ha-nova/SKILL.md              (context skill — stable top-level entrypoint)
+  ha-nova/session-bootstrap.md  (shared first-use update/census contract)
   ha-nova/relay-api.md          (reference doc)
   ha-nova/best-practices.md     (reference doc)
   ha-nova/payload-schemas.md    (reference doc)
@@ -24,17 +25,25 @@ skills/
   ha-nova/template-guidelines.md (reference doc — when to use templates vs native primitives)
   ha-nova/safe-refactoring.md   (reference doc — rename, delete, orphan cleanup workflows)
   ha-nova/automation-patterns.md (reference doc — native HA constructs vs templates)
+  ha-nova/one-shot-automations.md (reference doc — self-disabling one-shots, deadline expiry, duration requests)
   ha-nova/write-safety.md       (reference doc — pre-write diff + durable update-revert; SSOT for write/ + helper/)
+  ha-nova/batch-safety.md       (reference doc — scoped batch manifest for destructive multi-target operations)
+  ha-nova/grouped-change-set.md (reference doc — one confirmation for a fully previewed non-destructive change set)
+  ha-nova/config-snapshots.md   (reference doc — targeted config-snapshot capture/restore on the relay blob store)
+  ha-nova/input-capability-preflight.md (reference doc — verify input-device gestures before planning a remap)
+  ha-nova/consumer-discovery-preflight.md (reference doc — find an input's consumers before repurposing it)
   ha-nova/agents/               (agent templates: resolve, apply)
   read/SKILL.md                         (ha-nova:read — automation/script list/get/trace)
   write/SKILL.md                        (ha-nova:write — automation/script create/update/delete)
   helper/SKILL.md                       (ha-nova:helper — helper CRUD: list/read/create/update/delete)
+  integration-setup/SKILL.md            (ha-nova:integration-setup — add integrations, continue pending reauth flows, recover invalid credentials when none is pending)
   dashboard/SKILL.md                    (ha-nova:dashboard — storage dashboards, Lovelace resources, card operations)
   scene/SKILL.md                        (ha-nova:scene — storage-scene list/read/create/update/delete)
   organize/SKILL.md                     (ha-nova:organize — areas/floors/labels/categories/entity+device metadata)
   history/SKILL.md                      (ha-nova:history — bounded history/logbook/statistics reads)
   health/SKILL.md                       (ha-nova:health — read-only home status, repairs, system health)
-  calendar/SKILL.md                     (ha-nova:calendar — read-only calendar lists and bounded event windows)
+  calendar/SKILL.md                     (ha-nova:calendar — bounded calendar reads and single-event writes)
+  hacs/SKILL.md                         (ha-nova:hacs — HACS package lifecycle: registration, download, update, uninstall, migration)
   todo/SKILL.md                         (ha-nova:todo — to-do list items + Local To-do lifecycle)
   backup/SKILL.md                       (ha-nova:backup — backup status/create/inspect/delete; restore stays in HA UI)
   updates/SKILL.md                      (ha-nova:updates — pending updates, release notes, feature-gated installs)
@@ -44,7 +53,7 @@ skills/
   maintenance/maintenance-reference.md  (reference doc — issue matrix, repair payloads, orphan gates)
   review/SKILL.md                       (ha-nova:review — config quality review + collision scan)
   entity-discovery/SKILL.md             (ha-nova:entity-discovery — entity lookup)
-  service-call/SKILL.md                 (ha-nova:service-call — service calls + runtime control)
+  service-call/SKILL.md                 (ha-nova:service-call — services, events/webhooks, alarm/lock runtime control)
   fallback/SKILL.md                     (ha-nova:fallback — mandatory fallback for relay-ready features)
   onboarding/SKILL.md                   (ha-nova:onboarding — onboarding + diagnostics)
   diagnose/SKILL.md                     (ha-nova:diagnose — failure root-cause: traces, logs, bounded windows)
@@ -97,20 +106,21 @@ Current mapping:
 | read | inline | 1-2 calls, direct output |
 | write | **agents** | 5-7 calls, entity resolution fallback, singular/plural normalization, domain reload |
 | helper | inline | response-driven relay flows, direct preview/confirm loop, no agent-only normalization requirement |
+| integration-setup | inline | response-driven config flows with direct preview/confirm and HA UI handoff for secrets/external steps |
 | dashboard | inline | read → merge → preview → full-save → readback verify, all user-facing |
 | scene | inline | 2-4 calls, flat entities payload, read → merge → preview → full-save → readback verify |
 | organize | inline | field-level registry mutations with direct preview/readback |
 | history | inline | read-only bounded timeline lookups |
 | health | inline | read-only status aggregation, best-effort diagnostics |
-| calendar | inline | REST-only bounded calendar event reads |
+| calendar | inline | bounded REST reads plus feature-gated service/WS event writes |
 | todo | inline | service-based item CRUD with feature gate, single-step list flow |
 | backup | inline | WS status/generate/delete with initiation-vs-completion polling |
 | updates | inline | entity-based overview, feature-gated install with entity-poll verification |
 | energy | inline | statistics-based analysis, prefs read → merge → preview → full-save → validate verify |
-| maintenance | inline | grouped issue triage, token-gated destructive repairs with per-item verification |
+| maintenance | inline | grouped issue triage, code-gated destructive repairs with per-item verification |
 | review | inline | analysis is client-side, relay calls are reads only |
 | entity-discovery | inline | 1-2 calls, search + return |
-| service-call | inline | 2-3 calls, preview + execute |
+| service-call | inline | direct preview/confirm; any listener scan stays read-only and user-facing |
 | fallback | inline | research + web search + experimental relay calls (write-guarded) |
 | onboarding | inline | diagnostics only |
 | diagnose | inline | evidence gathering + reasoning, one gated debug escalation |
@@ -120,7 +130,7 @@ Current mapping:
 | mqtt | inline | one bounded window or one guarded publish |
 | assist | inline | read/test flows plus full-object pipeline writes |
 | admin | inline | registry-style writes with impact advisory and hard user guards |
-| yaml-config | inline | read -> diff -> write -> check_config -> reload -> verify |
+| yaml-config | inline | read -> File-Change Preview -> write -> check_config -> reload -> verify |
 | external-sources | inline | read-only, and the query does not go through the relay |
 
 **Rule of thumb:** If a `service-call` could do it, it's inline. If it needs what `write` needs (resolve + normalize + reload), use agents.
@@ -144,7 +154,7 @@ Current mapping:
 - ask one decision question only if ambiguous
 - confirmation tier:
   - create/update: natural confirmation bound to active preview
-  - delete: tokenized `confirm:<token>`
+  - delete: typed confirmation code `confirm:<token>`
   - pre-preview wording such as "implement the plan", "do it", or "go ahead" authorizes draft/check/preview work only; if the previewed payload, target, or manifest changes, confirmation expires
 
 3. Apply + Verify (Agent)
@@ -160,6 +170,16 @@ Current mapping:
 
 Fallback:
 - if agent dispatch unavailable, execute same phases inline serially.
+
+## Config Snapshot Architecture
+
+The `ha-nova` context skill owns generic config snapshot listing and deletion
+through `skills/ha-nova/config-snapshots.md`; restore delegates to the skill
+that owns the captured Home Assistant item because restore fidelity and write
+verification are family-specific. Exact multi-file deletion is the sole
+context-owned destructive batch family: `config-snapshots`, capped at 20,
+sequential, fail-fast, and verified per blob. The Relay remains an opaque blob
+store and gains no Home Assistant business logic.
 
 ## Read Architecture
 
@@ -224,13 +244,13 @@ Mutation rules:
   - categories: `icon`
 - entity/device label updates may replace, add, remove, or clear labels
 - field-level preview before write
-- destructive area/floor/label/category delete requires impact preview + token confirmation
+- destructive area/floor/label/category delete requires impact preview + typed confirmation code
 - read back the changed registry fields after every mutation
 
 Still excluded:
 - entity removal
 - device config-entry detachment
-- device category assignment
+- device categories do not exist; offer entity categories instead
 - zones / persons / tags
 
 ## History Architecture
@@ -258,28 +278,104 @@ Rules:
 Rules:
 - no repair/fix/ignore actions
 - no restart/reload/service calls
-- check `ha-nova relay health` and skip `system_health/info` when Relay App version is below 0.2.3
+- check `ha-nova relay health` and skip `system_health/info` when the relay is below the enforced floor (`min_relay_version`)
 - summarize by source and bind conclusions to evidence
-- keep Home Status compact: overall state, source coverage, capped examples, sanitized integration reasons
-- deprioritize noisy/stateless domains (`button`, `event`, `scene`, `stt`) in unavailable/unknown examples
+- keep Home Status table-first and cause-oriented: overall state + visible Detail×Privacy modes (default `Explained + Private`), prioritized actions, sanitized integration reasons (#440)
+- label unavailable/unknown totals as entity-state counts, never device/problem counts
+- when availability states exist, best-effort join full entity/device registries and config entries for restored/current, integration, config-entry-state, and device-attribution coverage
+- use one finding ledger across Entities and Integrations; a failed entry owns its joined impact once under Integrations ("associated states" wording)
+- assign every raw availability row to exactly one of six categories (sum equals the raw total); render groups under the Explained budget of 50 entity-detail rows (1-10 full detail, 11-50 five examples, >50 summarized) — in `Private` mode exact entity IDs, friendly names, and sanitized config-entry titles are legitimate output, while `Shareable`/`Aggregate` hide identity; secrets, addresses, and hosts stay out in every mode
+- report known device-registry records plus entity-state row coverage, never an inferred exact device total
+- aggregate and cap privacy-safe device-subcluster sizes independently of integration attribution; device IDs remain hidden tie-breakers only
+- treat setup/unload progress as context, and only the explicit config-entry failure set as attention
+- when availability rows exist, missing entity/device registry sources make coverage limited and are named separately
+- treat availability classification as context only; it never changes overall status without an existing attention source
+- deprioritize noisy/stateless domains (`button`, `event`, `scene`, `stt`) for attention while retaining their contextualized counts
 - localize output slot headings and labels; keep HA state values literal when used as evidence
+
+## HACS Architecture
+
+`ha-nova:hacs` owns the HACS package lifecycle end to end — registration,
+download/install, update, redownload, uninstall, and custom-integration
+migration:
+- a pinned, schema-guarded WS command map for the supported HACS major line;
+  capability detection reads `hacs/info` first and fails closed with the
+  HACS-UI pointer on an unrecognized schema — never guessed commands, never
+  `.storage` edits, never a transport outside the Relay
+- registration, downloaded files, and config entries are three distinct
+  lifecycle objects, named as such in output
+- a Relay timeout is an UNKNOWN outcome: bounded reconcile loops re-read
+  HACS/HA API state over a settle window; non-idempotent mutations never
+  auto-retry
+- every uninstall/removal runs HACS-specific consumer discovery first
+  (search/related plus, for frontend packages, Lovelace resources and
+  storage dashboards; template consumers disclosed as unscanned)
+- migrations require a CURRENT completed full HA Backup before the first
+  destructive step; config entries sit outside config snapshots
+- verification is category-appropriate (integration manifest/config-entry
+  state vs. frontend resource registration vs. theme version) and
+  distinguishes INSTALLED from ACTIVE (restart pending)
+- update ownership: `update.*` entity flows stay in `ha-nova:updates`; this
+  skill owns what the entity flow cannot do
 
 ## Calendar Architecture
 
-`ha-nova:calendar` is a REST-only read skill:
+`ha-nova:calendar` owns bounded calendar reads and single-event writes:
 - list calendars through `/api/calendars`
 - read events through `/api/calendars/{entity_id}?start=<timestamp>&end=<timestamp>`
+- create through `calendar.create_event`; update/delete through WS `calendar/event/update|delete`
+- capability gates use `supported_features` bits 1/2/4 before create/delete/update
+- update/delete identity is `(uid, recurrence_id)`; recurring scope is one occurrence (`""`) or this-and-future (`THISANDFUTURE`)
+- update sends a full merged event object, never a partial patch
 
 Rules:
 - default to the next 7 days
 - always use a bounded event window
 - resolve ambiguous calendar names before querying events
-- no event create/update/delete actions
+- create/update use natural bound confirmation; delete uses the typed confirmation code
+- drift-check immediately before the write; verify through bounded REST read-back and never auto-retry a write
+- recurring creation goes through WS `calendar/event/create` with an `rrule` (`calendar.create_event` has no recurrence field); verification re-reads the window and reports the pre-expanded instances as one series
+
+## Integration Setup Architecture
+
+`ha-nova:integration-setup` owns UI-configurable integration add, entry options/reconfigure through the standard config-entry flows, entry reload, pending reauthentication flows, and invalid-credential recovery when no reauth flow is pending:
+- add starts through REST `POST /api/config/config_entries/flow` after resolving an exact handler from `/api/config/config_entries/flow_handlers`
+- options/reconfigure follow the live-schema preflight contract: options via `POST /api/config/config_entries/options/flow` with the entry as handler, reconfigure via a config-flow start carrying `entry_id`; reconfigure verification requires the same `entry_id` to persist with no new entry created
+- entry reload previews the disruption (setup re-runs, entities drop briefly) and reports the entry's actual post-reload state; entry remove stays with `ha-nova:fallback`, enable/disable stays External
+- reauthentication continues an existing `context.source == "reauth"` flow discovered through WS `config_entries/flow/progress`; it never synthesizes a reauth flow
+- credential recovery (no reauth pending) previews and reloads the exact config entry, then re-reads flow progress and continues the reauth handoff, or fails closed to the HA UI
+- menu/form steps use only the live response schema and require a preview-bound confirmation before each submit
+- credential-bearing, external/OAuth, or progress add steps started through the Relay are canceled and restarted in the Home Assistant UI; user-started flows are omitted from `config_entries/flow/progress`, and the Relay cannot supply the frontend-origin header
+- credential-bearing, external/OAuth, or progress steps on pre-existing reauth flows hand off to the matching Home Assistant UI card; secrets never enter chat and the reauth flow stays preserved
+- config-entry existence/state is primary verification evidence; linked devices/entities are secondary
+- agent-created canceled add flows are deleted; Home Assistant-created reauth flows are preserved
+
+## Service Call Architecture
+
+`ha-nova:service-call` owns ordinary HA service calls plus four guarded runtime families:
+- custom event firing through `POST /api/events/{event_type}`
+- known JSON-webhook triggering through `POST /api/webhook/{webhook_id}`
+- alarm-panel runtime services with feature bits 1/2/4/8/16/32
+- lock runtime services, with `lock.open` gated by feature bit 1
+
+Event/webhook rules:
+- resolve an exact event type or an exact automation with a static webhook ID; never probe either endpoint
+- scan readable automation configs for every matching current/legacy trigger and classify literal event-data filters; compare with `GET /api/events` for unclassified event listeners
+- use WS `webhook/list` with `--out` into client-private scratch storage to check registration, POST support, and `local_only`; the full response never reaches stdout, user output, or persistent storage
+- preview payload fields, known listeners, unknown-listener limits, and inherited action risk before bound confirmation
+- event success proves bus acceptance only; webhook HTTP 200 is deliberately opaque and does not prove registration, locality, or handler success
+- verify known automation runs against pre-call `last_triggered`/trace baselines; never auto-retry either runtime action
+
+Alarm/lock rules:
+- inspect the exact state and `supported_features` immediately before preview
+- codes/PINs never enter chat or Relay payloads; alarm arming hands off whenever `code_arm_required` is true, while other code-bearing actions use `code_format`
+- unlocking/opening a lock and disarming an alarm use the typed high-consequence confirmation
+- security-state verification is transition-aware and never auto-retries
 
 ## Review Architecture
 
 `ha-nova:review` is a self-contained read-only reviewer:
-- Config quality: safety (S-01..S-03), reliability (R-01..R-29), performance (P-01..P-05), style (M-01..M-05; M-04 retired, moved to R-20), script-specific (F-01..F-08), helper-specific (H-01..H-10)
+- Config quality: safety (S-01..S-03), reliability (R-01..R-31), performance (P-01..P-05), style (M-01..M-05; M-04 retired, moved to R-20), script-specific (F-01..F-09), helper-specific (H-01..H-15), scene (SC-01..SC-07), dashboard (D-01..D-07), cross-item (HX-01..HX-05), YAML sensors (TS-01..TS-07)
 - `R-25` is pasted-YAML only (legacy template platform syntax, removed in HA 2026.6); `M-05` is a modernize advisory for pre-2024.10 automation keys
 - Collision scan: `search/related` on top 3 target entities
 - Conflict analysis: 3-step test (polarity → temporal → guard conditions)
@@ -293,7 +389,7 @@ Rules:
 - `R-19` is branch-structure reachability only; it covers direct `trigger.id` checks in a terminal bare `else` after entity-state `if` / `elif` guards, without intent inference
 - `R-23` catches boolean-like templates compared to string boolean literals such as `"True"` / `"False"`
 - `R-24` is a low-severity capacity-source advisory when a capacity-like variable reads `available_energy`
-- `R-29` detects mutually exclusive fixed state requirements inside one conjunction scope; alternatives in OR scopes or separate branches are excluded
+- `R-31` detects mutually exclusive fixed state requirements inside one conjunction scope; alternatives in OR scopes or separate branches are excluded
 - Known safe/problem pattern matching from `skills/review/checks.md`
 - resolved targets `== 1`: stable 8-section single-target output (`Review target`, `Findings`, `Collision check`, `Conflicts`, `Questions to consider`, `Suggestions`, `Summary`, `Instant help`)
 - resolved targets `> 1`: switch to aggregate multi-target mode automatically, materialize and trim the current workset before any per-item reads, audit max 5 items in stable order, aggregate findings by pattern, and report `matched / audited / remaining`
@@ -309,11 +405,11 @@ Rules:
   - Transport: WS (`{type}/create`, `{type}/update`, `{type}/delete`)
   - Identity: `{type}_id` from `{type}/list`, not entity_id
   - Write verify: `{type}/list`
-  - Review: H-01..H-10 helper-specific checks + collision scan via `search/related`
+  - Review: H-01..H-11 helper-specific checks + collision scan via `search/related`
   - No domain reload needed
 
 - **Config-entry family**
-  - Types: `utility_meter`, `derivative`, `integration`, `min_max`, `threshold`, `tod`, `statistics`, `group`, `history_stats`, `template`
+  - Types: `utility_meter`, `derivative`, `integration`, `min_max`, `threshold`, `tod`, `statistics`, `group`, `history_stats`, `template`, `generic_thermostat`, `switch_as_x`
   - Read/list: WS `config_entries/get` + WS `config/entity_registry/list`
   - Readback: current editable options snapshot when `supports_options: true`; metadata-only fallback otherwise
   - Mutation transport: relay `/core`
@@ -321,22 +417,20 @@ Rules:
   - Update: options-flow loop with required-field carry-forward from the current editable options snapshot
   - Identity: `entry_id` is canonical; linked `entity_id` values are derived only
   - Write verify: config-entry layer first for identity/existence, reopened editable options snapshot for field-level update verification
-  - Review: minimal config-entry post-write contract, not H-01..H-10
+  - Review: minimal config-entry post-write contract (plus H-12/H-13/H-15 where readable), not H-01..H-11
   - `group` remains menu-driven; end-to-end support is proven for the `sensor` subtype, and other subtypes must stay anchored to the live step schema instead of guessed fields
 
 Still excluded from `ha-nova:helper`:
 - `trend`
 - `random`
 - `filter`
-- `generic_thermostat`
-- `switch_as_x`
 - `generic_hygrostat`
 
 ## Diagnose Architecture
 
 `ha-nova:diagnose` is the failure-root-cause skill (read-only apart from one gated mutation):
 - traces first (`ha-nova trace latest <entity_id> --json`, plus `trace list` / `trace get`) for automation/script symptoms
-- `/api/error_log` (plain text — read from file, never dump) and WS `system_log/list`
+- WS `system_log/list` as the primary log source; `/api/error_log` only where the log file exists (404 on HA OS/Supervised since 2025.11)
 - bounded logbook/history windows around the incident (default ±30 min)
 - `POST /api/template` to probe suspect conditions against live state
 - WS `diagnostics/list` + `/api/diagnostics/config_entry/<entry_id>` when an integration is the suspect
@@ -370,7 +464,7 @@ Rules: never invent a `media_content_id`; volume jumps and announcements are dis
 
 ## Camera Architecture
 
-`ha-nova:camera` owns camera access and is the first consumer of the relay's binary path (relay >= 0.3.0):
+`ha-nova:camera` owns camera access and is the first consumer of the relay's binary path (guaranteed at the enforced relay floor, `version.json` → `min_relay_version`):
 - frames via `GET /api/camera_proxy/<entity_id>` with `--out-binary` ONLY (`--out`/`--jq` would write the JSON envelope instead of an image)
 - stream URL via WS `camera/stream` (needs the STREAM feature bit)
 - `camera.snapshot` / `camera.record` write on the HA host and need `allowlist_external_dirs` — previewed and confirmed
@@ -378,17 +472,17 @@ Rules: never invent a `media_content_id`; volume jumps and announcements are dis
 
 ## MQTT Architecture
 
-`ha-nova:mqtt` owns MQTT work and is the first consumer of envelope window mode (relay >= 0.3.0):
+`ha-nova:mqtt` owns MQTT work and is the first consumer of envelope window mode (guaranteed at the enforced relay floor):
 - listening is a bounded WINDOW (`mqtt/subscribe` inside `collect_events` with `on_limit: "return"`), never a stream; the relay unsubscribes when it closes
 - an empty window is a real answer ("nothing published"), reported as one — an `UPSTREAM_WS_TIMEOUT` (subscription never established) is a different finding
 - discovery/debug via WS `mqtt/device/debug_info` (device_id from the registry, never guessed)
-- publishing is guarded: retained messages and command/`set` topics take the typed token, because they persist on the broker or actuate hardware
+- publishing is guarded: retained messages and command/`set` topics take the typed confirmation code, because they persist on the broker or actuate hardware
 
 ## Assist Architecture
 
 `ha-nova:assist` owns Home Assistant's voice assistant:
 - utterance testing through `POST /api/conversation/process` — the flagship capability, and a LIVE command: it executes what it understands, so anything state-changing is previewed and confirmed like a service call
-- pipelines via WS `assist_pipeline/pipeline/*` (update resends every settings field addressed by `pipeline_id`; delete is tokenized because a satellite may depend on it)
+- pipelines via WS `assist_pipeline/pipeline/*` (update resends every settings field addressed by `pipeline_id`; delete is code-gated because a satellite may depend on it)
 - voice exposure via WS `homeassistant/expose_entity[/list]`
 - engine inventories: `tts/engine/list`, `stt/engine/list`, `conversation/agent/list`, `wake_word/info`
 - `assist_pipeline/run` stays out of reach: it is an audio subscription, not request/response
@@ -398,13 +492,13 @@ Rules: never invent a `media_content_id`; volume jumps and announcements are dis
 `ha-nova:admin` owns persons, zones, tags, and user accounts:
 - persons/zones/tags via WS `person/*`, `zone/*`, `tag/*` (updates resend every mutable field, addressed by the `*_id` key)
 - zones are presence infrastructure: every zone change runs `search/related` first and names the automations that depend on it, in the preview
-- users via WS `config/auth/*` — the strictest writes in HA NOVA: owner, system-generated, and the relay's own account are refused outright; everything else needs the typed token
+- users via WS `config/auth/*` — the strictest writes in HA NOVA: owner, system-generated, and the relay's own account are refused outright; everything else needs the typed confirmation code
 - passwords and auth providers stay in the Home Assistant UI on purpose
 
 ## YAML Config Architecture
 
-`ha-nova:yaml-config` owns configuration that has no API, through the relay's opt-in file access (relay >= 0.4.0):
-- read -> diff -> confirm -> `write_file` (automatic `.bak`) -> `POST /api/config/core/check_config` -> targeted reload -> verify the entity in `/api/states`
+`ha-nova:yaml-config` owns configuration that has no API, through the relay's opt-in file access. The current release enforces Relay >= 0.9.0:
+- read -> File-Change Preview (effect sentences + the changed section only, never a unified diff) -> confirm -> `write_file` (automatic `.bak`) -> `POST /api/config/core/check_config` -> targeted reload -> verify the entity in `/api/states`
 - an invalid `check_config` restores the `.bak` BEFORE reporting, and never reloads
 - whole-file replacement: never write a file that was not read first
 - when `file_access` is off (the default), the skill degrades to producing the exact YAML block plus the two commands to apply it — a fully supported path, not a failure
@@ -480,15 +574,21 @@ Scope → Bootstrap (once per session) → Relay Contract → [domain] → Flow 
 
 **Required for ALL sub-skills:**
 - **Scope** — what this skill does + inverse scope (what it does NOT do, which skill to use instead)
-- **Bootstrap (once per session)** — exact heading; relay CLI verification + onboarding fallback
+- **Bootstrap (once per session)** — exact heading; shared
+  `../ha-nova/session-bootstrap.md` pointer, relay CLI verification, and
+  onboarding fallback. The shared contract synchronously checks HA NOVA and
+  the selected server's Relay update state before the first HA task, then
+  keeps any callouts post-task and once-per-session.
 - **Relay Contract** — the file-based `ha-nova relay` command contract this skill uses
 - **Flow** — step-by-step operations with relay commands
 - **Output Format** — first line starts with ``Apply `skills/ha-nova/output-rules.md` `` ; then what the user receives
 - **Safety** — risk mitigations, confirmation rules, relay-only constraint
 
-**Required for config-persisting skills** (write, helper):
+**Required for behavior-config-persisting skills** (write, helper):
 - **Post-Write Review** — mandatory inline review phase after every create/update/delete (a Flow phase, not a separate H2)
 - **References** — links to schema docs, relay API, review checks
+
+`integration-setup` persists config entries through Home Assistant-owned flows. It verifies the resulting config entry instead of applying automation/helper quality checks.
 
 **Optional:**
 - **Error Handling** — error classification + remediation (recommended for external calls); when present it sits directly before Output Format
@@ -496,8 +596,8 @@ Scope → Bootstrap (once per session) → Relay Contract → [domain] → Flow 
 - **Latency Policy** — when to optimize for speed
 
 **Declared deviations** (the only allowed ones):
-- `onboarding` — heading `## Bootstrap` (it repairs the relay; "once per session" would be wrong) and no `Relay Contract` section (the diagnostics skill's whole body is remediation commands)
-- `fallback` — heading `## Bootstrap (only before Relay-Ready calls)`
+- `onboarding` — heading `## Bootstrap` (it repairs the relay; "once per session" would be wrong), applies the shared session bootstrap only when the CLI exists, and has no `Relay Contract` section (the diagnostics skill's whole body is remediation commands)
+- `fallback` — heading `## Bootstrap (before Home Assistant tasks)`; the shared session bootstrap applies before Home Assistant work, while Roadmap/External guidance needs no Relay probe
 
 **Forbidden heading variants** (normalized in 2026-07, must not return): `## Output Rules`, `## Safety Baseline` (sub-skills; the context skill keeps its own), `## Safety Guardrails`, `## Agent Flow`.
 
@@ -509,13 +609,13 @@ Scope → Bootstrap (once per session) → Relay Contract → [domain] → Flow 
 
 ### Safety Core (canonical text)
 
-Every mutation-capable sub-skill opens its `## Safety` section with this block, byte-identical (linter-enforced; the linter extracts this fenced block as the SSOT). It carries the bootstrap-independent guarantees — preview binding, delete tokenization, and the fallback write gate — so a bare agent that never auto-loads the context skill still gets them:
+Every mutation-capable sub-skill opens its `## Safety` section with this block, byte-identical (linter-enforced; the linter extracts this fenced block as the SSOT). It carries the bootstrap-independent guarantees — preview binding, delete confirmation-code gating, and the fallback write gate — so a bare agent that never auto-loads the context skill still gets them:
 
 ```text
 - Preview before write: nothing is saved until the user confirms the shown preview.
 - Confirmation binds to the displayed preview and expires on any change to target, payload, endpoint, or scope (context skill → Active Preview Confirmation).
 - Pre-preview phrases ("do it", "go ahead", "implement the plan") authorize drafting and preview only — never the write itself.
-- Delete and destructive operations require the typed token `confirm:<token>` verbatim; "yes" or any natural-language reply is invalid.
+- Delete and destructive operations require the typed confirmation code `confirm:<token>` verbatim; "yes" or any natural-language reply is invalid.
 - Never guess entity, service, or config IDs — resolve them or ask.
 - Home Assistant is reached exclusively through `ha-nova relay`.
 - For any HA write this skill does not cover, STOP and invoke `ha-nova:fallback` first — never probe unfamiliar write endpoints.
@@ -530,7 +630,7 @@ Read-only sub-skills open `## Safety` with this block instead:
 
 Skill-specific safety bullets follow the core block; bullets that merely restate a core line are removed, domain nuances (confirmation tiering, no-revert notes, session-cleanup rules) stay.
 
-A skill may declare an explicit, named exception to a single core bullet directly below the core block — it must reference the core rule it narrows ("Declared exception to the core ... rule above") so a bare agent never sees two contradicting instructions. Current declared exceptions: `todo` item removes (`todo.remove_item`, `todo.remove_completed_items`) stay at natural preview confirmation; list deletion keeps the typed token.
+A skill may declare an explicit, named exception to a single core bullet directly below the core block — it must reference the core rule it narrows ("Declared exception to the core ... rule above") so a bare agent never sees two contradicting instructions. Current declared exceptions: `todo` item removes (`todo.remove_item`, `todo.remove_completed_items`) stay at natural preview confirmation while list deletion keeps the typed confirmation code; `integration-setup` may delete only an unfinished add flow that it started when a credential, external/OAuth, or progress step requires a UI restart.
 
 ## Post-Write Review Standard
 
@@ -557,6 +657,8 @@ After any mutation (automation, script, or helper):
    - Omit any section with nothing to report — never print an empty "none" bucket. When all are empty, collapse to one scope-honest confirmation line (write-safety → Verification Honesty; never a bare "verified").
    - Do not emit `Questions to consider`, `Suggestions`, or `Instant help` in post-write mode.
 
+After the review, the `write` skill offers a structured test plan (feasibility, one recommended option, single bound confirmation) per `skills/ha-nova/test-run.md` (Phase 5: Test Offer) — offer only; execution follows `ha-nova:service-call` → Automation And Script Runtime Calls. The `helper` skill keeps the plain Verification Honesty offer.
+
 ## Adding a New Skill — Checklist
 
 When creating a new skill under `skills/{name}/SKILL.md`:
@@ -569,14 +671,14 @@ When creating a new skill under `skills/{name}/SKILL.md`:
 6. `docs/reference/skill-architecture.md` — add to skill tree + add Architecture section
 7. `docs/reference/skill-architecture.md` — add to Agent vs Inline table
 8. `scripts/onboarding/install-local-skills.sh` — verify dynamic discovery picks up new skill
-9. `README.md` / `PROJECT.md` — add skill to overview table/list
-10. `version.json` — bump patch version
+9. `PROJECT.md` — update the active inventory; defer `README.md` feature claims to the release-prep PR
+10. `version.json` — bump only in the release-prep PR that publishes the skill
 11. For file-based clients, re-run `npm run dev:install:<client>-skill` and start a new session. Use `npm run dev:sync` only when you need the Claude cache sync helper or already have a repo-local install to refresh.
 
 ## Review Check Single Source of Truth
 
 `skills/review/SKILL.md` is the stable review entrypoint for standalone reviews (workflow, output shape, collision/conflict analysis).
-`skills/review/checks.md` is the authoritative, self-contained source for the detailed review catalog (S/R/P/M/F/H) plus its `## Application` section (family matrix, evidence boundaries, live-helper evidence).
+`skills/review/checks.md` is the authoritative, self-contained source for the detailed review catalog (S/R/P/M/F/H/SC/D/HX/TS) plus its `## Application` section (family matrix, evidence boundaries, live-helper evidence).
 There is deliberately no review agent template: `write` and `helper` run their post-write review inline against `skills/review/checks.md` only — they no longer load the standalone review workflow.
 When adding or modifying checks, update `skills/review/checks.md` first and keep `skills/review/SKILL.md` aligned as the facade/workflow file.
 
@@ -589,6 +691,10 @@ Review checks use the format `{CATEGORY}-{NN}`:
 - `M` = Style
 - `F` = Script-specific
 - `H` = Helper-specific
+- `SC` = Scene-specific
+- `D` = Dashboard-specific
+- `HX` = Cross-item
+- `TS` = YAML-sensor-specific
 
 `NN` is the running rule number inside that family. Severity is separate from the code.
 
@@ -603,7 +709,7 @@ These codes are contributor-facing/internal only. User-facing output must use lo
 Global safety expectations:
 - no guessed ids
 - preview before any write
-- delete requires tokenized confirmation
+- delete requires typed confirmation code
 - pre-preview approval is never write confirmation; live writes require confirmation after the concrete preview/diff/payload/manifest is shown
 - multi-target writes require a grouped manifest only where the owning skill already supports multi-target writes; otherwise process targets sequentially
 - structured failure output: what failed / why / next step

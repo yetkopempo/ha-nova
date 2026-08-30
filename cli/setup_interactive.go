@@ -13,7 +13,6 @@ import (
 var resolveHAURLBaseForSetup = resolveHomeAssistantURLBase
 var probeHTTPForSetup = probeHTTP
 var fetchRelayHealthForSetup = fetchRelayHealth
-var detectDefaultHAHostForSetup = detectDefaultHAHost
 var probeRelayWSPingForSetup = probeRelayWSPing
 var readRelayAuthTokenForSetup = readRelayAuthToken
 
@@ -34,21 +33,65 @@ func printRelayTokenStorageSetupWarning(err error) {
 	}
 }
 
-func maybeHandleInteractiveSetupCurrentState(reader *bufio.Reader, out io.Writer, paths runtimePaths, cfg runtimeConfig, current setupState, overrideApplied bool) (bool, int) {
+func maybeHandleInteractiveSetupCurrentState(reader *bufio.Reader, out io.Writer, paths runtimePaths, cfg runtimeConfig, current setupState, overrideApplied, serviceMode bool, lifecycleMarker ...[]byte) (bool, int) {
 	if !(current.ConfigOK || current.TokenOK || current.RelayOK || current.WSOK || current.SkillsOK) {
 		return false, 0
 	}
 
 	renderSetupHeader(out)
 	renderSetupStatusSummary(out, current)
+	if cfg.Cloud != nil && !cloudRemoteFeatureAvailable() {
+		fmt.Fprintln(
+			out,
+			"  Home Assistant Cloud access is unavailable because this build or platform has Cloud setup disabled.",
+		)
+		renderCloudCheckpointActions(out, paths, cfg, false)
+		return true, 1
+	}
 	if current.IsComplete() {
 		if overrideApplied {
-			if err := saveConfig(paths, cfg); err != nil {
+			if err := ensureProfileIdentityForSetup(paths, &cfg); err != nil {
+				printHumanErr("cannot prepare the server profile identity: %s", err)
+				return true, 1
+			}
+			if err := saveSetupConfigWithLifecycle(paths, cfg, lifecycleMarker...); err != nil {
 				printHumanErr("cannot save config: %s", err)
 				return true, 1
 			}
 		}
-		renderSetupAlreadyDoneBanner(out)
+		var cloudAttempted bool
+		var cloudCode int
+		cfg, cloudAttempted, cloudCode = maybeOfferCloudForCompletedSetup(reader, out, paths, cfg, serviceMode, lifecycleMarker...)
+		if cloudAttempted && cloudCode != 0 {
+			return true, cloudCode
+		}
+		if cloudAttempted && cfg.Cloud != nil && !cfg.Cloud.ready() {
+			return true, cloudCode
+		}
+		// Offered before completeSetupLifecycle so the add flow's config
+		// saves run under the same lifecycle marker as this setup pass.
+		addAttempted, addCode := maybeOfferAddServerForCompletedSetup(reader, out, paths, serviceMode, lifecycleMarker...)
+		if addAttempted && addCode != 0 {
+			return true, addCode
+		}
+		if err := completeSetupLifecycle(paths, lifecycleMarker...); err != nil {
+			printHumanErr("cannot finalize setup lifecycle: %s", err)
+			return true, 1
+		}
+		// Same suppression as the done banner below: after a ran add flow
+		// its own closing lines are the message — never bury a cancelled or
+		// partial add under a success banner.
+		if !addAttempted && cloudAttempted && cfg.Cloud.ready() &&
+			cfg.RoutePolicy == routePolicyAutomatic {
+			renderSetupCloudFallbackReadyBanner(out)
+			return true, 0
+		}
+		// After a ran add flow (success or cancel) its own closing lines are
+		// the message — the already-done banner would bury a cancelled or
+		// partial add under "Everything is already set up!".
+		if !addAttempted {
+			renderSetupAlreadyDoneBanner(out, cfg.RelaySecureBaseURL == "" && cfg.RelayBaseURL != "")
+		}
 		return true, 0
 	}
 	if summary := current.SkipSummary(); summary != "" {
@@ -66,6 +109,26 @@ func maybeHandleInteractiveSetupCurrentState(reader *bufio.Reader, out io.Writer
 		}
 	}
 	return false, 0
+}
+
+func saveSetupConfigWithLifecycle(paths runtimePaths, cfg runtimeConfig, lifecycleMarker ...[]byte) error {
+	return withSetupLifecycleLock(paths, lifecycleMarker, func() error {
+		return saveConfig(paths, cfg)
+	})
+}
+
+func saveSetupConfigWithLifecycleUnlocked(
+	paths runtimePaths,
+	cfg runtimeConfig,
+	lifecycleMarker ...[]byte,
+) error {
+	if err := ensureSetupLifecycleCurrent(paths, lifecycleMarker...); err != nil {
+		return err
+	}
+	if err := saveConfig(paths, cfg); err != nil {
+		return err
+	}
+	return refreshSetupConfigSnapshot(paths, lifecycleMarker)
 }
 
 func promptYesNoFromReader(reader *bufio.Reader, out io.Writer, label string, defaultYes bool) (bool, error) {
@@ -91,14 +154,14 @@ func maskSecretHint(value string) string {
 	return "***" + value[len(value)-4:]
 }
 
-func interactiveSetup(paths runtimePaths, cfg runtimeConfig, state installState, target string, hostFlag, haURLFlag, relayURLFlag, relayTokenFlag string, serviceMode bool) int {
+func interactiveSetup(paths runtimePaths, cfg runtimeConfig, state installState, target string, hostFlag, haURLFlag, relayURLFlag, relayTokenFlag string, serviceMode bool, lifecycleMarker ...[]byte) int {
 	const (
 		setupStageClient = iota
 		setupStageSecureStorageRecovery
 		setupStageHost
 		setupStageRelayInstall
 		setupStageToken
-		setupStageLLAT
+		setupStagePairing
 		setupStageVerify
 		setupStageSkills
 	)
@@ -111,6 +174,86 @@ func interactiveSetup(paths runtimePaths, cfg runtimeConfig, state installState,
 		// Flag-driven runs are not fully interactive first runs even before
 		// the overrides are applied to cfg below — skip the intro for them.
 		renderSetupIntro(os.Stdout)
+	}
+	namedRetirementOnly := false
+	retirementPending := false
+	if activeServerProfile() != defaultServerProfileName {
+		var retirementErr error
+		retirementPending, retirementErr =
+			deviceCredentialRetirementCheckpointExistsForProfile(
+				paths,
+				activeServerProfile(),
+			)
+		if retirementErr != nil {
+			printHumanErr(
+				"cannot inspect interrupted device credential retirement: %s",
+				retirementErr,
+			)
+			return 1
+		}
+		namedRetirementOnly = namedSetupIsRetirementOnly(
+			cfg,
+			retirementPending,
+		)
+	}
+	namedRequestAllowed := namedSetupRequestAllowed(
+		cfg,
+		retirementPending,
+		target,
+		serviceMode,
+		hostFlag,
+		haURLFlag,
+		relayURLFlag,
+		relayTokenFlag,
+	)
+	explicitLocalSetup := serviceMode ||
+		strings.TrimSpace(hostFlag) != "" ||
+		strings.TrimSpace(haURLFlag) != "" ||
+		strings.TrimSpace(relayURLFlag) != "" ||
+		strings.TrimSpace(relayTokenFlag) != ""
+	var cloudRecoveryHandled bool
+	var cloudRecoveryCode int
+	cfg, cloudRecoveryHandled, cloudRecoveryCode =
+		handleInteractiveCloudRecoveryBeforeClients(
+			reader,
+			os.Stdout,
+			paths,
+			cfg,
+			serviceMode,
+			explicitLocalSetup,
+			lifecycleMarker...,
+		)
+	if cloudRecoveryHandled {
+		return cloudRecoveryCode
+	}
+	if !namedRequestAllowed {
+		renderNamedSetupRequestError()
+		return 1
+	}
+	if err := resumeSetupDeviceCredentialRetirement(paths, cfg); err != nil {
+		printHumanErr(
+			"cannot finish the interrupted device credential retirement: %s",
+			err,
+		)
+		return 1
+	}
+	if namedRetirementOnly {
+		return 0
+	}
+	resumedActivation, resumeActivationErr :=
+		resumeInteractiveSetupPendingActivation(
+			paths,
+			&cfg,
+			lifecycleMarker...,
+		)
+	if resumeActivationErr != nil {
+		printPendingActivationResumeError(resumeActivationErr)
+		return 1
+	}
+	if resumedActivation {
+		printHumanInfo(
+			"Resumed the interrupted pairing — this device is connected.",
+		)
 	}
 	choices, err := buildSetupClientChoices(paths, state)
 	if err != nil {
@@ -128,42 +271,113 @@ func interactiveSetup(paths runtimePaths, cfg runtimeConfig, state installState,
 	existingToken := strings.TrimSpace(relayTokenFlag)
 
 	promptedClient := false
-	if target == "" {
-		for {
-			answer, err := promptSetupClientInteractive(reader, os.Stdout, choices, "claude")
-			if err == errSetupBack {
-				continue
+	clientsResolved := false
+	connectionMode := setupConnectionLocal
+	connectionModePrompted := false
+	for {
+		if target == "" {
+			answer, selectErr := promptSetupClientForWizard(
+				reader,
+				os.Stdout,
+				choices,
+			)
+			if selectErr == errSetupClientPrerequisite {
+				return 0
 			}
-			if err == errSetupExit {
+			if selectErr == errSetupExit {
 				renderSetupCancelledNote(os.Stdout)
 				return 0
 			}
-			if err != nil {
-				printHumanErr("%s", err)
+			if selectErr != nil {
+				printHumanErr("%s", selectErr)
 				return 1
 			}
 			target = answer
-			selectedClients, skippedClients, err = resolveSetupClientsWithChoices(choices, target)
+			promptedClient = true
+			clientsResolved = false
+		}
+		if !clientsResolved {
+			selectedClients, skippedClients, err = resolveSetupClientsWithChoices(
+				choices,
+				target,
+			)
 			if err != nil {
 				printHumanErr("%s", err)
 				return 1
 			}
+			clientsResolved = true
+		}
+
+		if remoteOnlyCloudSetup(cfg) && !explicitLocalSetup {
+			return resumeInteractiveCloudOnlySetup(
+				reader,
+				os.Stdout,
+				paths,
+				cfg,
+				&state,
+				target,
+				selectedClients,
+				skippedClients,
+				lifecycleMarker...,
+			)
+		}
+
+		connectionMode = setupConnectionLocal
+		if hybridCloudSetupPending(cfg) {
+			connectionMode = setupConnectionHybrid
+		}
+		if !shouldOfferSetupConnectionMode(
+			cfg,
+			hostFlag,
+			haURLFlag,
+			relayURLFlag,
+			relayTokenFlag,
+			serviceMode,
+		) {
 			break
 		}
-		promptedClient = true
-	} else {
-		var err error
-		selectedClients, skippedClients, err = resolveSetupClientsWithChoices(choices, target)
+		connectionModePrompted = true
+		connectionMode, err = promptSetupConnectionMode(reader, os.Stdout)
+		if err == errSetupBack {
+			target = ""
+			selectedClients = nil
+			skippedClients = nil
+			clientsResolved = false
+			continue
+		}
+		if err == errSetupExit {
+			renderSetupCancelledNote(os.Stdout)
+			return 0
+		}
 		if err != nil {
 			printHumanErr("%s", err)
 			return 1
 		}
+		if connectionMode != setupConnectionCloud {
+			break
+		}
+		exit, back := runInteractiveCloudOnlySetupForWizard(
+			reader,
+			os.Stdout,
+			paths,
+			cfg,
+			&state,
+			target,
+			selectedClients,
+			skippedClients,
+			lifecycleMarker...,
+		)
+		if back {
+			continue
+		}
+		return exit
 	}
 
 	restoreTokenFileOverride := func() {}
 	defer func() {
 		restoreTokenFileOverride()
 	}()
+	setupChanged := resumedActivation
 	formerServiceTokenFile := ""
 	formerServiceToken := ""
 	if !serviceMode {
@@ -179,6 +393,24 @@ func interactiveSetup(paths runtimePaths, cfg runtimeConfig, state installState,
 		if err := requireSelectedClientServiceCredentials(paths, selectedClients); err != nil {
 			printHumanErr("%s", err)
 			return 1
+		}
+		// Only after the service target and client checks passed: a re-setup
+		// with a healthy keyring pairing short-circuits to verify and never
+		// reaches the pairing stage, so a readable keyring device credential
+		// migrates to the private-file backend now (the service contract).
+		migrated := false
+		migrateErr := withSetupLifecycleLock(paths, lifecycleMarker, func() error {
+			var err error
+			migrated, err = migrateKeyringDeviceCredentialToFile()
+			return err
+		})
+		if migrateErr != nil {
+			printHumanErr("cannot move the device credential into service file storage: %s", migrateErr)
+			return 1
+		}
+		if migrated {
+			setupChanged = true
+			printHumanInfo("Moved this install's device credential into protected service file storage.")
 		}
 		// Read any already-stored token BEFORE the file override redirects
 		// token reads, so an existing desktop-keyring token can be offered
@@ -221,7 +453,10 @@ func interactiveSetup(paths runtimePaths, cfg runtimeConfig, state installState,
 			}
 		}
 	}
-	if tokenStoragePreflightErr == nil {
+	// Set when the missing-keyring error is downgraded below: the legacy /pair
+	// token store is unavailable, so the pairing stage must not fall back to it.
+	legacyTokenStoreUnavailable := false
+	if tokenStoragePreflightErr == nil && !hybridCloudSetupPending(cfg) {
 		if savedToken, err := readRelayAuthTokenForSetup(); err == nil && strings.TrimSpace(savedToken) != "" {
 			savedTokenBeforeSetup = strings.TrimSpace(savedToken)
 			hadSavedTokenBeforeSetup = true
@@ -232,9 +467,41 @@ func interactiveSetup(paths runtimePaths, cfg runtimeConfig, state installState,
 			printRelayTokenStorageSetupWarning(err)
 		}
 	} else if !setupSecureStorageRecoveryAvailableNow(tokenStoragePreflightErr) {
-		printRelayTokenStorageSetupWarning(tokenStoragePreflightErr)
-		printHumanErr("%s", relayAuthTokenSetupSaveError(tokenStoragePreflightErr))
-		return 1
+		// A missing OS keyring is only fatal when a relay TOKEN must actually be
+		// stored. The default onboarding path is secure device pairing, which
+		// brings its own file-backed credential storage (device_credential_storage.go),
+		// so a headless box (container/SSH with no Secret Service) must still reach
+		// the pairing stage instead of exiting here on the legacy-token preflight.
+		// Only an explicit --relay-token makes the token path mandatory here:
+		// service installs default to secure pairing as well (file-backed device
+		// credential), so a missing keyring must not abort their onboarding.
+		tokenPathRequired := strings.TrimSpace(relayTokenFlag) != ""
+		noKeyringBackend := isDesktopKeyringSessionUnavailableError(tokenStoragePreflightErr) ||
+			isDesktopKeyringUnavailableError(tokenStoragePreflightErr)
+		// The default onboarding path is secure device pairing, which brings its
+		// own file-backed credential storage — no keyring needed. So a missing
+		// keyring must not abort here; let the wizard reach the pairing stage,
+		// where the relay URL is known. The legacy /pair fallback (which DOES need
+		// a keyring token store) is guarded there, failing before it consumes a
+		// one-time code — see runSetupPairingFlow. Deciding it here is impossible
+		// for the plain interactive flow, which discovers the relay URL later.
+		deviceStorageViable := false
+		if !tokenPathRequired && noKeyringBackend {
+			_ = withSetupLifecycleLock(paths, lifecycleMarker, func() error {
+				deviceStorageViable = deviceCredentialStorageViable()
+				return nil
+			})
+		}
+		if !tokenPathRequired && noKeyringBackend && deviceStorageViable {
+			printRelayTokenStorageSetupWarning(tokenStoragePreflightErr)
+			printHumanInfo("No OS keyring is reachable here — this device will pair with secure file-backed storage instead of a shared token.")
+			tokenStoragePreflightErr = nil
+			legacyTokenStoreUnavailable = true
+		} else {
+			printRelayTokenStorageSetupWarning(tokenStoragePreflightErr)
+			printHumanErr("%s", relayAuthTokenSetupSaveError(tokenStoragePreflightErr))
+			return 1
+		}
 	}
 	if existingToken == "" {
 		existingToken = savedTokenBeforeSetup
@@ -248,8 +515,9 @@ func interactiveSetup(paths runtimePaths, cfg runtimeConfig, state installState,
 		existingToken = formerServiceToken
 	}
 
+	// Activation recovery above intentionally ran before applying unconfirmed
+	// local endpoint overrides.
 	overrideApplied := strings.TrimSpace(hostFlag) != "" || strings.TrimSpace(haURLFlag) != "" || strings.TrimSpace(relayURLFlag) != ""
-	skipLLATWalkthrough := strings.TrimSpace(hostFlag) != "" && strings.TrimSpace(relayTokenFlag) != ""
 	if overrideApplied {
 		var err error
 		cfg, err = applySetupFlagOverrides(cfg, hostFlag, haURLFlag, relayURLFlag)
@@ -259,20 +527,51 @@ func interactiveSetup(paths runtimePaths, cfg runtimeConfig, state installState,
 		}
 	}
 
-	current := detectSetupStateWithToken(paths, cfg, state, target, savedTokenBeforeSetup, hadSavedTokenBeforeSetup)
+	current := detectSetupStateForAssessment(paths, cfg, state, target, savedTokenBeforeSetup, hadSavedTokenBeforeSetup)
 	if tokenStoragePreflightErr == nil {
-		if handled, code := maybeHandleInteractiveSetupCurrentState(reader, os.Stdout, paths, cfg, current, overrideApplied); handled {
+		currentLifecycleMarker := lifecycleMarker
+		if !setupChanged && !overrideApplied &&
+			!(len(lifecycleMarker) > 1 && len(lifecycleMarker[1]) > 0) {
+			currentLifecycleMarker = nil
+		}
+		if handled, code := maybeHandleInteractiveSetupCurrentState(reader, os.Stdout, paths, cfg, current, overrideApplied, serviceMode, currentLifecycleMarker...); handled {
+			if code == 0 && current.IsComplete() {
+				askCensusIfEligible(paths, "setup", reader, os.Stdout)
+			}
 			return code
 		}
 	}
 
+	pairingFlow := false
+	pairingCredentialReceived := false
+	devicePaired := false
+	manualCredentialFlow := false
+	pairingBackStage := setupStageRelayInstall
+	cloudSetupIncomplete := false
+	cloudSetupPaused := false
+	// Service installs pair by default too: secure pairing no longer depends on
+	// a desktop keyring (the service path forces the file backend at the pairing
+	// stage), and the legacy token flow costs manual HA UI steps. Only an
+	// explicit --relay-token or an already-stored token keeps the token path.
+	usePairingByDefault := func() bool {
+		return connectionMode == setupConnectionHybrid ||
+			(strings.TrimSpace(relayTokenFlag) == "" &&
+				strings.TrimSpace(existingToken) == "")
+	}
 	stage := setupStageHost
 	if tokenStoragePreflightErr != nil {
 		stage = setupStageSecureStorageRecovery
 	}
+	// A device credential from an earlier pairing makes this a paired install:
+	// re-runs (adding a client, finishing an interrupted setup) verify the
+	// existing pairing instead of demanding a fresh code every time.
+	_, _, _, deviceAlreadyPaired, _ := relayFunctionalTransportForDoctor(cfg)
 	verifyFirstReuseFlow := false
 	if stage != setupStageSecureStorageRecovery && cfg.HAHost != "" && cfg.HAURL != "" {
 		switch {
+		case deviceAlreadyPaired:
+			devicePaired = true
+			stage = setupStageVerify
 		case existingToken != "" && current.RelayOK && !current.WSOK:
 			stage = setupStageVerify
 			verifyFirstReuseFlow = true
@@ -284,7 +583,12 @@ func interactiveSetup(paths runtimePaths, cfg runtimeConfig, state installState,
 				verifyFirstReuseFlow = true
 			}
 		default:
-			stage = setupStageToken
+			if usePairingByDefault() {
+				pairingFlow = true
+				stage = setupStagePairing
+			} else {
+				stage = setupStageToken
+			}
 		}
 	}
 
@@ -367,21 +671,28 @@ func interactiveSetup(paths runtimePaths, cfg runtimeConfig, state installState,
 			if strings.TrimSpace(relayTokenFlag) == "" {
 				existingToken = savedTokenBeforeSetup
 			}
-			current = detectSetupStateWithToken(paths, cfg, state, target, savedTokenBeforeSetup, hadSavedTokenBeforeSetup)
+			current = detectSetupStateForAssessment(paths, cfg, state, target, savedTokenBeforeSetup, hadSavedTokenBeforeSetup)
 			if current.IsComplete() {
 				if overrideApplied {
-					if err := saveConfig(paths, cfg); err != nil {
+					if err := saveSetupConfigWithLifecycle(paths, cfg, lifecycleMarker...); err != nil {
 						printHumanErr("cannot save config: %s", err)
 						return 1
 					}
 				}
-				renderSetupAlreadyDoneBanner(os.Stdout)
+				renderSetupAlreadyDoneBanner(os.Stdout, cfg.RelaySecureBaseURL == "" && cfg.RelayBaseURL != "")
 				return 0
 			}
 			stage = setupStageHost
 			verifyFirstReuseFlow = false
+			// Secure storage just became readable: the pre-recovery transport
+			// resolution is stale. A paired device found NOW routes to verify —
+			// demanding a fresh code here would undo the point of recovery.
+			_, _, _, deviceAlreadyPaired, _ = relayFunctionalTransportForDoctor(cfg)
 			if cfg.HAHost != "" && cfg.HAURL != "" {
 				switch {
+				case deviceAlreadyPaired:
+					devicePaired = true
+					stage = setupStageVerify
 				case existingToken != "" && current.RelayOK && !current.WSOK:
 					stage = setupStageVerify
 					verifyFirstReuseFlow = true
@@ -393,22 +704,38 @@ func interactiveSetup(paths runtimePaths, cfg runtimeConfig, state installState,
 						verifyFirstReuseFlow = true
 					}
 				default:
-					stage = setupStageToken
+					if usePairingByDefault() {
+						pairingFlow = true
+						stage = setupStagePairing
+					} else {
+						stage = setupStageToken
+					}
 				}
 			}
 			continue
 
 		case setupStageHost:
-			defaultHost := ""
+			var host string
+			var haURL string
+			var err error
 			if hostChangeRetry {
 				// The user just rejected the saved address — don't spend the
 				// discovery window re-confirming it or offer it back as the
 				// press-Enter default.
 				renderSetupParagraph(os.Stdout, fmt.Sprintf("The saved address %s could not be used. Enter a new one.", cfg.HAURL))
+				host, haURL, err = promptValidHAHostFromReader(reader, os.Stdout, "")
 			} else {
-				defaultHost, _ = detectDefaultHAHostWithFeedback(os.Stdout, cfg)
+				candidate, selected, discoveryErr := selectDefaultHAHostWithFeedback(reader, os.Stdout, cfg)
+				switch {
+				case discoveryErr != nil:
+					err = discoveryErr
+				case selected:
+					host = candidate.Host
+					haURL = candidate.HAURL
+				default:
+					host, haURL, err = promptValidHAHostFromReader(reader, os.Stdout, candidate.Host)
+				}
 			}
-			host, haURL, err := promptValidHAHostFromReader(reader, os.Stdout, defaultHost)
 			if err == errSetupBack {
 				if hostChangeRetry {
 					hostChangeRetry = false
@@ -447,7 +774,7 @@ func interactiveSetup(paths runtimePaths, cfg runtimeConfig, state installState,
 				// repository/app/token steps. Save the corrected address
 				// now so it survives an exit before verification succeeds.
 				hostChangeRetry = false
-				if err := saveConfig(paths, cfg); err != nil {
+				if err := saveSetupConfigWithLifecycle(paths, cfg, lifecycleMarker...); err != nil {
 					printHumanErr("cannot save config: %s", err)
 					return 1
 				}
@@ -459,8 +786,7 @@ func interactiveSetup(paths runtimePaths, cfg runtimeConfig, state installState,
 					// A fresh-flow host change abandons the flag-driven or
 					// pasted-token shortcut: the corrected address may be a
 					// different instance that still needs the repository/app
-					// install and the access-token walkthrough.
-					skipLLATWalkthrough = false
+					// install and client credential setup.
 					verifyFirstReuseFlow = false
 				}
 				hostChangeRetry = false
@@ -468,7 +794,11 @@ func interactiveSetup(paths runtimePaths, cfg runtimeConfig, state installState,
 			}
 
 		case setupStageRelayInstall:
-			steps := buildSetupWizardSteps(true)
+			pairAfterInstall := usePairingByDefault()
+			steps := buildSetupWizardSteps()
+			if pairAfterInstall {
+				steps = buildSetupPairingWizardSteps()
+			}
 			renderSetupStep(os.Stdout, steps.RelayInstall, steps.Total, "Install NOVA Relay in Home Assistant")
 			repositoryURL := haAddRepositoryURL(cfg.HAURL)
 			renderSetupParagraph(os.Stdout,
@@ -494,9 +824,9 @@ func interactiveSetup(paths runtimePaths, cfg runtimeConfig, state installState,
 				"1. Go to Settings > Apps > App Store (on older Home Assistant: Settings > Add-ons)",
 				`2. Search for "NOVA Relay"`,
 				"3. Click Install and wait for it to finish",
-				"   (don't start the app yet — we'll set up the tokens first)",
+				"4. Click Start",
 			)
-			_, err = promptWizardLineFromReader(reader, os.Stdout, "Press Enter when the installation is complete", "")
+			_, err = promptWizardLineFromReader(reader, os.Stdout, "Press Enter when the app is running", "")
 			if err == errSetupBack {
 				stage = setupStageHost
 				continue
@@ -509,9 +839,26 @@ func interactiveSetup(paths runtimePaths, cfg runtimeConfig, state installState,
 				printHumanErr("%s", err)
 				return 1
 			}
-			stage = setupStageToken
+			if pairAfterInstall {
+				if deviceAlreadyPaired {
+					// An earlier pairing already gave this device its own
+					// credential: verify it against the (re)installed relay
+					// first — a failed verify still routes back to pairing.
+					devicePaired = true
+					stage = setupStageVerify
+					continue
+				}
+				pairingFlow = true
+				pairingBackStage = setupStageRelayInstall
+				stage = setupStagePairing
+			} else {
+				stage = setupStageToken
+			}
 
 		case setupStageToken:
+			// Any route into the token stage is the legacy path by definition:
+			// verify must judge the token, never a leftover device pairing.
+			devicePaired = false
 			current = detectSetupStateWithToken(paths, cfg, state, target, savedTokenBeforeSetup, hadSavedTokenBeforeSetup)
 			existingToken = ""
 			if relayTokenFlag == "" && hadSavedTokenBeforeSetup {
@@ -522,17 +869,23 @@ func interactiveSetup(paths runtimePaths, cfg runtimeConfig, state installState,
 			}
 			resumeWSRecovery := relayTokenFlag == "" && strings.TrimSpace(existingToken) != "" && current.RelayOK && !current.WSOK
 			verifyFirstReuseFlow = false
-			steps := buildSetupWizardSteps(!skipLLATWalkthrough)
+			steps := buildSetupWizardSteps()
+			credentialStep := steps.RelayToken
+			if pairingFlow {
+				steps = buildSetupPairingWizardSteps()
+				credentialStep = steps.Pairing
+			}
 			if resumeWSRecovery {
-				steps = buildSetupWizardSteps(false)
+				steps = buildSetupWizardSteps()
+				credentialStep = steps.RelayToken
 			}
 
-			renderSetupStep(os.Stdout, steps.RelayToken, steps.Total, "Set up Relay Auth Token")
-			renderSetupIndentedBlock(os.Stdout, `NOVA needs two passwords ("tokens") to work securely:`, "    ",
-				"a) Relay token — keeps the connection between this computer and Home Assistant private",
-				"b) HA access token — allows the relay to control your devices and automations",
+			renderSetupStep(os.Stdout, credentialStep, steps.Total, "Set up Relay Auth Token")
+			renderSetupIndentedBlock(os.Stdout, "NOVA keeps client and Home Assistant access separate:", "    ",
+				"a) This Relay token protects the connection from this computer",
+				"b) The Home Assistant App receives its upstream access automatically",
 			)
-			renderSetupParagraph(os.Stdout, "This step is only for the Relay Auth Token. The Home Assistant Access Token comes next as its own step.")
+			renderSetupParagraph(os.Stdout, "Standalone Container/Core relays keep HA_LLAT in the server environment; the CLI never asks for it.")
 			if relayTokenFlag != "" {
 				renderSetupParagraphTight(os.Stdout, "Using the Relay Auth Token you already provided.")
 			} else if resumeWSRecovery {
@@ -546,7 +899,11 @@ func interactiveSetup(paths runtimePaths, cfg runtimeConfig, state installState,
 
 				choice, err := promptSetupTokenChoiceInteractive(reader, os.Stdout, existingToken != "")
 				if err == errSetupBack {
-					stage = setupStageRelayInstall
+					if pairingFlow {
+						stage = setupStagePairing
+					} else {
+						stage = setupStageRelayInstall
+					}
 					continue
 				}
 				if err == errSetupExit {
@@ -603,6 +960,7 @@ func interactiveSetup(paths runtimePaths, cfg runtimeConfig, state installState,
 						`1. Open the "Configuration" tab`,
 						`2. Paste the token into the "Relay Auth Token" field ("relay_auth_token")`,
 						"3. Click Save",
+						"4. Restart the App so it picks up the new token",
 					)
 					renderSetupLink(os.Stdout, "This will open:", haRelayAppPageURL(cfg.HAURL))
 					_, err := promptWizardLineFromReader(reader, os.Stdout, "Press Enter to open your browser", "")
@@ -618,7 +976,7 @@ func interactiveSetup(paths runtimePaths, cfg runtimeConfig, state installState,
 						return 1
 					}
 					openAnnouncedBrowserURL(os.Stdout, haRelayAppPageURL(cfg.HAURL))
-					_, err = promptWizardLineFromReader(reader, os.Stdout, "Press Enter after you saved the Relay Auth Token in NOVA Relay", "")
+					_, err = promptWizardLineFromReader(reader, os.Stdout, "Press Enter after you saved the Relay Auth Token and restarted NOVA Relay", "")
 					if err == errSetupBack {
 						continue
 					}
@@ -637,30 +995,57 @@ func interactiveSetup(paths runtimePaths, cfg runtimeConfig, state installState,
 				renderSetupParagraph(os.Stdout, "If this token already works on another device, the next verification step should succeed without any new Home Assistant changes.")
 			}
 
-			if !skipLLATWalkthrough && !verifyFirstReuseFlow {
-				stage = setupStageLLAT
-				continue
-			}
 			stage = setupStageVerify
 
-		case setupStageLLAT:
-			steps := buildSetupWizardSteps(true)
-			if err := runSetupLLATWalkthrough(reader, os.Stdout, cfg, token, steps); err != nil {
-				if err == errSetupBack {
-					if relayTokenFlag != "" {
-						stage = setupStageHost
-					} else {
-						stage = setupStageToken
-					}
-					continue
-				}
-				if err == errSetupExit {
-					renderSetupCancelledNote(os.Stdout)
-					return 0
-				}
+		case setupStagePairing:
+			steps := buildSetupPairingWizardSteps()
+			renderSetupStep(os.Stdout, steps.Pairing, steps.Total, "Pair this device")
+			if serviceMode {
+				// `setup --service` documents that the device credential lands in a
+				// protected file — service installs must not depend on a desktop
+				// keyring nobody unlocks. Forced here at the pairing stage, not at
+				// setup entry, so earlier reads of an existing keyring credential
+				// stay untouched.
+				forceDeviceCredentialFileMode()
+			}
+			pairedToken, err := runSetupPairingFlow(reader, os.Stdout, paths, &cfg, legacyTokenStoreUnavailable, lifecycleMarker...)
+			if err == errSetupBack {
+				stage = pairingBackStage
+				continue
+			}
+			if err == errSetupRelayTokenStep {
+				// The user explicitly left the device path: verify must judge
+				// the token they are about to provide, not the old pairing.
+				devicePaired = false
+				manualCredentialFlow = true
+				stage = setupStageToken
+				continue
+			}
+			if err == errSetupExit {
+				renderSetupCancelledNote(os.Stdout)
+				return 0
+			}
+			if err == errSetupDevicePaired {
+				// Secure v1 pairing already stored the device credential and the
+				// secure endpoint in the config; there is no relay token to keep,
+				// and activation already proved the connection.
+				devicePaired = true
+				token = ""
+				pairingCredentialReceived = false
+				manualCredentialFlow = false
+				verifyFirstReuseFlow = false
+				stage = setupStageVerify
+				continue
+			}
+			if err != nil {
 				printHumanErr("%s", err)
 				return 1
 			}
+			token = pairedToken
+			pairingCredentialReceived = true
+			devicePaired = false
+			manualCredentialFlow = false
+			verifyFirstReuseFlow = false
 			stage = setupStageVerify
 
 		case setupStageVerify:
@@ -668,15 +1053,87 @@ func interactiveSetup(paths runtimePaths, cfg runtimeConfig, state installState,
 				cfg.RelayBaseURL = deriveRelayURLFromHA(cfg.HAURL, cfg.HAHost)
 			}
 
-			steps := buildSetupWizardSteps(!skipLLATWalkthrough && !verifyFirstReuseFlow)
+			steps := buildSetupWizardSteps()
+			if pairingFlow {
+				steps = buildSetupPairingWizardSteps()
+			}
 			renderSetupStep(os.Stdout, steps.Verify, steps.Total, "Verifying connection")
+
+			if devicePaired {
+				renderDeviceVerifyIntro(os.Stdout)
+				if !verifyDeviceHealth(cfg) {
+					renderSetupErrorLine(os.Stdout, "Paired, but the secure device endpoint did not answer yet. The App may still be starting.")
+					if _, retryErr := promptWizardLineFromReader(reader, os.Stdout, "Press Enter to retry, or type 'back' to pair again", ""); retryErr != nil {
+						if retryErr == errSetupBack {
+							// Do exactly what the prompt advertises.
+							pairingBackStage = setupStageVerify
+							stage = setupStagePairing
+							continue
+						}
+						if retryErr == errSetupExit {
+							renderSetupCancelledNote(os.Stdout)
+							return 0
+						}
+						printHumanErr("%s", retryErr)
+						return 1
+					}
+					if !verifyDeviceHealth(cfg) {
+						pairingBackStage = setupStageVerify
+						stage = setupStagePairing
+						continue
+					}
+				}
+				renderSetupSuccessLine(os.Stdout, "Secure connection verified")
+				if err := persistDeviceSetupState(paths, cfg, &state, lifecycleMarker...); err != nil {
+					printHumanErr("%s", err)
+					return 1
+				}
+				if connectionMode == setupConnectionHybrid && !cfg.Cloud.ready() {
+					renderSetupParagraph(
+						os.Stdout,
+						"Local access is ready. Now connecting Home Assistant Cloud for away-from-home access.",
+					)
+					cfg, err = addHybridCloudAfterLocal(
+						paths,
+						cfg,
+						lifecycleMarker...,
+					)
+					if err != nil {
+						if handlePausedCloudOwnerPairing(
+							os.Stdout,
+							paths,
+							err,
+						) {
+							cloudSetupPaused = true
+							stage = setupStageSkills
+							continue
+						}
+						renderCloudFailure(os.Stdout, paths, err)
+						cloudSetupIncomplete = true
+						stage = setupStageSkills
+						continue
+					}
+					renderSetupSuccessLine(os.Stdout, "Home Assistant Cloud access verified")
+				}
+				stage = setupStageSkills
+				continue
+			}
+
 			if verifyFirstReuseFlow {
 				renderSetupParagraphTight(os.Stdout, "Using Home Assistant address: "+cfg.HAURL)
 			}
-			issue, ok, err := verifySetupConnection(reader, os.Stdout, cfg, token, verifyFirstReuseFlow, relayTokenFlag == "")
+			credentialRepair := setupCredentialRepairNone
+			if strings.TrimSpace(relayTokenFlag) == "" {
+				credentialRepair = setupCredentialRepairToken
+				if !serviceMode && !manualCredentialFlow {
+					credentialRepair = setupCredentialRepairPairing
+				}
+			}
+			issue, ok, err := verifySetupConnection(reader, os.Stdout, cfg, token, verifyFirstReuseFlow, credentialRepair, pairingCredentialReceived)
 			if err == errSetupBack {
-				if !skipLLATWalkthrough && !verifyFirstReuseFlow {
-					stage = setupStageLLAT
+				if pairingFlow {
+					pairingBackStage = setupStageVerify
+					stage = setupStagePairing
 				} else if relayTokenFlag != "" {
 					stage = setupStageHost
 				} else {
@@ -685,7 +1142,14 @@ func interactiveSetup(paths runtimePaths, cfg runtimeConfig, state installState,
 				continue
 			}
 			if err == errSetupRelayTokenStep {
+				pairingFlow = false
 				stage = setupStageToken
+				continue
+			}
+			if err == errSetupPairingStep {
+				pairingFlow = true
+				pairingBackStage = setupStageVerify
+				stage = setupStagePairing
 				continue
 			}
 			if err == errSetupHostStep {
@@ -695,9 +1159,8 @@ func interactiveSetup(paths runtimePaths, cfg runtimeConfig, state installState,
 			}
 			if err == errSetupInstallStep {
 				// The user asked for full guidance from the repair menu:
-				// repository/app install, token, and access-token walkthrough
+				// repository/app install and client credential setup
 				// for the current address.
-				skipLLATWalkthrough = false
 				verifyFirstReuseFlow = false
 				stage = setupStageRelayInstall
 				continue
@@ -711,21 +1174,28 @@ func interactiveSetup(paths runtimePaths, cfg runtimeConfig, state installState,
 				return 1
 			}
 			if !ok {
-				if err := persistInteractiveSetupStateWithRecovery(reader, os.Stdout, paths, cfg, &state, savedTokenBeforeSetup, hadSavedTokenBeforeSetup, token, &secureStorageRecovery); err != nil {
+				if err := persistInteractiveSetupStateWithRecovery(reader, os.Stdout, paths, cfg, &state, savedTokenBeforeSetup, hadSavedTokenBeforeSetup, token, &secureStorageRecovery, lifecycleMarker...); err != nil {
 					printHumanErr("%s", err)
 					return 1
 				}
 				renderSetupIncompleteBanner(os.Stdout, issue)
 				return 1
 			}
-			if err := persistInteractiveSetupStateWithRecovery(reader, os.Stdout, paths, cfg, &state, savedTokenBeforeSetup, hadSavedTokenBeforeSetup, token, &secureStorageRecovery); err != nil {
+			// The token path just verified successfully. A leftover device
+			// pairing (this branch is legacy-only; the device branch continues
+			// to Skills above) would win transport resolution on the next run
+			// and wedge the install on a dead pairing — retire it for good.
+			if err := persistInteractiveSetupStateWithRecoveryMode(reader, os.Stdout, paths, cfg, &state, savedTokenBeforeSetup, hadSavedTokenBeforeSetup, token, &secureStorageRecovery, true, lifecycleMarker...); err != nil {
 				printHumanErr("%s", err)
 				return 1
 			}
 			stage = setupStageSkills
 
 		case setupStageSkills:
-			steps := buildSetupWizardSteps(!skipLLATWalkthrough && !verifyFirstReuseFlow)
+			steps := buildSetupWizardSteps()
+			if pairingFlow {
+				steps = buildSetupPairingWizardSteps()
+			}
 			renderSetupStep(os.Stdout, steps.Skills, steps.Total, "Installing HA NOVA skills")
 			if target == "all" && len(selectedClients) > 0 {
 				fmt.Fprintf(os.Stdout, "  Will install: %s\n", strings.Join(selectedClients, ", "))
@@ -734,31 +1204,97 @@ func interactiveSetup(paths runtimePaths, cfg runtimeConfig, state installState,
 				}
 			}
 			if err := runSetupStepWithFeedback(os.Stdout, fmt.Sprintf("Setting up HA NOVA for %s...", setupClientLabel(target)), func() error {
-				return installClients(paths, &state, selectedClients)
+				return withClientMutationLock(paths, func() error {
+					if err := installClientsAndSaveStateUnlocked(paths, &state, selectedClients, saveState, lifecycleMarker...); err != nil {
+						return err
+					}
+					finalizeServiceTokenFileMigration(formerServiceTokenFile, token)
+					return nil
+				})
 			}); err != nil {
 				printHumanErr("client installation failed: %s", err)
 				renderSetupIncompleteBanner(os.Stdout, setupIssueSkillsInstall)
 				return 1
 			}
-			// Mark this version verified only if every tracked client was just
-			// synced (see allTrackedClientsSynced); a subset sync must leave the
-			// marker so the self-heal still repairs the untouched clients.
-			if allTrackedClientsSynced(state.InstalledClients, selectedClients) {
-				state.ClientsVerifiedVersion = localVersion(paths)
+			exit := 0
+			if cloudSetupIncomplete || cloudSetupPaused {
+				exit = renderSetupCompletionOutcomeWithCloudPause(
+					os.Stdout,
+					selectedClients,
+					cloudSetupIncomplete,
+					cloudSetupPaused,
+				)
 			}
-			if err := saveState(paths, state); err != nil {
-				printHumanErr("cannot save state: %s", err)
+			if exit == 0 && !connectionModePrompted && !serviceMode {
+				armSetupNextPromptSkipsStaleBlankInput()
+				var cloudAttempted bool
+				var cloudCode int
+				cfg, cloudAttempted, cloudCode = maybeOfferCloudForCompletedSetup(
+					reader,
+					os.Stdout,
+					paths,
+					cfg,
+					false,
+					lifecycleMarker...,
+				)
+				clearSetupNextPromptSkipsStaleBlankInput()
+				if cloudAttempted && cloudCode != 0 {
+					exit = cloudCode
+				}
+				if exit == 0 && cloudAttempted &&
+					cfg.Cloud != nil && !cfg.Cloud.ready() {
+					exit = cloudCode
+				}
+			}
+			if err := completeSetupLifecycle(paths, lifecycleMarker...); err != nil {
+				printHumanErr("cannot finalize setup lifecycle: %s", err)
 				return 1
 			}
-			finalizeServiceTokenFileMigration(formerServiceTokenFile, token)
-			renderSetupCompleteBanner(os.Stdout, selectedClients)
+			if exit != 0 {
+				return exit
+			}
+			if cfg.Cloud.ready() && cfg.RoutePolicy == routePolicyAutomatic {
+				renderSetupCloudFallbackReadyBanner(os.Stdout)
+			} else if !cloudSetupPaused {
+				renderSetupCompleteBanner(os.Stdout, selectedClients)
+			}
+			// One-time census ask AFTER the complete banner — clearly outside
+			// the numbered wizard steps, never readable as a setup hurdle.
+			// A queued Enter from the wizard's last step must not silently
+			// answer "No": arm the stale-blank-input skip for the next prompt
+			// and clear it afterwards (the ask may not prompt at all).
+			armSetupNextPromptSkipsStaleBlankInput()
+			askCensusIfEligible(paths, "setup", reader, os.Stdout)
+			clearSetupNextPromptSkipsStaleBlankInput()
 			return 0
 		}
 	}
 }
 
-func persistInteractiveSetupStateWithRecovery(reader *bufio.Reader, out io.Writer, paths runtimePaths, cfg runtimeConfig, state *installState, previousToken string, hadPreviousToken bool, token string, recovery *setupSecureStorageRecoveryState) error {
-	err := persistInteractiveSetupState(paths, cfg, state, previousToken, hadPreviousToken, token)
+func renderSetupCompletionOutcomeWithCloudPause(
+	out io.Writer,
+	selectedClients []string,
+	cloudSetupIncomplete bool,
+	cloudSetupPaused bool,
+) int {
+	if cloudSetupPaused {
+		renderSetupCloudPausedOutcome(out)
+		return 0
+	}
+	if cloudSetupIncomplete {
+		renderSetupIncompleteBanner(out, setupIssueCloudAccess)
+		return 1
+	}
+	renderSetupCompleteBanner(out, selectedClients)
+	return 0
+}
+
+func persistInteractiveSetupStateWithRecovery(reader *bufio.Reader, out io.Writer, paths runtimePaths, cfg runtimeConfig, state *installState, previousToken string, hadPreviousToken bool, token string, recovery *setupSecureStorageRecoveryState, lifecycleMarker ...[]byte) error {
+	return persistInteractiveSetupStateWithRecoveryMode(reader, out, paths, cfg, state, previousToken, hadPreviousToken, token, recovery, false, lifecycleMarker...)
+}
+
+func persistInteractiveSetupStateWithRecoveryMode(reader *bufio.Reader, out io.Writer, paths runtimePaths, cfg runtimeConfig, state *installState, previousToken string, hadPreviousToken bool, token string, recovery *setupSecureStorageRecoveryState, retireDevice bool, lifecycleMarker ...[]byte) error {
+	err := persistInteractiveSetupStateWithMode(paths, cfg, state, previousToken, hadPreviousToken, token, retireDevice, lifecycleMarker...)
 	if err == nil {
 		return nil
 	}
@@ -777,5 +1313,5 @@ func persistInteractiveSetupStateWithRecovery(reader *bufio.Reader, out io.Write
 		return relayAuthTokenSetupSaveError(err)
 	}
 
-	return persistInteractiveSetupState(paths, cfg, state, previousToken, hadPreviousToken, token)
+	return persistInteractiveSetupStateWithMode(paths, cfg, state, previousToken, hadPreviousToken, token, retireDevice, lifecycleMarker...)
 }

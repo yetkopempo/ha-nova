@@ -2,6 +2,11 @@ import { readFileSync } from "node:fs";
 
 import { describe, expect, it } from "vitest";
 
+
+// The -- RELAY-READY sections live in fallback's split file, which fallback
+// loads. A negative assertion must cover both, or it cannot fail.
+const relayReadySplit = readFileSync("skills/fallback/relay-ready.md", "utf-8");
+
 const maintenanceSkill = readFileSync("skills/maintenance/SKILL.md", "utf8");
 const maintenanceReference = readFileSync("skills/maintenance/maintenance-reference.md", "utf8");
 const contextSkill = readFileSync("skills/ha-nova/SKILL.md", "utf8");
@@ -32,11 +37,11 @@ describe("maintenance contract", () => {
     expect(maintenanceSkill).toContain("`recorder/clear_statistics` is IRREVERSIBLE");
     // The anti-Spook gate: never clear an energy-dashboard statistic silently.
     expect(maintenanceSkill).toContain("`energy/get_prefs` cross-check");
-    expect(maintenanceSkill).toContain("Typed token confirmation");
-    // Red-team blocker: the token must bind to the fully enumerated set, not a capped sample.
+    expect(maintenanceSkill).toContain("Typed confirmation code");
+    // Red-team blocker: the confirmation code must bind to the fully enumerated set, not a capped sample.
     expect(maintenanceSkill).toContain("a capped sample never authorizes the uncapped set");
     expect(maintenanceSkill).toContain(
-      "the token binds to one issue group and its full enumerated ID set; never one token for multiple groups",
+      "it binds to one issue group and the manifest's full enumerated ID set",
     );
     // Non-energy dashboards can also reference statistics.
     expect(maintenanceSkill).toContain("scan of storage dashboards for the IDs");
@@ -116,7 +121,7 @@ describe("maintenance contract", () => {
     );
     expect(contextSkill).toContain('"Clean up orphaned statistics"** → `ha-nova:maintenance`');
     expect(fallbackSkill).toContain("| Statistics repair / Purge / Entity registry remove | Covered | maintenance |");
-    expect(fallbackSkill).not.toContain("Entity Removal / Device Detach -- RELAY-READY");
+    expect(fallbackSkill + relayReadySplit).not.toContain("Entity Removal / Device Detach -- RELAY-READY");
     expect(writeSafety).toContain(
       "| `maintenance` | grouped preview + re-validate verify | spike adjust only (inverse call); clears/purges/removals irreversible | HA Backups (offered pre-bulk) |",
     );

@@ -1,9 +1,11 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"net/http"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -12,8 +14,10 @@ import (
 )
 
 type versionJSON struct {
-	SkillVersion    string `json:"skill_version"`
-	MinRelayVersion string `json:"min_relay_version"`
+	SkillVersion         string   `json:"skill_version"`
+	MinRelayVersion      string   `json:"min_relay_version"`
+	CloudRemoteEnabled   bool     `json:"cloud_remote_enabled"`
+	CloudRemotePlatforms []string `json:"cloud_remote_platforms"`
 }
 
 type releaseInfo struct {
@@ -24,6 +28,13 @@ type releaseInfo struct {
 	// so an unchanged release returns a cheap 304 (off the rate limit) while a
 	// new release returns 200 and is detected immediately.
 	ETag string `json:"etag,omitempty"`
+	// PublishedAt doubles as the digest-metadata marker: an entry without it
+	// was written by a pre-digest CLI, so revalidation skips If-None-Match
+	// once to refill the digest from a full 200 (a 304 has no body).
+	PublishedAt string `json:"published_at,omitempty"`
+	// ReleaseHighlights is the compact normalized digest derived from the
+	// release body (cli/release_digest.go). The full body is never cached.
+	ReleaseHighlights []releaseHighlight `json:"release_highlights,omitempty"`
 }
 
 type updateCheckResult struct {
@@ -36,6 +47,9 @@ type updateCheckResult struct {
 	HTMLURL         string `json:"html_url,omitempty"`
 	CacheStatus     string `json:"cache_status"`
 	Message         string `json:"message"`
+	// Additive digest fields (#403); existing fields and exit codes are pinned.
+	PublishedAt       string             `json:"published_at,omitempty"`
+	ReleaseHighlights []releaseHighlight `json:"release_highlights,omitempty"`
 }
 
 type parsedReleaseVersion struct {
@@ -103,7 +117,7 @@ func parseReleaseVersion(s string) (parsedReleaseVersion, error) {
 			return parsedReleaseVersion{}, fmt.Errorf("%w: %q", errUnsupportedVersionFormat, s)
 		}
 		value := strings.TrimPrefix(suffix, "rc")
-		if value == "" {
+		if value == "" || (len(value) > 1 && value[0] == '0') {
 			return parsedReleaseVersion{}, fmt.Errorf("%w: %q", errUnsupportedVersionFormat, s)
 		}
 		parsedRC, err := strconv.Atoi(value)
@@ -118,7 +132,7 @@ func parseReleaseVersion(s string) (parsedReleaseVersion, error) {
 	}
 	values := [3]int{}
 	for i, part := range parts {
-		if part == "" {
+		if part == "" || (len(part) > 1 && part[0] == '0') {
 			return parsedReleaseVersion{}, fmt.Errorf("%w: %q", errUnsupportedVersionFormat, s)
 		}
 		value, err := strconv.Atoi(part)
@@ -213,9 +227,18 @@ func readMinRelayVersion(dir string) string {
 }
 
 func checkRelayVersion(paths runtimePaths, healthBody []byte) humanNotice {
-	// A live GET /health answers with the relay envelope
-	// {"ok":true,"data":{"version":...}} — the version is NOT top-level. The
-	// top-level field stays as a fallback for bare health bodies.
+	version := parseRelayHealthVersion(healthBody)
+	if version == "" {
+		return humanNotice{}
+	}
+	return checkRelayVersionValue(paths, version)
+}
+
+// parseRelayHealthVersion extracts the relay version from a /health body. A
+// live GET /health answers with the relay envelope
+// {"ok":true,"data":{"version":...}} — the version is NOT top-level. The
+// top-level field stays as a fallback for bare health bodies.
+func parseRelayHealthVersion(healthBody []byte) string {
 	var health struct {
 		Version string `json:"version"`
 		Data    struct {
@@ -223,16 +246,12 @@ func checkRelayVersion(paths runtimePaths, healthBody []byte) humanNotice {
 		} `json:"data"`
 	}
 	if json.Unmarshal(healthBody, &health) != nil {
-		return humanNotice{}
+		return ""
 	}
-	version := health.Data.Version
-	if version == "" {
-		version = health.Version
+	if health.Data.Version != "" {
+		return health.Data.Version
 	}
-	if version == "" {
-		return humanNotice{}
-	}
-	return checkRelayVersionValue(paths, version)
+	return health.Version
 }
 
 // relayFloorNotice fetches the relay health once and returns the
@@ -245,15 +264,150 @@ func relayFloorNotice(paths runtimePaths) humanNotice {
 	if err != nil || cfg.RelayBaseURL == "" {
 		return humanNotice{}
 	}
-	token, err := readRelayAuthTokenForDoctor()
-	if err != nil || token == "" {
+	base, client, credential, ok := relayNoticeTransport(cfg)
+	if !ok {
 		return humanNotice{}
 	}
-	body, err := fetchRelayHealth(cfg.RelayBaseURL, token)
+	body, err := fetchRelayHealthWith(client, base, credential)
 	if err != nil {
 		return humanNotice{}
 	}
 	return checkRelayVersion(paths, body)
+}
+
+// relayNoticeTransport picks the credential path for the best-effort update
+// notices: the device transport for paired installs (which store no legacy
+// token at all), the legacy token otherwise. false means "no usable auth" —
+// the notices stay silent, matching their best-effort contract.
+func relayNoticeTransport(cfg config) (string, *http.Client, string, bool) {
+	if base, client, credential, device, err := relayFunctionalTransportForDoctor(cfg); err == nil && device {
+		return base, client, credential, true
+	}
+	// A paired config must not downgrade to the legacy plain, unpinned port when
+	// its device credential is missing/unreadable — respect the same fail-closed
+	// contract as relayFunctionalTransport and stay silent (the notice is
+	// best-effort).
+	if cfg.RelaySecureBaseURL != "" && cfg.RelaySpkiPin != "" {
+		return "", nil, "", false
+	}
+	// Non-default profiles are device-credential-only: a best-effort notice
+	// must never send the default profile's machine-wide token to another
+	// server's URL. Stay silent instead.
+	if activeServerProfile() != defaultServerProfileName {
+		return "", nil, "", false
+	}
+	token, err := readRelayAuthTokenForDoctor()
+	if err != nil || token == "" {
+		return "", nil, "", false
+	}
+	return cfg.RelayBaseURL, httpClient, token, true
+}
+
+// relayUpdateNotice preserves the compatibility-floor warning and, when the
+// floor is satisfied, also surfaces a registry-proven pending Relay App update
+// reported by Home Assistant. Missing or ambiguous update-entity evidence is
+// best-effort silence so standalone Container/Core installs stay unchanged.
+func relayUpdateNotice(paths runtimePaths) humanNotice {
+	return relayUpdateNoticeWithContext(context.Background(), paths)
+}
+
+func relayUpdateNoticeWithTimeout(paths runtimePaths, timeout time.Duration) humanNotice {
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	defer cancel()
+	return relayUpdateNoticeWithContext(ctx, paths)
+}
+
+func relayUpdateNoticeWithContext(ctx context.Context, paths runtimePaths) humanNotice {
+	cfg, err := loadConfig(paths)
+	if err != nil || cfg.RelayBaseURL == "" {
+		return humanNotice{}
+	}
+	base, client, credential, ok := relayNoticeTransport(cfg)
+	if !ok {
+		return humanNotice{}
+	}
+	floorNotice := humanNotice{}
+	if body, healthErr := fetchRelayHealthWithContext(ctx, client, base, credential); healthErr == nil {
+		floorNotice = checkRelayVersion(paths, body)
+	}
+	// Resolve the exact HA update entity even when the Relay is below the
+	// compatibility floor. Only that evidence distinguishes an App that can
+	// use the guided update flow from a standalone container/manual path.
+	// relayCoreRequest resolves the actual transport itself; the credential
+	// only matters for the legacy path.
+	candidate, _ := resolveRelayUpdateCandidateWithTransport(ctx, base, client, credential)
+	if !floorNotice.empty() {
+		if candidate.updateAvailable() {
+			if !candidate.guidedInstallReady() {
+				return humanNotice{
+					level: humanNoticeWarning,
+					kind:  humanNoticeKindRelayUpdateAvailable,
+					message: fmt.Sprintf(
+						"%s Home Assistant reports a NOVA Relay App update: v%s → v%s, but its entity does not support the required install-plus-backup flow. Inform the user to update it manually in Home Assistant > Settings > Apps > NOVA Relay.",
+						floorNotice.message,
+						candidate.InstalledVersion,
+						candidate.LatestVersion,
+					),
+				}
+			}
+			return humanNotice{
+				level: humanNoticeWarning,
+				kind:  humanNoticeKindRelayUpdateAvailable,
+				message: fmt.Sprintf(
+					"%s Home Assistant reports a NOVA Relay App update: v%s → v%s. Inform the user, then offer to prepare the guided App update through ha-nova:updates; that skill must show its preview and obtain confirmation before installing.",
+					floorNotice.message,
+					candidate.InstalledVersion,
+					candidate.LatestVersion,
+				),
+			}
+		}
+		if candidate.EntityID != "" {
+			return humanNotice{
+				level: floorNotice.level,
+				kind:  floorNotice.kind,
+				message: floorNotice.message +
+					" Home Assistant confirms the NOVA Relay App is installed, but it currently exposes no pending App update. Refresh the App store and update or reinstall NOVA Relay there; do not use a container image pull.",
+			}
+		}
+		return humanNotice{
+			level: floorNotice.level,
+			kind:  floorNotice.kind,
+			message: floorNotice.message +
+				" No registry-proven pending NOVA Relay App update was found; open Home Assistant > Settings > Apps > NOVA Relay, or pull and recreate a standalone Relay container.",
+		}
+	}
+	return relayAvailableUpdateNoticeFromCandidate(candidate)
+}
+
+func relayAvailableUpdateNotice(cfg config, token string) humanNotice {
+	candidate, _ := resolveRelayUpdateCandidate(cfg, token)
+	return relayAvailableUpdateNoticeFromCandidate(candidate)
+}
+
+func relayAvailableUpdateNoticeFromCandidate(candidate relayUpdateCandidate) humanNotice {
+	if !candidate.updateAvailable() {
+		return humanNotice{}
+	}
+	if !candidate.guidedInstallReady() {
+		return humanNotice{
+			level: humanNoticeWarning,
+			kind:  humanNoticeKindRelayUpdateAvailable,
+			message: fmt.Sprintf(
+				"Relay update available: v%s → v%s, but the App entity does not support the required install-plus-backup flow. Inform the user to update it manually in Home Assistant > Settings > Apps > NOVA Relay.",
+				candidate.InstalledVersion,
+				candidate.LatestVersion,
+			),
+		}
+	}
+	return humanNotice{
+		level: humanNoticeWarning,
+		kind:  humanNoticeKindRelayUpdateAvailable,
+		message: fmt.Sprintf(
+			"Relay update available: v%s → v%s. Inform the user, then offer to prepare the guided App update through ha-nova:updates; that skill must show its preview and obtain confirmation before installing.",
+			candidate.InstalledVersion,
+			candidate.LatestVersion,
+		),
+	}
 }
 
 // checkRelayVersionValue compares a bare relay version (from the /health body
@@ -263,6 +417,10 @@ func checkRelayVersionValue(paths runtimePaths, relayVersion string) humanNotice
 	if strings.TrimSpace(relayVersion) == "" {
 		return humanNotice{}
 	}
+	// Opportunistic census stamp: every relay-version observation funnels
+	// through here, so the census never needs its own relay call. No-op unless
+	// the user opted in; write-throttled (cli/census_state.go).
+	stampCensusRelayVersion(paths, relayVersion)
 
 	v, err := readVersionJSON(paths.VersionFile)
 	if err != nil || v.MinRelayVersion == "" {
@@ -281,7 +439,7 @@ func checkRelayVersionValue(paths runtimePaths, relayVersion string) humanNotice
 		return humanNotice{
 			level:   humanNoticeWarning,
 			kind:    humanNoticeKindRelayOutdated,
-			message: fmt.Sprintf("Relay outdated: v%s is below minimum v%s. Inform the user, then ask whether to install the relay update now — the updates skill (ha-nova:updates) handles the App update; a standalone container needs a manual image pull.", relayVersion, v.MinRelayVersion),
+			message: fmt.Sprintf("Relay outdated: v%s is below minimum v%s. Inform the user that the Relay must be updated before compatible operation.", relayVersion, v.MinRelayVersion),
 		}
 	}
 	return humanNotice{}
@@ -313,8 +471,10 @@ func cacheReleaseInfo(paths runtimePaths, info releaseInfo) {
 	if info.Version == "" {
 		return
 	}
-	if err := os.MkdirAll(filepath.Dir(paths.UpdateCacheFile), 0o755); err != nil {
-		return
-	}
-	_ = writeJSONFile(paths.UpdateCacheFile, info, 0o644)
+	mutateActiveInstallCache(paths, func() {
+		if err := os.MkdirAll(filepath.Dir(paths.UpdateCacheFile), 0o755); err != nil {
+			return
+		}
+		_ = writeJSONFileNoHTMLEscape(paths.UpdateCacheFile, info, 0o644)
+	})
 }

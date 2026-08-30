@@ -17,6 +17,8 @@ Diagnostics only. Do not use this skill for config writes or routine HA operatio
 
 If the `ha-nova` command itself is missing, the CLI is not installed — install it first from the latest GitHub release (https://github.com/markusleben/ha-nova/releases/latest carries the copy-paste install command per OS), then run `ha-nova setup`. Never bootstrap from the repo's `main` branch: released skills must install the reviewed, tagged release.
 
+When the CLI exists, read and follow
+`../ha-nova/session-bootstrap.md` before the first HA task.
 Relay CLI command: `ha-nova relay`
 If missing: `ha-nova setup`
 
@@ -27,8 +29,9 @@ If missing: `ha-nova setup`
    - `401/403`: relay auth token mismatch
    - `404`: endpoint/path mismatch
    - connect error / status `000`: relay unreachable
-   - `ha_ws_connected=false`: relay is reachable but not proven ready yet; confirm with `/ws` or `ha-nova doctor` before blaming LLAT
-   - `/ws` proves `LLAT is required`: Home Assistant access token (`ha_llat`) is missing or wrong
+   - `ha_ws_connected=false`: the reason can be passive or stale because health/REST reads do not open WS. Send WS `{"type":"ping"}`, then re-read health before diagnosing any `auth`, `network`, or `never_connected` value. Ping `ok: true` plus post-ping `ha_ws_connected: true` proves readiness. Otherwise classify the ping error and post-health reason: `auth` means upstream authentication was rejected (App: update/restart Relay; standalone: replace `HA_LLAT`); `network` means HA remains unreachable/restarting; `never_connected` alone never proves a bad `HA_URL` or network path. Older relays omit the reason — use the ping result or `ha-nova doctor`
+   - `/ws` on an older Relay proves `LLAT is required`: update the App; only standalone Container/Core should repair `HA_LLAT`
+   - `desktop keyring locked` / `secure storage is present but locked` during setup or pairing: the machine has a Secret Service that never gets unlocked (headless VM, autologin box, systemd user service). Do not ask the user to unlock it on every boot — use the explicit file backend instead: `ha-nova setup --service <client>`, or `ha-nova pair --credential-store=file`
 3. Return one concrete remediation step.
 
 ## Standard Remediation Commands
@@ -39,6 +42,10 @@ If missing: `ha-nova setup`
   - `ha-nova relay health`
 - doctor detail:
   - `ha-nova doctor`
+- pairing on a machine whose desktop keyring is never unlocked (headless VM, agent box):
+  - `ha-nova setup --service <client>` — or standalone: `ha-nova pair --credential-store=file`
+- connecting a second Home Assistant server:
+  - rerun `ha-nova setup` — the completed-setup screen offers "Add another Home Assistant server" (per-call selection stays `HA_NOVA_SERVER=<name>`)
 
 ## Output Format
 

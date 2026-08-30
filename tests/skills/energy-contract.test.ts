@@ -2,6 +2,11 @@ import { readFileSync } from "node:fs";
 
 import { describe, expect, it } from "vitest";
 
+
+// The -- RELAY-READY sections live in fallback's split file, which fallback
+// loads. A negative assertion must cover both, or it cannot fail.
+const relayReadySplit = readFileSync("skills/fallback/relay-ready.md", "utf-8");
+
 const energySkill = readFileSync("skills/energy/SKILL.md", "utf8");
 const energyReference = readFileSync("skills/energy/energy-reference.md", "utf8");
 const contextSkill = readFileSync("skills/ha-nova/SKILL.md", "utf8");
@@ -38,7 +43,7 @@ describe("energy contract", () => {
     expect(energySkill).toContain("With no existing grid source to detect from, pick by HA version");
     // Emptying/replacing a whole list is destructive, not a natural-confirmation edit.
     expect(energySkill).toContain(
-      "a save that empties or wholesale-replaces a list on a configured instance is destructive — typed token confirmation",
+      "a save that empties or wholesale-replaces a list on a configured instance is destructive — typed confirmation code",
     );
     // The plausible wrong payload guess is echoing get_prefs back.
     expect(energyReference).toContain("Never echo the whole `get_prefs` object back as the save body");
@@ -122,9 +127,9 @@ describe("energy contract", () => {
     );
     expect(contextSkill).toContain('"Add this plug to the energy dashboard"** → `ha-nova:energy`');
     expect(fallbackSkill).toContain("| Energy (analysis + source/device config) | Covered | energy |");
-    expect(fallbackSkill).not.toContain("Energy Configuration -- RELAY-READY");
+    expect(fallbackSkill + relayReadySplit).not.toContain("Energy Configuration -- RELAY-READY");
     expect(writeSafety).toContain(
-      "| `energy` | change preview + read-back & validate verify | no (corrective save) | HA Backups |",
+      "| `energy` | change preview + read-back & validate verify | no (corrective save) | config snapshot (auto before entry-removing saves, whole-doc restore); HA Backups |",
     );
     expect(architectureDoc).toContain("energy/SKILL.md");
   });

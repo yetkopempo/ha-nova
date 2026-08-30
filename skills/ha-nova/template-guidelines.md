@@ -139,6 +139,18 @@ sequence:
       message: "{{ flow_status }}"
 ```
 
+## Live Render Loop (pre-save iteration)
+
+Before saving ANY persisted Jinja field — automation templates, template sensor states, and dashboard template-capable fields (only where the card type documents Jinja, e.g. Markdown card `content`) alike — render the draft against live state:
+
+`ha-nova relay core --method POST --path /api/template --body-file <payload-file>` with `{"template":"{{ ... }}"}`; the rendered value comes back in `.data.body`.
+
+- Rendering is read-only: it evaluates against live state and changes nothing.
+- Iterate here: render, adjust, render again until the output is right. Surface render errors verbatim — the error text names the failing expression.
+- Exercise edge branches synthetically with `{% set %}` overrides inside the draft (a threshold boundary, a missing value via `none`) instead of changing any real sensor state.
+- Runtime-only names (`trigger`, `wait`, `this`, `response_variable` results) do not exist in a standalone render: stub them with representative `{% set %}` values for the preflight and strip the stubs before saving — an undefined-variable error on only such a name never blocks the save.
+- The loop ends BEFORE the write preview: a template that never rendered correctly does not reach a save preview.
+
 ## Anti-Patterns
 
 These are caught by review checks — listed here for reference:
@@ -153,4 +165,4 @@ These are caught by review checks — listed here for reference:
 | Templated event trigger name | R-16 | Event trigger names are attached literally; dynamic `event_type` never matches the intended event | Event trigger names must be literal strings; do not template `event_type:` |
 | Same-block sibling variable dependency in one `variables:` mapping | R-18 | REST/UI storage can reorder mapping keys, so a variable may render before the sibling it references | Use a self-contained template with internal `{% set %}`, or split the dependency into ordered `variables` actions |
 | Direct `trigger.id` check in a terminal bare `else` after entity-state `if` / `elif` guards | R-19 | final else branch is only reached when the earlier entity-state branches are false | Move the `trigger.id` check into an explicit `elif`, or refactor to `choose` + `condition: trigger` |
-| Contradictory fixed `condition: state` checks on the same entity inside one conjunction | R-29 | The branch is unreachable because mutually exclusive states must be true together | Put intentional alternatives under `condition: or`, or remove the contradictory requirement |
+| Contradictory fixed `condition: state` checks on the same entity inside one conjunction | R-31 | The branch is unreachable because mutually exclusive states must be true together | Put intentional alternatives under `condition: or`, or remove the contradictory requirement |

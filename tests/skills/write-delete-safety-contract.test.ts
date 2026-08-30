@@ -12,7 +12,8 @@ const resolveAgent = readFileSync("skills/ha-nova/agents/resolve-agent.md", "utf
 describe("write delete safety contract", () => {
   it("requires delete previews to surface consumer-check results before confirmation", () => {
     expect(writeSkill).toContain("Delete preview MUST include the consumer-check result before confirmation");
-    expect(writeSkill).toContain("either the affected consumers or an explicit no-consumer result");
+    expect(writeSkill).toContain('an explicit "consumer check inconclusive" line when the scan failed or did not run');
+    expect(writeSkill).toContain("Never present a failed or skipped scan as a no-consumer result");
   });
 
   it("requires destructive writes to stay unclaimed until verification proves the target is gone", () => {
@@ -36,8 +37,42 @@ describe("write delete safety contract", () => {
     // confirmation of an incomprehensible preview is not informed consent.
     expect(writeSafety).toContain("### Behavior narrative (required with every update preview)");
     expect(writeSafety).toContain("never ask for confirmation of a change you cannot describe");
-    expect(writeSafety).toContain("the summary MUST name what was added, removed, or nested there");
+    expect(writeSafety).toContain(
+      "the summary MUST name what\nwas added, removed, replaced, modified, or nested there",
+    );
     expect(writeSkill).toContain("state the behavioral effect in the summary sentence");
+  });
+
+  it("blocks confirmation of count-only or type-only previews (issue #390)", () => {
+    // The narrative is diff-scoped, per-entry, and nested-aware; a count or
+    // type-name transition alone never reaches confirmation.
+    expect(writeSafety).toContain("The narrative covers every collection\nthe diff touches");
+    expect(writeSafety).not.toContain("for something\nthe user's request touched");
+    expect(writeSafety).toContain("Each added, removed, replaced, or modified entry");
+    expect(writeSafety).toContain("entries with one shared effect may\nshare a line");
+    expect(writeSafety).toContain("at the depth needed to understand its effect");
+    expect(writeSafety).toContain("container counts alone never\nqualify");
+    expect(writeSafety).toContain("not a description");
+    expect(writeSafety).toContain("is not a valid confirmation basis");
+    expect(writeSafety).toContain("it may run longer when per-entry coverage requires it");
+    // The gate lives with the confirmation owner in the context skill.
+    const contextSkill = readFileSync("skills/ha-nova/SKILL.md", "utf8");
+    expect(contextSkill).toContain(
+      "A preview is a valid confirmation basis only if it explains the behavioral effect of every collection it touches.",
+    );
+    expect(contextSkill).toContain("cannot proceed to confirmation");
+    // Flows with terse local preview wording carry the narrative pointer.
+    const helper = readFileSync("skills/helper/SKILL.md", "utf8");
+    const scene = readFileSync("skills/scene/SKILL.md", "utf8");
+    const dashboard = readFileSync("skills/dashboard/SKILL.md", "utf8");
+    const fallback = readFileSync("skills/fallback/SKILL.md", "utf8");
+    expect(helper).toContain("a count-only diff row never stands alone");
+    expect(helper).toContain(
+      "plus the behavior narrative (write-safety → Behavior narrative). Include an explicit not-saved-yet line",
+    );
+    expect(scene).toContain("never entity counts alone");
+    expect(dashboard).toContain("plus a plain-language behavior line");
+    expect(fallback).toContain("with a plain-language behavior line");
     // Post-write checks prove persistence, not behavior — wording must say so.
     expect(writeSafety).toContain("## Verification Honesty (post-write wording)");
     expect(writeSafety).toContain('Never a bare "verified"');
@@ -80,7 +115,8 @@ describe("write delete safety contract", () => {
     expect(organizeSkill).toContain("Registry deletes are irreversible");
     expect(organizeSkill).toContain("Home Assistant Backups (Settings > System > Backups)");
     expect(dashboardSkill).toContain("Dashboard writes have no `revert`");
-    expect(dashboardSkill).toContain("the recovery path is Home Assistant Backups");
+    expect(dashboardSkill).toContain("recovery for dashboard/card deletes is the auto config snapshot");
+    expect(dashboardSkill).toContain("resources recover via Home Assistant Backups");
     // Fallback full-replace writes verify survival of unrelated content after write.
     expect(fallbackSkill).toContain("verify both the intended change and the survival of unrelated content");
     expect(fallbackSkill).toContain("verify the pre-existing list items survived");
@@ -131,6 +167,21 @@ describe("write delete safety contract", () => {
     expect(writeSkill).toContain("prefer `--out <diff-file>`");
   });
 
+  it("splits the change table: agent-authored localized header, verbatim CLI rows", () => {
+    // The CLI emits data rows only; the two header lines are the agent's — and
+    // the ONLY hand-written lines inside the table. This split keeps
+    // Before/After in the user's language while every fact stays byte-identical
+    // CLI output.
+    expect(writeSafety).toContain("| Field | before | after |");
+    expect(writeSafety).toContain("exactly two hand-written");
+    expect(writeSafety).toContain("the localized table header row");
+    expect(writeSafety).toContain("|---|---|---|");
+    expect(writeSafety).toContain("do not re-align pipes or pad cells");
+    // The truncation marker joins the count-only rule: a cut-off value the
+    // request touched must be named in the summary.
+    expect(writeSafety).toContain("a truncated (`…`) value");
+  });
+
   it("protects notification copy from unrequested rewrites", () => {
     expect(writeSafety).toContain("User-authored notification copy");
     expect(writeSafety).toContain("Notification text is user-authored copy");
@@ -153,11 +204,11 @@ describe("write delete safety contract", () => {
     expect(updateRevert).toContain("reconstruct the previous config from memory");
   });
 
-  it("keeps delete a typed token even under menu pressure", () => {
-    expect(writeSkill).toContain("delete is the typed token, never a menu");
+  it("keeps delete a typed confirmation code even under menu pressure", () => {
+    expect(writeSkill).toContain("delete is the typed confirmation code, never a menu");
   });
 
-  it("requires tokenized delete confirmation for same-session cleanup", () => {
+  it("requires the typed confirmation code for same-session cleanup", () => {
     expect(writeSkill).toContain("Destructive cleanup still requires `confirm:<token>`");
     expect(writeSafety).toContain("even when the item was created earlier in the same session");
     expect(refactorGuide).toContain("cleanup, undo-create, orphan cleanup, failed-create cleanup");
@@ -166,7 +217,7 @@ describe("write delete safety contract", () => {
   it("treats post-delete absence evidence as successful verification without alternate delete retries", () => {
     expect(applyAgent).toContain("config read-back not-found after DELETE is expected absence evidence");
     expect(applyAgent).toContain("entity state not-found after DELETE is expected absence evidence");
-    expect(applyAgent).toContain("`config/entity_registry/get` may return `UPSTREAM_WS_ERROR` (or `UPSTREAM_WS_COMMAND_ERROR` on Relay App >= 0.2.4) after deletion");
+    expect(applyAgent).toContain("`config/entity_registry/get` may return `UPSTREAM_WS_COMMAND_ERROR` (legacy relays below the enforced floor: `UPSTREAM_WS_ERROR`) after deletion");
     expect(applyAgent).toContain("do not retry alternate deletes");
     expect(applyAgent).toContain("config/entity_registry/list_for_display");
     expect(applyAgent).toContain("no exact `entity_id` match");

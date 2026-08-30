@@ -133,7 +133,7 @@ func TestRunUninstallStandardKeepsServiceTokenFile(t *testing.T) {
 	}
 }
 
-func TestRunUninstallPurgeRemovesServiceTokenFileAfterConfig(t *testing.T) {
+func TestRunUninstallPurgeRemovesServiceTokenFileBeforeConfig(t *testing.T) {
 	if runtime.GOOS == "windows" {
 		t.Skip("service token files are not supported on native Windows")
 	}
@@ -171,7 +171,7 @@ func TestRunUninstallPurgeRemovesServiceTokenFileAfterConfig(t *testing.T) {
 	}
 }
 
-func TestRunUninstallPurgeRemovesUnsafeServiceTokenFileAfterConfig(t *testing.T) {
+func TestRunUninstallPurgeRemovesUnsafeServiceTokenFileBeforeConfig(t *testing.T) {
 	if runtime.GOOS == "windows" {
 		t.Skip("service token files are not supported on native Windows")
 	}
@@ -284,7 +284,7 @@ func TestRunUninstallShowsPreflightAndRelayStillRunningNote(t *testing.T) {
 		"The NOVA Relay app is still running in Home Assistant. To fully remove HA NOVA:",
 		"1. Remove the NOVA Relay app: " + haRelayAppPageURL("http://192.168.1.5:8123"),
 		"2. Remove the repository: " + haAppStoreURL("http://192.168.1.5:8123"),
-		"3. Revoke the \"NOVA\" access token: http://192.168.1.5:8123/profile/security",
+		"3. If this was a legacy/standalone install, revoke its \"NOVA\" access token: http://192.168.1.5:8123/profile/security",
 	} {
 		if !strings.Contains(output, want) {
 			t.Fatalf("expected uninstall output %q:\n%s", want, output)
@@ -328,6 +328,11 @@ func TestRunUninstallNoopDoesNotClaimRemoval(t *testing.T) {
 	}
 	if strings.Contains(output, "HA NOVA removed") {
 		t.Fatalf("did not expect final removal claim for noop uninstall:\n%s", output)
+	}
+	if marker := censusLifecycleMarkerPath(paths); marker != "" {
+		if _, err := os.Stat(marker); !os.IsNotExist(err) {
+			t.Fatalf("noop uninstall created lifecycle residue %s (err=%v)", marker, err)
+		}
 	}
 }
 
@@ -780,7 +785,7 @@ func TestPurgeFindsServiceTokenFileWhenConfigIsIncomplete(t *testing.T) {
 	deleteRelayAuthTokenForUninstall = func() error { return nil }
 
 	report := &uninstallReport{}
-	if err := finalizeLocalUninstall(paths, installState{}, report, uninstallModePurge); err != nil {
+	if err := finalizeLocalUninstall(paths, installState{}, report, uninstallModePurge, false); err != nil {
 		t.Fatalf("finalizeLocalUninstall() error: %v", err)
 	}
 	if _, err := os.Stat(tokenPath); !isNotExist(err) {
@@ -788,7 +793,7 @@ func TestPurgeFindsServiceTokenFileWhenConfigIsIncomplete(t *testing.T) {
 	}
 }
 
-func TestPurgeKeepsExternalTokenFileAndCleansKeyringOnly(t *testing.T) {
+func TestPurgePreservesConfigForExternalTokenFile(t *testing.T) {
 	if relayAuthTokenFilePlatformOS == "windows" {
 		t.Skip("service token files are not supported on native Windows")
 	}
@@ -831,22 +836,27 @@ func TestPurgeKeepsExternalTokenFileAndCleansKeyringOnly(t *testing.T) {
 	}
 
 	report := &uninstallReport{}
-	if err := finalizeLocalUninstall(paths, installState{}, report, uninstallModePurge); err != nil {
+	err = finalizeLocalUninstall(
+		paths,
+		installState{},
+		report,
+		uninstallModePurge,
+		false,
+	)
+	if err == nil ||
+		!strings.Contains(
+			err.Error(),
+			"is not the managed service-token path",
+		) {
 		t.Fatalf("finalizeLocalUninstall() error: %v", err)
 	}
 	if _, err := os.Stat(externalToken); err != nil {
 		t.Fatalf("expected external token file to be left untouched, err=%v", err)
 	}
-	if !keyringDeleted {
-		t.Fatalf("expected the OS keyring copy to be cleaned")
+	if _, err := os.Stat(paths.ConfigFile); err != nil {
+		t.Fatalf("expected config to retain external token pointer: %v", err)
 	}
-	foundNote := false
-	for _, note := range report.notes {
-		if strings.Contains(note, "outside the HA NOVA config directory") {
-			foundNote = true
-		}
-	}
-	if !foundNote {
-		t.Fatalf("expected a kept-external-file note, got %+v", report.notes)
+	if keyringDeleted {
+		t.Fatal("keyring token was deleted after external token policy blocked")
 	}
 }

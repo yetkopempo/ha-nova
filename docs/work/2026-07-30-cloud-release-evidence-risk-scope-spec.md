@@ -1,0 +1,245 @@
+# Cloud Release Evidence Risk Scope
+
+Status: active
+
+## Problem
+
+The Cloud release contract currently requires every positive path, rare
+account state, operating system, and lifecycle failure to be repeated as one
+real-device matrix for every evidence commit. Some states need external
+accounts or subscriptions that a maintainer cannot safely manufacture. The
+Cartesian matrix spends time without adding commit-specific confidence.
+
+## Decision
+
+Keep the existing evidence schema and fail-closed verifier. Split evidence
+into two layers:
+
+1. Exact-target checks always run: CI, security and recovery contracts,
+   per-platform execution evidence — the candidate workflow's hash-bound
+   native runner smoke on every enabled platform, plus the installed-layout
+   provenance on the maintainer host and on every reachable lab host
+   (maintainer decision 2026-08-28: an unreachable lab host may fall back —
+   explicit per-run opt-in `HA_NOVA_EVIDENCE_RUNNER_FALLBACK=1` — to a
+   positive local verification of the bundle's signed Cloud release
+   evidence plus the runner smoke; only the installed-layout runtime
+   execution is skipped, named in the ledger; a reachable host is never
+   skipped) — and the exact installed Relay App. For deltas that match an invalidation-map row with
+   real-platform scope, one real reference-platform Cloud health smoke also
+   runs, using the downloaded candidate binary with Census suppressed —
+   unless the reference-smoke waiver below applies.
+2. Risk-scoped qualification runs on first support and after a relevant
+   implementation or evidence-harness change. A passing qualification remains
+   applicable across unrelated changes.
+
+The check owner must inspect the complete qualification-to-target diff before
+attesting carried evidence. The activation or release pull request records a
+non-secret qualification ledger for every carried check and keyring OS:
+qualified commit and tree, evidence reference, inspected target, and the
+change-class decision. The privileged evidence secret remains the attestation;
+the pull-request ledger makes its inputs reviewable without expanding the
+existing JSON schema. The verifier validates the privileged attestation and
+exact target; it does not infer the maintainer's invalidation decision. Missing
+or uncertain ledger data means rerun.
+
+Carry-forward applies only to the qualification behind a check boolean. The
+JSON envelope, commit/tree identity, candidate provenance, and installed App
+remain exact-target; the reference health smoke is exact-target for deltas
+with real-platform scope, waivable only under the reference-smoke waiver
+below. Never reuse an older JSON envelope, except through
+the ancestor-bound `uses:`-only and non-sensitive source escapes (see the
+escape section below and `docs/releasing.md`).
+The verifier binds that new envelope to the exact target. Reviewers verify the
+qualification ledger before the boolean is set to `true`.
+
+## Invalidation map
+
+Use the narrowest matching row. A change that matches multiple rows invalidates
+their union. A qualification trigger includes changes to every deterministic
+substitute and real evidence collection/validation harness it relies on.
+
+### Reference-smoke waiver (2026-08-19)
+
+When no validation infrastructure is available, the maintainer may waive the
+real reference-platform Cloud health smoke and exactly those real-platform
+qualification reruns that the delta's matched invalidation-map rows require.
+Eligible infrastructure gaps are exactly these three: no reachable reference
+platform; no completable human-gated Cloud authorization (no interactive
+desktop session exists); or — for rows scoped "Affected OS only" — no
+interactive desktop session on the affected OS, whose machine must still be
+provenance-reachable, because a fully unreachable enabled platform already
+fails the non-waivable provenance requirement.
+Nothing outside those rows is waivable, and every deterministic exact-target
+test still runs. Each waived check must itself be blocked by the named
+unavailable infrastructure; a check that can still run, runs. A waiver is never implicit: the PR ledger must name the
+unavailable infrastructure that makes the waiver eligible, the waived
+checks, the last real qualification they carry from, the exact crossing
+delta, and state that the maintainer accepts the residual risk. Four things
+are never waivable: the JSON envelope, the commit/tree identity, the
+per-platform execution evidence (the candidate workflow's native runner
+smoke; installed-layout provenance on the maintainer host and reachable
+lab hosts; opted-in fallback platforms get a positive local verification
+of their signed bundle evidence), and the live `installed_relay_app`
+check. None of the four requires the reference platform: the runner smokes
+run in the candidate workflow itself, and `installed_relay_app`
+is a live relay health read that may run from any host that reaches the
+installed Relay App. The map rows' "one reference platform" scope governs
+only the waivable qualification repeats — including the Relay-App row's —
+never this live read, which is a separate, platform-independent, mandatory
+proof. If even one of the four cannot be completed, there is
+no waiver and the delta stays unmergeable. The remaining levers are then a
+reviewed pull request that removes the unavailable platform from
+`cloud_remote_platforms` — which relieves only that platform's candidate
+provenance — or one that disables Cloud remote entirely; full disable is the
+only lever when the envelope, the commit/tree identity, or the live
+`installed_relay_app` read cannot be completed. Waived checks remain first in
+line for a real rerun once infrastructure is available again: the backlog
+rerun is then due before the next release tag, and while it is pending no
+evidence session may set the affected check booleans without either running
+it or recording in the ledger why it is still blocked.
+
+| Changed surface | Qualification to repeat | Real platform scope |
+|---|---|---|
+| Cloud or Relay transport, Ingress session, endpoint, or route selection | `parity`, `stress_10000`, `routing`, relevant lifecycle and non-disclosure paths | One reference platform |
+| Shared native-secret orchestration | `keyrings` | One reference platform, plus any OS with different behavior |
+| macOS, Windows, or Linux native-store adapter | `keyrings`; relevant lifecycle path | Affected OS only |
+| `internal-cloud-stress` or its evidence collection/validation harness | `stress_10000` | One reference platform |
+| OAuth, Home Assistant user binding, or App discovery | `roles`, `domains_mfa`; relevant authorization lifecycle | One reference platform |
+| Relay App startup, identity, device registry, or installation | `installed_relay_app`; relevant lifecycle and redirect paths | One reference platform |
+| CLI setup, install, update, uninstall, signing identity, or authorization retention | `signing_and_update_matrix`; relevant lifecycle path | Affected OS only; exact provenance still runs on all enabled OSes |
+| Config, argv, logs, diagnostics, or AI-visible output | `redirects_non_disclosure` | Affected surface; one retained real artifact scan |
+| A deterministic substitute or real evidence collection/validation harness | Its owning qualification | Same scope as that qualification |
+| Release workflow or provenance machinery only | `signing_and_update_matrix` | Exact provenance on all enabled OSes |
+| Unrelated docs, tests, process, or product code | None | Exact-target layer only; see the non-sensitive source escape below |
+
+## Non-sensitive source escape (added 2026-08-12)
+
+The `None` row's exact-target requirement made every docs/skills pull
+request cost one maintainer evidence session (measured on the 2026-08-09/10
+audit train: one session per PR, twelve PRs). The verifier therefore accepts
+a carried envelope when the complete ancestor-to-target delta is confined to
+regular non-executable Markdown files under `docs/` or `skills/` or at the
+repository root, none carrying an agent-policy basename (any basename whose
+stem starts with `agent(s)`, `claude`, or `gemini` — suffix variants like
+`AGENTS.override.md` included — at any depth, case-folded) — with one content
+guard applied to every file in the delta (a guarded subcommand anywhere
+after its command on the same line counts; no option grammar): no changed
+line, nor a context line adjacent to a change, may touch these families —
+
+- downloaders and pipe-to-shell invocations, including the PowerShell
+  download and expression verbs;
+- package-manager installs across language and OS ecosystems, and remote
+  package runners that fetch before executing;
+- inline interpreter execution, wrapped or encoded shell invocations, and
+  version-pinned remote source builds;
+- raw-script and CDN script sources;
+- shell line continuations, where a trailing backtick counts only when
+  unpaired, so balanced Markdown code spans and fences do not.
+
+The families are named here on purpose and the concrete tokens live only in
+`scripts/release/verify-cloud-nonsensitive-source.mjs`, which is the
+authority: a spec that enumerated every verb would drift from the code, and
+would trigger its own guard on every edit. Those lines are the copy-paste
+surface users and agents
+execute blindly; changing them keeps the full evidence path. The guard
+forces textual diffs (`--text`, `--no-ext-diff`), scans every line after the first
+hunk marker so header-shaped content cannot dodge it, requires
+printable-ASCII paths, rejects control characters other than tab in changed
+lines (UTF-16 or NUL padding cannot split command words), and fails closed
+when a changed file yields no scannable delta — so in-tree diff attributes,
+binary heuristics, or text/path encoding can never blind it. It stays
+documented as best-effort: a denylist cannot be complete, and PR review
+stays the semantic control.
+
+Deliberate exclusions: `tests/**` stays outside the escape because
+privileged release workflows execute repository tests with
+production-environment secrets, so test content must remain attested.
+Agent-policy basenames (stems `agent(s)`, `claude`, `gemini`, with any
+suffix — `AGENTS.md`, `AGENTS.override.md`, `CLAUDE.md`, `GEMINI.md`)
+stay outside at every depth and in any case spelling — agents load them per
+subtree, Codex prefers override variants, and
+on a case-insensitive checkout an added `agents.md`/`claude.md` would
+materialize as the executable policy of agents operating with maintainer
+credentials (`CLAUDE.md` is additionally a symlink, rejected by mode).
+Non-Markdown files (assets, dotfiles such as `.gitattributes`) stay
+outside.
+
+Residual risk, accepted deliberately: skill files instruct AI agents and are
+protected under this escape by PR review, Codex, and the skill contract
+tests instead of the privileged attestation — the envelope never verified
+skill content, it sealed the tree. Enforced by
+`scripts/release/verify-cloud-nonsensitive-source.mjs`, called by
+`verify-cloud-release-gate.sh` after the `uses:`-only escape fails; mixed
+deltas fail closed.
+
+## Check contract
+
+- `parity`: real `/health`, `/ws`, `/core`, `/files`, and `/backups` parity on
+  one reference platform for every Cloud or Relay transport change.
+- `stress_10000`: one real bounded run per Cloud or Relay transport change or
+  stress-harness change, not once per operating system.
+- `keyrings`: real happy-path and fail-closed no-UI behavior on every enabled
+  OS for first support. A shared orchestration change repeats one reference OS;
+  an adapter change repeats only its affected OS. Deterministic platform tests
+  cover cancellation and timeout branches.
+- `roles`: one real standard non-administrator binding on a reference
+  platform. Exact-target tests verify that the authenticated Home Assistant
+  user and Relay instance remain bound through setup and functional dispatch;
+  Owner and administrator add no separate transport path.
+- `domains_mfa`: one real canonical Nabu Casa OAuth flow. Home Assistant owns
+  the MFA challenge before returning the same OAuth callback, so HA NOVA does
+  not manufacture account-specific MFA proof. Deterministic tests cover
+  custom-origin canonicalization, inactive subscription, disabled remote
+  access, and authorization abort.
+- `lifecycle`: one isolated Cloud-authorized profile first covers Relay App
+  restart and reinstall recovery, then HA NOVA CLI standard uninstall/reinstall
+  with retained authorization. Full purge is last; it revokes and verifies the
+  active remote authorization and device before local cleanup. Deterministic
+  crash/concurrency tests cover every durable boundary; update and
+  instance-mismatch paths get a real run when those paths change.
+- `redirects_non_disclosure`: exact-target redirect, argv, config, log,
+  diagnostic, and AI-output tests plus one retained real artifact scan after
+  a relevant transport, config, argv, log, diagnostics, or AI-output change.
+- `installed_relay_app`: always exact-target. Supervisor builds the reviewed
+  source, the App reports the expected version, and the reviewed Cloud routes
+  exist.
+- `routing`: one real automatic local-to-Cloud fallback after a routing
+  change; exact-target tests cover every fail-closed non-fallback outcome.
+- `signing_and_update_matrix`: always verify exact candidate signatures and
+  provenance on all enabled platforms. Repeat real install/update behavior
+  only after installer, updater, signing identity, or native authorization
+  changes. Existing release rules still decide when an RC rehearsal is
+  mandatory.
+
+No mock may replace the required real positive path. No carried
+qualification may cross a relevant implementation change, except those the
+reference-smoke waiver covers, which records that crossing explicitly in the
+ledger.
+
+The exact-target Cloud health smoke is not `parity`. It repeats only for a
+target whose delta matches an invalidation-map row with real-platform scope;
+a maintenance delta (the `None` and release-machinery rows) refreshes the
+envelope and provenance without a new smoke. When due, the official
+downloaded candidate binary must run with `HA_NOVA_NO_CENSUS=1`
+against the exact installed Relay App (from an isolated smoke profile — see
+`docs/releasing.md` for the collision-safe setup):
+
+```bash
+HOME=<smoke-home> HA_NOVA_NO_CENSUS=1 <candidate-binary> relay health \
+  --server <smoke-profile> --via cloud
+```
+
+The result must identify the expected App version and a healthy Home Assistant
+WebSocket. Do not retain the private Cloud URL.
+
+## Acceptance
+
+- The JSON schema remains unchanged; the verifier's stale-evidence path was
+  extended by the 2026-08-12 non-sensitive source escape.
+- `docs/releasing.md`, `docs/reference/testing.md`, and the Cloud remote spec
+  describe the same risk-scoped contract.
+- Repository documentation checks pass.
+- No product, workflow, version metadata, README, or tag changes; the
+  release-gate verifier extension is the 2026-08-12 escape itself.
+- The 2026-08-19 reference-smoke waiver changes only the maintainer
+  contract; the verifier and gate code are untouched.

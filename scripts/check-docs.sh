@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 #
-# check-docs.sh — Verify that factual claims in README.md and CONTRIBUTING.md
-# match the actual codebase. Run in CI to catch stale docs.
+# check-docs.sh — Verify documentation facts and lifecycle rules against the
+# actual codebase. Run in CI to catch stale docs.
 #
 # Exit 0 = all claims verified. Exit 1 = at least one mismatch.
 #
@@ -25,28 +25,49 @@ echo ""
 
 # ── 1. LOC count ──
 # The relay must stay small enough that a person can read it. The ceiling moved
-# from 2000 to 2800 across relay 0.4.0: the opt-in file transport is ~500 lines,
-# split into three modules (gate / path security / operations), and most of that
-# is containment, deny rules and the code-execution boundary. Growth here is
-# security surface, and it is reviewed as such. The README's own number is
-# updated in the release-prep PR — README describes the STABLE release, not main.
+# from 2000 to 2800 across relay 0.4.0 (opt-in file transport: containment,
+# deny rules, code-execution boundary) and to 3200 across relay 0.5.0 (the
+# generic config-snapshot store, ~330 lines of validation, caps and prune;
+# and to 3300 for the diagnosability wave: disconnect reasons, request
+# logging, server timeouts; and to 3700 for Wave 6's bounded pairing manager,
+# persisted App credential, and code-authenticated transport endpoint; and to
+# 3900 for Home Base's static status renderer and Supervisor ingress gate; and
+# to 7000 for the secure device-pairing wave (relay 0.7): the OPAQUE (RFC 9807)
+# server, a persistent self-signed TLS identity with SPKI pinning, durable
+# atomic-file storage, the versioned fail-closed device registry, the pairing
+# state machine, per-device auth, three listeners, legacy migration, and the
+# NOVA owner console with CSRF-protected form actions including legacy-access
+# revocation and corrupt-registry owner recovery; and to 9000 for the reviewed
+# Cloud ingress/security wave: persistent Relay identity, HA-user-bound device
+# credentials and revocation, ingress-only OPAQUE pairing v2, strict shared
+# ingress identity and principal gates, bounded request bodies, atomic
+# pairing-response persistence with replay protection, and cleanup-only routes
+# while Cloud is disabled; and to 9200 for the #482 owner-console safety
+# rework: the armed two-step confirm flow with device-bound CSRF tokens, the
+# typed registry-reset gate, and throttled last-used tracking with disk-failure
+# fallback in the device auth path. The current reviewed tree is about 9030
+# lines; the 9200 ceiling leaves only narrow refactoring headroom and still
+# fails further unreviewed Relay growth.
+# Growth here is security surface, and it is reviewed as such. The README's own
+# number is updated in the release-prep PR — README describes the STABLE
+# release, not main.
 echo "[1] Relay LOC (must stay readable in one sitting)"
 ACTUAL_LOC=$(find "$REPO_ROOT/nova/src" -name '*.ts' -exec cat {} + | wc -l | tr -d ' ')
-if (( ACTUAL_LOC >= 1000 && ACTUAL_LOC <= 2800 )); then
-  pass "src/ = ${ACTUAL_LOC} LOC (within 1000–2800 range)"
+if (( ACTUAL_LOC >= 1000 && ACTUAL_LOC <= 9200 )); then
+  pass "src/ = ${ACTUAL_LOC} LOC (within 1000–9200 range)"
 else
-  fail "src/ = ${ACTUAL_LOC} LOC — outside the 1000–2800 range. If this is real growth, justify it and update the README claim in the release-prep PR."
+  fail "src/ = ${ACTUAL_LOC} LOC — outside the 1000–9200 range. Justify real Relay growth in active architecture docs; update README only in a release-prep PR."
 fi
 
 # ── 2. Skill count ──
-# Active skill inventory expects 29 top-level skill directories
-# (context skill + 28 sub-skills; yaml-config/assist/admin/external-sources added 2026-07-11)
-echo "[2] Skill directory count (current inventory expects 29)"
+# Active skill inventory expects 31 top-level skill directories
+# (context skill + 30 sub-skills; hacs added 2026-08-04)
+echo "[2] Skill directory count (current inventory expects 31)"
 SKILL_COUNT=$(find "$REPO_ROOT/skills" -mindepth 1 -maxdepth 1 -type d | wc -l | tr -d ' ')
-if (( SKILL_COUNT == 29 )); then
+if (( SKILL_COUNT == 31 )); then
   pass "skills/ has ${SKILL_COUNT} directories"
 else
-  fail "skills/ has ${SKILL_COUNT} directories — active docs/contracts expect 29. Update README and architecture docs."
+  fail "skills/ has ${SKILL_COUNT} directories — active docs/contracts expect 31. Update PROJECT and architecture docs; update README only in release prep."
 fi
 
 # ── 2b. One relay codebase, two distributions ──
@@ -85,16 +106,25 @@ else
 fi
 
 # ── 5. No unplanned feature creep ──
-# The relay must stay minimal: no backup endpoints, no streaming. File access
-# EXISTS (relay 0.4.0, for YAML-only configuration that has no API) but it is a
-# capability, not a default — so the check is stricter than "no filesystem":
-# it fails if the opt-in gate ever disappears.
-echo "[5] No backup/streaming endpoints; file access stays opt-in"
-CREEP_HITS=$(count_matches "backup_endpoint\|/backup\|/stream\|EventSource\|SSE" "$REPO_ROOT/nova/src/http/handlers/")
+# The relay must stay minimal: no streaming, and the config-snapshot store
+# (relay 0.5.0, POST /backups) must stay a GENERIC blob store — the moment it
+# imports the HA clients it has become a domain feature, which is the creep
+# this check exists to catch. File access EXISTS (relay 0.4.0) but it is a
+# capability, not a default — the check fails if the opt-in gate disappears.
+echo "[5] No streaming endpoints; snapshot store stays generic; file access stays opt-in"
+CREEP_HITS=$(count_matches "/stream\|EventSource\|SSE" "$REPO_ROOT/nova/src/http/handlers/")
 if (( CREEP_HITS != 0 )); then
-  fail "Found ${CREEP_HITS} hits for backup/streaming endpoints in handlers/ — the relay must stay minimal."
+  fail "Found ${CREEP_HITS} hits for streaming endpoints in handlers/ — the relay must stay minimal."
 else
-  pass "No backup/streaming endpoints found"
+  pass "No streaming endpoints found"
+fi
+if [[ -f "$REPO_ROOT/nova/src/http/handlers/backups.ts" ]]; then
+  DOMAIN_HITS=$(count_matches "ha/rest-client\|ha/ws-client\|coreClient\|wsClient" "$REPO_ROOT/nova/src/http/handlers/backups.ts")
+  if (( DOMAIN_HITS != 0 )); then
+    fail "backups.ts touches the HA clients — the snapshot store must stay a generic blob store."
+  else
+    pass "Snapshot store is a generic blob store (no HA client imports)"
+  fi
 fi
 
 if [[ -f "$REPO_ROOT/nova/src/http/handlers/files.ts" ]]; then
@@ -139,10 +169,46 @@ done
 # ── 9. Route count — verify relay stays minimal ──
 echo "[9] Relay route count"
 ROUTE_COUNT=$(grep -c "router.register" "$REPO_ROOT/nova/src/index.ts" 2>/dev/null || true)
-if (( ROUTE_COUNT <= 5 )); then
-  pass "Relay has ${ROUTE_COUNT} routes (≤5 — still minimal)"
+if (( ROUTE_COUNT <= 7 )); then
+  pass "Relay has ${ROUTE_COUNT} routes (≤7 — still minimal)"
 else
   fail "Relay has ${ROUTE_COUNT} routes — growing beyond 'minimal'. Review architecture claims."
+fi
+
+echo "[9c] Home Base stays read-only and Supervisor-ingress-only"
+HOME_HITS=$(count_matches "ha/rest-client\|ha/ws-client\|coreClient\|sendMessage\|entity_id\|service_data" \
+  "$REPO_ROOT/nova/src/http/handlers/home.ts")
+if (( HOME_HITS == 0 )); then
+  pass "Home Base has no HA client or mutation imports"
+else
+  fail "Home Base contains ${HOME_HITS} HA client/mutation hits — it must remain read-only status."
+fi
+if grep -q 'panel_admin: true' "$REPO_ROOT/nova/config.yaml" \
+  && grep -q 'ingress_entry: /home' "$REPO_ROOT/nova/config.yaml" \
+  && grep -q 'SUPERVISOR_INGRESS_PEERS' "$REPO_ROOT/nova/src/security/ingress-identity.ts" \
+  && grep -q 'resolveIngressIdentity' "$REPO_ROOT/nova/src/http/handlers/home.ts" \
+  && grep -q 'resolveIngressIdentity' "$REPO_ROOT/nova/src/http/handlers/cloud.ts" \
+  && grep -q 'resolveIngressIdentity' "$REPO_ROOT/nova/src/runtime/ingress-listener.ts" \
+  && grep -q 'HOME_CONTENT_SECURITY_POLICY' "$REPO_ROOT/nova/src/http/handlers/home.ts"; then
+  pass "Home Base and Cloud routes share the strict Supervisor ingress gate; Home Base keeps admin-panel ingress and CSP"
+else
+  fail "Home Base and Cloud routes must share the strict Supervisor ingress gate; Home Base must keep admin-only ingress and CSP."
+fi
+
+# Pairing is a generic credential exchange, never a second HA API surface.
+echo "[9b] Pairing stays transport-only and narrowly bearer-exempt"
+PAIR_HITS=$(count_matches "ha/rest-client\|ha/ws-client\|coreClient\|wsClient\|entity_id\|service_data" \
+  "$REPO_ROOT/nova/src/http/handlers/pair.ts" "$REPO_ROOT/nova/src/security/pairing.ts")
+if (( PAIR_HITS == 0 )); then
+  pass "Pairing has no HA client or domain imports"
+else
+  fail "Pairing contains ${PAIR_HITS} HA client/domain hits — it must remain a generic credential exchange."
+fi
+if grep -q 'const PAIR_PATH = "/pair"' "$REPO_ROOT/nova/src/index.ts" \
+  && grep -q 'bearerExemptRoutes: new Set(\[PAIR_ROUTE, HOME_ROUTE\])' "$REPO_ROOT/nova/src/index.ts"; then
+  pass "Only POST /pair and ingress-gated GET /home bypass relay bearer auth"
+else
+  fail "Bearer exemptions must stay pinned to POST /pair and ingress-gated GET /home."
 fi
 
 # ── 10. Keychain usage exists ──
@@ -158,12 +224,85 @@ fi
 echo "[11] No telemetry or analytics code"
 # "segment" alone is an English word (path segments!) — match the vendors, not
 # the vocabulary, or the check cries wolf and gets ignored.
-TELEMETRY_HITS=$(count_matches "telemetry\|analytics\|mixpanel\|segment\.io\|@segment/\|posthog\|sentry" "$REPO_ROOT/nova/src")
-if (( TELEMETRY_HITS == 0 )); then
-  pass "No telemetry/analytics patterns in src/"
+# Scope: relay and CLI. The ONLY sanctioned measurement is the opt-in Census:
+# its client is confined to cli/census*.go and its receiver is confined to
+# census-worker/, both policed by checks [12]/[12b] and contract tests. -I
+# skips locally built binaries.
+TELEMETRY_HITS=$(count_matches -I "telemetry\|analytics\|mixpanel\|segment\.io\|@segment/\|posthog\|sentry" --exclude='census*.go' "$REPO_ROOT/nova/src" "$REPO_ROOT/cli")
+WORKER_VENDOR_HITS=$(count_matches -I "telemetry\|mixpanel\|segment\.io\|@segment/\|posthog\|sentry" "$REPO_ROOT/census-worker/src")
+if (( TELEMETRY_HITS == 0 && WORKER_VENDOR_HITS == 0 )); then
+  pass "No telemetry/analytics patterns outside the Census; no behavioral analytics vendors in its Worker"
 else
-  fail "Found ${TELEMETRY_HITS} telemetry-related patterns in src/ — README claims 'No telemetry'."
+  fail "Found $((TELEMETRY_HITS + WORKER_VENDOR_HITS)) telemetry-related patterns outside the allowed Census measurement — HA NOVA promises no behavioral or feature-use analytics."
 fi
+
+# ── 12. Census send path stays confined and opt-in gated ──
+# The opt-in census (docs/reference/census.md) may send exactly one thing from
+# exactly one place: cli/census*.go. If the endpoint constant or the send
+# function leaks into any other file, the documented census boundary is false.
+echo "[12] Census send path confined to cli/census*.go with the opt-in guard"
+CENSUS_SEND_LEAKS=$(count_matches -I "sendCensusPing\|censusEndpointURL\|censusPingURL\|censusStatsURL\|censusHTTPClient\|workers\.dev" --include='*.go' --exclude='census*.go' "$REPO_ROOT/cli")
+if (( CENSUS_SEND_LEAKS == 0 )); then
+  pass "census send surface (send func, endpoint constant/URLs, HTTP client) appears only in cli/census*.go"
+else
+  fail "Found ${CENSUS_SEND_LEAKS} census send-path references outside cli/census*.go — the ping must stay confined to the census module."
+fi
+if grep -q 'if !state.Enabled' "$REPO_ROOT/cli/census.go"; then
+  pass "Census carrier keeps the opt-in guard (if !state.Enabled)"
+else
+  fail "cli/census.go lost the opt-in guard 'if !state.Enabled' — nothing may ever send without an explicit yes."
+fi
+
+# ── 12b. Census Worker request reads stay positively allowlisted ──
+# Cloudflare necessarily processes transport metadata. HA NOVA's narrower
+# promise is enforced through AST inspection instead of a bypassable blacklist:
+# the Worker may read only method, URL, body, content headers, and the explicit
+# Cloudflare Access/local-test authentication headers from the incoming Request.
+echo "[12b] Census Worker request access stays positively allowlisted"
+if node "$REPO_ROOT/scripts/test/check-census-worker-request-access.mjs"; then
+  pass "Census Worker request access excludes source-IP metadata"
+else
+  fail "Census Worker request access escaped its allowlist — update the privacy contract before adding any new request metadata."
+fi
+
+# ── 13. Work docs stay temporary and genuinely active ──
+echo "[13] Work-document lifecycle"
+while IFS= read -r work_doc_path; do
+  declared_status_line=$(grep -m1 '^Status:' "$work_doc_path" || true)
+  if [[ ! "$declared_status_line" =~ ^Status:\ (active|merged|superseded|abandoned)($|[[:space:]]) ]]; then
+    fail "${work_doc_path#"$REPO_ROOT/"} must declare Status: active, merged, superseded, or abandoned"
+  elif [[ ! "$declared_status_line" =~ ^Status:\ active($|[[:space:]]) ]]; then
+    fail "${work_doc_path#"$REPO_ROOT/"} is not active — move it to docs/archive/work or delete it"
+  else
+    pass "${work_doc_path#"$REPO_ROOT/"} declares active status"
+  fi
+done < <(
+  find "$REPO_ROOT/docs/work" -maxdepth 1 -type f -name '*.md' \
+    ! -name 'README.md' -print | sort
+)
+
+current_client_version=$(node -p "require('$REPO_ROOT/package.json').version")
+while IFS= read -r release_body_path; do
+  release_body_name=$(basename "$release_body_path")
+  release_body_version=${release_body_name%-release-body.md}
+  if node -e '
+    const [candidate, current] = process.argv.slice(1).map((value) =>
+      value.split(".").map((part) => Number.parseInt(part, 10)),
+    );
+    for (let index = 0; index < 3; index += 1) {
+      if (candidate[index] > current[index]) process.exit(0);
+      if (candidate[index] < current[index]) process.exit(1);
+    }
+    process.exit(1);
+  ' "$release_body_version" "$current_client_version"; then
+    pass "$release_body_name targets a future version"
+  else
+    fail "$release_body_name is not newer than v$current_client_version — archive it during release prep"
+  fi
+done < <(
+  find "$REPO_ROOT/docs/work" -maxdepth 1 -type f \
+    -name '*-release-body.md' ! -name 'next-release-body.md' -print | sort
+)
 
 # ── Results ──
 echo ""

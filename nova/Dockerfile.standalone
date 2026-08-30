@@ -22,6 +22,11 @@ FROM node:22-alpine
 # and talks HTTP; a compromised process should not own the container.
 RUN addgroup -S nova && adduser -S nova -G nova
 
+# Config-snapshot store (POST /backups) — must be writable by the nova user or
+# every save fails EACCES. Ephemeral unless a volume is mounted here (see
+# docs/reference/relay-container.md); SNAPSHOT_DIR overrides the location.
+RUN mkdir -p /data/ha_nova_snapshots && chown -R nova:nova /data
+
 WORKDIR /app
 COPY --from=build --chown=nova:nova /app/dist ./dist
 COPY --from=build --chown=nova:nova /app/node_modules ./node_modules
@@ -38,9 +43,9 @@ ENV RELAY_VERSION=${RELAY_VERSION}
 ENV RELAY_PORT=8791
 EXPOSE 8791
 
-# The relay's own /health is bearer-authenticated (there is no unauthenticated
-# surface), so the container healthcheck asserts the port is serving HTTP —
-# a 401 proves the process is up and authenticating.
+# The relay's own /health is bearer-authenticated, so the container healthcheck
+# asserts the port is serving HTTP — a 401 proves the process is up and
+# authenticating. POST /pair uses its one-time code as the credential.
 HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 \
   CMD node -e "require('node:http').get({host:'127.0.0.1',port:process.env.RELAY_PORT||8791,path:'/health'},r=>process.exit(r.statusCode?0:1)).on('error',()=>process.exit(1))"
 

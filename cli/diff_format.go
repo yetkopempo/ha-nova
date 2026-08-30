@@ -4,13 +4,14 @@ import (
 	"encoding/json"
 	"fmt"
 	"strings"
+	"unicode/utf8"
 )
 
 // This file holds the presentation half of `ha-nova diff`: turning a computed
-// change (a path plus before/after values) into the stable, human-readable text
-// the skill prints verbatim under the localized changes slot. The comparison and tree-walk
-// logic lives in diff.go; splitting the two keeps each file focused and under the
-// repo's size guardrail.
+// change (a path plus before/after values) into the stable GFM table data rows
+// (`| Field | before | after |`) the skill prints verbatim under its localized
+// header row. The comparison and tree-walk logic lives in diff.go; splitting
+// the two keeps each file focused and under the repo's size guardrail.
 
 // jsonTypeName names the JSON type of a decoded value for diff disambiguation.
 func jsonTypeName(v interface{}) string {
@@ -31,60 +32,6 @@ func jsonTypeName(v interface{}) string {
 	return "value"
 }
 
-var arraySingular = map[string]string{
-	"triggers": "Trigger", "conditions": "Condition", "actions": "Action", "sequence": "Step",
-}
-
-// humanizeLabel turns a path into a stable, readable label, e.g.
-// [mode] -> "Mode", [actions,1,delay] -> "Action 2 (delay)".
-func humanizeLabel(segs []segment) string {
-	var head string
-	var leaf []string
-	for i := 0; i < len(segs); {
-		s := segs[i]
-		if s.isIndex {
-			leaf = append(leaf, fmt.Sprintf("#%d", s.index+1))
-			i++
-			continue
-		}
-		if i+1 < len(segs) && segs[i+1].isIndex {
-			name := arraySingular[s.key]
-			if name == "" {
-				name = titleFirst(s.key)
-			}
-			token := fmt.Sprintf("%s %d", name, segs[i+1].index+1)
-			if head == "" && len(leaf) == 0 {
-				head = token
-			} else {
-				leaf = append(leaf, strings.ToLower(name)+fmt.Sprintf(" %d", segs[i+1].index+1))
-			}
-			i += 2
-			continue
-		}
-		if head == "" && len(leaf) == 0 {
-			head = titleFirst(s.key)
-		} else {
-			leaf = append(leaf, s.key)
-		}
-		i++
-	}
-	switch {
-	case len(leaf) == 0:
-		return head
-	case head == "":
-		return strings.Join(leaf, " › ")
-	default:
-		return head + " (" + strings.Join(leaf, " › ") + ")"
-	}
-}
-
-func titleFirst(s string) string {
-	if s == "" {
-		return s
-	}
-	return strings.ToUpper(s[:1]) + s[1:]
-}
-
 func formatValue(v interface{}) string {
 	switch t := v.(type) {
 	case nil:
@@ -93,10 +40,15 @@ func formatValue(v interface{}) string {
 		if t == "" {
 			return `""`
 		}
-			// Escape control chars (newlines/tabs from a multiline description or
-			// template) and cap length so one value can't split a changes bullet
-			// into unprefixed lines — the skill prints this CLI output verbatim.
-		return truncate(escapeInline(t))
+		if t == "—" {
+			// A literal em dash as the user's value would be indistinguishable
+			// from the absence marker (`| Field | — | — |` on add/remove) —
+			// quote it, same pattern as the empty string above.
+			return `"—"`
+		}
+		// Raw on purpose: truncation and escaping happen exactly once, in
+		// escapeCell, when the value becomes a table cell.
+		return t
 	case bool:
 		if t {
 			return "true"
@@ -108,9 +60,9 @@ func formatValue(v interface{}) string {
 		if isDurationMap(t) {
 			return formatDuration(t)
 		}
-		return truncate(compactJSON(t))
+		return compactJSON(t)
 	default:
-		return truncate(compactJSON(v))
+		return compactJSON(v)
 	}
 }
 
@@ -142,7 +94,7 @@ func formatDuration(m map[string]interface{}) string {
 		}
 	}
 	if len(parts) == 0 {
-		return truncate(compactJSON(m))
+		return compactJSON(m)
 	}
 	return strings.Join(parts, " ")
 }
@@ -158,25 +110,25 @@ func summarizeConfigItem(v interface{}) string {
 		return formatValue(v)
 	}
 	if alias, _ := m["alias"].(string); alias != "" {
-		return truncate(fmt.Sprintf("%q", escapeInline(alias)))
+		return fmt.Sprintf("%q", alias)
 	}
 	if action, _ := m["action"].(string); action != "" {
-		return truncate("action " + escapeInline(action))
+		return "action " + action
 	}
 	if service, _ := m["service"].(string); service != "" {
-		return truncate("action " + escapeInline(service))
+		return "action " + service
 	}
 	if platform, _ := m["platform"].(string); platform != "" {
-		return truncate("trigger " + escapeInline(platform))
+		return "trigger " + platform
 	}
 	if trigger, _ := m["trigger"].(string); trigger != "" {
-		return truncate("trigger " + escapeInline(trigger))
+		return "trigger " + trigger
 	}
 	if condition, _ := m["condition"].(string); condition != "" {
-		return truncate("condition " + escapeInline(condition))
+		return "condition " + condition
 	}
 	if delay, ok := m["delay"]; ok {
-		return truncate("delay " + formatValue(delay))
+		return "delay " + formatValue(delay)
 	}
 	if _, ok := m["wait_template"]; ok {
 		return "wait_template"
@@ -187,7 +139,7 @@ func summarizeConfigItem(v interface{}) string {
 	if blockSummary := summarizeBlockItem(m); blockSummary != "" {
 		return blockSummary
 	}
-	return truncate(compactJSON(m))
+	return compactJSON(m)
 }
 
 // configItemKind identifies what KIND of step an item is (which service call,
@@ -265,14 +217,105 @@ func compactJSON(v interface{}) string {
 	return string(out)
 }
 
-func truncate(s string) string {
-	const max = 180
-	if len(s) <= max {
-		return s
-	}
-	return s[:max] + "…"
+// maxCellBytes caps one table cell's raw content. 80 keeps ordinary
+// one-sentence notification copy whole while two value columns still fit a
+// terminal line; longer values truncate with `…` — the full text is always one
+// `show yaml` away, and write-safety obliges the summary to name what a
+// truncated value changed.
+const maxCellBytes = 80
+
+// maxFieldCellBytes gives the field column more room than the value columns:
+// anchored labels carry entity IDs plus a field name, and cutting the FIELD
+// mid-name ("… › be…") loses what identifies the row. Labels are constructed,
+// not user-authored, so 120 bounds the pathological case only.
+const maxFieldCellBytes = 120
+
+// tableRow renders one GFM table data row. Every cell passes through
+// escapeCellWithCap exactly once, here — callers hand over raw content and
+// never pre-escape.
+func tableRow(field, before, after string) string {
+	return "| " + escapeCellWithCap(field, maxFieldCellBytes) + " | " + escapeCell(before) + " | " + escapeCell(after) + " |"
 }
 
-func escapeInline(s string) string {
-	return strings.NewReplacer("\n", `\n`, "\r", `\r`, "\t", `\t`).Replace(s)
+// escapeCell makes one value cell safe inside a table row the skill prints
+// verbatim: rune-safe truncation to maxCellBytes, control-character escaping
+// (a raw newline would break the whole table, not just one bullet), and pipe
+// escaping so a value — Jinja templates love `|` — can never add a column.
+// Truncation runs first so an escape sequence is never cut in half; escapes
+// may push the final cell slightly past the cap, which bounds content, not
+// framing.
+func escapeCell(s string) string {
+	return escapeCellWithCap(s, maxCellBytes)
+}
+
+func escapeCellWithCap(s string, cap int) string {
+	truncated := false
+	if len(s) > cap {
+		cut := cap
+		for cut > 0 && !utf8.RuneStart(s[cut]) {
+			cut--
+		}
+		s = s[:cut]
+		truncated = true
+	}
+	s = strings.NewReplacer("\n", `\n`, "\r", `\r`, "\t", `\t`, "|", `\|`).Replace(s)
+	if truncated {
+		s += "…"
+	}
+	return s
+}
+
+// itemsCell renders an array length as a self-labeling cell ("1 item",
+// "3 items") so a count row can never be misread as a numeric value change.
+func itemsCell(n int) string {
+	if n == 1 {
+		return "1 item"
+	}
+	return fmt.Sprintf("%d items", n)
+}
+
+// divergenceContextBytes is how much shared text stays visible before the
+// first difference when focusDivergence trims a long common prefix.
+const divergenceContextBytes = 20
+
+// withTypeSuffix appends the disambiguating type label so it survives the
+// cell cap: for identically-rendered values the type IS the only visible
+// change, so the value is pre-trimmed (rune-safe, `…`) to leave room for the
+// suffix inside maxCellBytes — escapeCell must never cut the label off.
+func withTypeSuffix(v, typeName string) string {
+	suffix := " (" + typeName + ")"
+	limit := maxCellBytes - len(suffix) - len("…")
+	if len(v)+len(suffix) > maxCellBytes {
+		cut := limit
+		for cut > 0 && !utf8.RuneStart(v[cut]) {
+			cut--
+		}
+		v = v[:cut] + "…"
+	}
+	return v + suffix
+}
+
+// focusDivergence keeps the FIRST difference of a changed value pair visible.
+// Without it, two long values sharing their first maxCellBytes bytes (a
+// notification message edited near the end) would truncate into two identical
+// `<prefix>…` cells — and write-safety requires changed copy to be visible in
+// the preview. When either side would truncate, the shared prefix is cut to
+// divergenceContextBytes of context (rune-safe, marked with a leading `…`);
+// escapeCell still caps the tail afterwards.
+func focusDivergence(before, after string) (string, string) {
+	if len(before) <= maxCellBytes && len(after) <= maxCellBytes {
+		return before, after
+	}
+	p := 0
+	for p < len(before) && p < len(after) && before[p] == after[p] {
+		p++
+	}
+	if p <= divergenceContextBytes {
+		return before, after
+	}
+	start := p - divergenceContextBytes
+	for start > 0 && !utf8.RuneStart(before[start]) {
+		start--
+	}
+	return "…" + before[start:], "…" + after[start:]
 }

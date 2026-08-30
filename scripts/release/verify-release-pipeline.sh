@@ -4,8 +4,8 @@
 # Two layers:
 #   1. Static workflow invariants every release depends on (no GitHub
 #      permissions; runs in CI and locally).
-#   2. The live GitHub tag-ruleset state that makes "release tags are
-#      maintainer-pushed, the RC workflow never auto-publishes" actually true.
+#   2. The live GitHub production-environment and tag-ruleset state that keeps
+#      production secrets on main/v* and makes release tags maintainer-pushed.
 #
 # The live layer auto-skips entirely with a notice when the current token cannot
 # read rulesets at all (e.g. a token with no repo access), so the same script
@@ -32,7 +32,7 @@ POLICY_FILE="${ROOT_DIR}/.github/policy/repo-policy.json"
 # default it skips with a notice when the token cannot see them, so the weekly
 # audit on the read-only default token does not go red on every run. The
 # release preflight sets HA_NOVA_RELEASE_AUDIT_REQUIRE_BYPASS=1 to make that
-# case fail closed, so a release never proceeds with the guard unverified.
+# case fail closed and verify the production environment before any release.
 REQUIRE_BYPASS="${HA_NOVA_RELEASE_AUDIT_REQUIRE_BYPASS:-0}"
 
 fail() {
@@ -40,6 +40,9 @@ fail() {
   exit 1
 }
 note() { echo "::notice::$*"; }
+
+[[ "${REPO}" == "markusleben/ha-nova" ]] \
+  || fail "release pipeline audit is hard-pinned to markusleben/ha-nova (got ${REPO})."
 
 # Skip a live check when it cannot run — but never in strict mode. The release
 # preflight sets HA_NOVA_RELEASE_AUDIT_REQUIRE_BYPASS=1 precisely to prove the
@@ -59,10 +62,27 @@ command -v jq >/dev/null 2>&1 || fail "jq is required to verify the release pipe
 release_workflow="${ROOT_DIR}/.github/workflows/release.yml"
 rc_workflow="${ROOT_DIR}/.github/workflows/release-candidate.yml"
 goreleaser="${ROOT_DIR}/.goreleaser.yml"
+cloud_gate="${ROOT_DIR}/scripts/release/verify-cloud-release-gate.sh"
+cloud_workflow_gate="${ROOT_DIR}/scripts/release/verify-cloud-workflow-gate.sh"
+production_environment_gate="${ROOT_DIR}/scripts/release/verify-github-production-environment.sh"
+publication_main_protection_gate="${ROOT_DIR}/scripts/release/verify-cloud-publication-main-protection.sh"
 
 # --- Static workflow contract (no GitHub permissions required) --------------
 [[ -f "${release_workflow}" ]] || fail "Missing ${release_workflow}."
+[[ -f "${rc_workflow}" ]] || fail "Missing ${rc_workflow}."
 [[ -f "${goreleaser}" ]] || fail "Missing ${goreleaser}."
+[[ -x "${cloud_gate}" ]] || fail "Missing executable ${cloud_gate}."
+[[ -f "${cloud_workflow_gate}" ]] || fail "Missing ${cloud_workflow_gate}."
+[[ -x "${production_environment_gate}" ]] \
+  || fail "Missing executable ${production_environment_gate}."
+[[ -x "${publication_main_protection_gate}" ]] \
+  || fail "Missing executable ${publication_main_protection_gate}."
+
+# Cloud publication stays disabled by version metadata until the exact release
+# commit has complete real-device evidence. The dedicated structural verifier
+# rejects skipped/soft-failing gates and any build, upload, or publish producer
+# that can run before metadata and the Cloud gate have both completed.
+bash "${cloud_workflow_gate}"
 
 # Pin GoReleaser to the triggering tag: an rc tag and the final tag can share a
 # commit, and without this GoReleaser auto-detects a tag and publishes onto the
@@ -78,6 +98,34 @@ grep -Fq 'git merge-base --is-ancestor' "${release_workflow}" \
 grep -Eq '^[[:space:]]*prerelease:[[:space:]]*auto[[:space:]]*$' "${goreleaser}" \
   || fail ".goreleaser.yml must set 'prerelease: auto' so -rcN tags publish as prereleases."
 
+# GoReleaser may upload only to a replaceable draft. The separate publish job
+# is the single visibility transition after every binary and installer bundle
+# exists, so a failed/retried build never exposes a partial public release.
+grep -Eq '^[[:space:]]*draft:[[:space:]]*true[[:space:]]*$' "${goreleaser}" \
+  || fail ".goreleaser.yml must keep releases as drafts until the workflow publishes the complete asset set."
+grep -Eq '^[[:space:]]*replace_existing_draft:[[:space:]]*true[[:space:]]*$' "${goreleaser}" \
+  || fail ".goreleaser.yml must replace an incomplete draft on retry."
+grep -Fq 'publish-release:' "${release_workflow}" \
+  || fail "release.yml must publish complete drafts in a separate final job."
+grep -Fq 'needs: smoke-release-bundles' "${release_workflow}" \
+  || fail "release.yml must smoke exact uploaded bundles before publishing."
+grep -Fq 'version: "v2.17.0"' "${release_workflow}" \
+  || fail "release.yml must pin the audited GoReleaser version."
+grep -Fq "steps.release-state.outputs.published != 'true'" "${release_workflow}" \
+  || fail "release.yml must skip draft replacement when a retry finds an already-published release."
+grep -Fq "gh api --paginate --slurp 'repos/markusleben/ha-nova/releases?per_page=100'" "${release_workflow}" \
+  || fail "release.yml must discover published retries through a fail-closed hard-pinned API listing."
+grep -Fq 'verify-release-assets.sh "$GITHUB_REF_NAME"' "${release_workflow}" \
+  || fail "release.yml must verify the exact complete asset set before publishing or skipping a published retry."
+grep -Fq 'gh release edit "$GITHUB_REF_NAME" --draft=false' "${release_workflow}" \
+  || fail "release.yml must make the draft public only in the publish job."
+grep -Fq 'gh release edit "$GITHUB_REF_NAME" --draft=false --latest --verify-tag' "${release_workflow}" \
+  || fail "release.yml must re-assert Latest for both new and already-published stable releases."
+grep -Fq "repos/markusleben/ha-nova/releases/latest" "${release_workflow}" \
+  || fail "release.yml must verify that the final stable tag resolves through /releases/latest."
+grep -Fq 'needs: publish-release' "${release_workflow}" \
+  || fail "public installer smoke must wait for the complete release publish job."
+
 # The RC workflow must not try to publish: the v* tag ruleset blocks the Actions
 # token, so any automated publish only ever 422s. Real RC publishing is the
 # tag-first rehearsal driven by release.yml.
@@ -91,8 +139,29 @@ echo "[verify-release-pipeline] static workflow contract OK"
 if ! command -v gh >/dev/null 2>&1; then
   skip_or_fail "gh not available, so the live tag-ruleset contract cannot be checked."
 fi
+if ! gh auth status --hostname github.com >/dev/null 2>&1; then
+  skip_or_fail "gh is not authenticated for github.com."
+fi
 
-rulesets_json="$(gh api "repos/${REPO}/rulesets" 2>/dev/null || true)"
+# A disabled workflow receives no events, so its checks and release jobs
+# silently never run. Catches ci.yml itself and the merge→tag window, which
+# the in-PR gate cannot see. Exit 3 means the token cannot read workflow
+# states (skippable when non-strict); any other failure is a real disable.
+workflow_state_rc=0
+bash "${SCRIPT_DIR}/verify-required-workflows-active.sh" "${REPO}" "${POLICY_FILE}" \
+  || workflow_state_rc=$?
+if [[ "${workflow_state_rc}" -eq 3 ]]; then
+  skip_or_fail "Cannot read ${REPO} workflow states with the current token (needs Actions: read)."
+elif [[ "${workflow_state_rc}" -ne 0 ]]; then
+  fail "A guarded workflow is disabled; re-enable it before releasing."
+fi
+
+if [[ "${REQUIRE_BYPASS}" == "1" ]]; then
+  bash "${production_environment_gate}" "${REPO}" \
+    || fail "Production environment ref protection is a release blocker."
+fi
+
+rulesets_json="$(gh api --hostname github.com "repos/${REPO}/rulesets" 2>/dev/null || true)"
 if [[ -z "${rulesets_json}" ]] || ! printf '%s' "${rulesets_json}" | jq -e 'type == "array"' >/dev/null 2>&1; then
   skip_or_fail "Cannot read ${REPO} rulesets with the current token (run with a maintainer 'gh auth' or set RELEASE_AUDIT_TOKEN)."
 fi
@@ -102,7 +171,7 @@ ruleset_id="$(printf '%s' "${rulesets_json}" | jq -r --arg n "${expected_name}" 
 [[ -n "${ruleset_id}" ]] \
   || fail "Tag ruleset '${expected_name}' is missing — v* release tags are unprotected."
 
-ruleset="$(gh api "repos/${REPO}/rulesets/${ruleset_id}" 2>/dev/null || true)"
+ruleset="$(gh api --hostname github.com "repos/${REPO}/rulesets/${ruleset_id}" 2>/dev/null || true)"
 if [[ -z "${ruleset}" ]] || ! printf '%s' "${ruleset}" | jq -e '.rules' >/dev/null 2>&1; then
   skip_or_fail "Cannot read ruleset ${ruleset_id} detail with the current token."
 fi

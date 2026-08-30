@@ -9,15 +9,100 @@ permissions:
   contents: write
 
 jobs:
+  cloud-release-gate:
+    name: Verify release publication gates
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      deployments: read
+    environment:
+      name: production
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+
+      - name: Setup Node
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: "20"
+
+      - name: Verify production environment policy
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: bash scripts/release/verify-github-production-environment.sh
+
+      - name: Verify live main protection
+        env:
+          HA_NOVA_CLOUD_SOURCE_CHECK_APP_ID: ${{ secrets.HA_NOVA_CLOUD_SOURCE_CHECK_APP_ID }}
+          HA_NOVA_CLOUD_SOURCE_CHECK_APP_PRIVATE_KEY: ${{ secrets.HA_NOVA_CLOUD_SOURCE_CHECK_APP_PRIVATE_KEY }}
+        run: bash scripts/release/verify-cloud-publication-main-protection.sh
+
+      - name: Verify release metadata
+        env:
+          VERSION_TAG: ${{ github.ref_name }}
+        run: bash scripts/release/verify-release-metadata.sh "${VERSION_TAG}"
+
+      - name: Verify Home Assistant Cloud release gate
+        env:
+          GH_TOKEN: ${{ github.token }}
+          HA_NOVA_CLOUD_GATE_EVIDENCE_JSON: ${{ secrets.HA_NOVA_CLOUD_GATE_EVIDENCE_JSON }}
+        run: bash scripts/release/verify-cloud-release-gate.sh
+
+  build-signed-darwin-release-assets:
+    name: Build signed Darwin release artifacts
+    needs: cloud-release-gate
+    runs-on: macos-latest
+    permissions:
+      contents: read
+    environment:
+      name: production
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+
+      - name: Verify tag is on main
+        run: |
+          if ! git merge-base --is-ancestor "$GITHUB_SHA" origin/main; then
+            echo "::error::Tag must point to a commit on main. Refusing signing access."
+            exit 1
+          fi
+
+      - name: Setup Go
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version: "1.26.5"
+          cache-dependency-path: cli/go.sum
+
+      - name: Build and sign exact Darwin release binaries
+        env:
+          HA_NOVA_MACOS_CERTIFICATE_P12_BASE64: ${{ secrets.HA_NOVA_MACOS_CERTIFICATE_P12_BASE64 }}
+          HA_NOVA_MACOS_CERTIFICATE_PASSWORD: ${{ secrets.HA_NOVA_MACOS_CERTIFICATE_PASSWORD }}
+        run: bash scripts/release/build-sign-darwin-binaries.sh "${{ github.ref_name }}"
+
+      - name: Upload signed Darwin release binaries
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: release-signed-darwin-binaries
+          path: dist/ha-nova-darwin-*
+          if-no-files-found: error
+          retention-days: 1
+
   release:
-    name: Build and publish release assets
+    name: Build release assets
+    needs:
+      - cloud-release-gate
+      - build-signed-darwin-release-assets
     runs-on: ubuntu-latest
     environment:
       name: production
       url: ${{ github.server_url }}/${{ github.repository }}/releases/tag/${{ github.ref_name }}
     steps:
       - name: Checkout
-        uses: actions/checkout@v7
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: 0
 
@@ -29,7 +114,7 @@ jobs:
           fi
 
       - name: Setup Node
-        uses: actions/setup-node@v6
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
           node-version: "20"
           cache: npm
@@ -38,16 +123,13 @@ jobs:
         run: npm ci
 
       - name: Setup Go
-        uses: actions/setup-go@v6
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
-          go-version: "1.24"
+          go-version: "1.26.5"
           cache-dependency-path: cli/go.sum
 
       - name: Verify repository
         run: npm run verify
-
-      - name: Verify release metadata
-        run: bash scripts/release/verify-release-metadata.sh "${GITHUB_REF_NAME}"
 
       - name: Verify next release version
         env:
@@ -55,10 +137,29 @@ jobs:
           HA_NOVA_ALLOW_EXISTING_RELEASE_TAG: "1"
         run: bash scripts/release/verify-next-release-version.sh "${GITHUB_REF_NAME}"
 
+      - name: Detect an already-published retry
+        id: release-state
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          published=false
+          release_pages="$(gh api --paginate --slurp 'repos/markusleben/ha-nova/releases?per_page=100')"
+          matching="$(jq -c --arg tag "$GITHUB_REF_NAME" '[.[][] | select(.tag_name == $tag)]' <<<"$release_pages")"
+          jq -e 'length <= 1' <<<"$matching" >/dev/null
+          if [[ "$(jq 'length' <<<"$matching")" == "1" ]]; then
+            if [[ "$(jq -r '.[0].draft' <<<"$matching")" == "false" ]]; then
+              bash scripts/release/verify-release-assets.sh "$GITHUB_REF_NAME"
+              published=true
+            fi
+          fi
+          echo "published=$published" >> "$GITHUB_OUTPUT"
+
       - name: GoReleaser
-        uses: goreleaser/goreleaser-action@v7
+        if: steps.release-state.outputs.published != 'true'
+        uses: goreleaser/goreleaser-action@f06c13b6b1a9625abc9e6e439d9c05a8f2190e94 # v7.2.3
         with:
-          version: "~> v2"
+          version: "v2.17.0"
           args: release --clean --skip=sign
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -66,17 +167,289 @@ jobs:
           # GoReleaser auto-detects the tag and may publish onto the wrong release.
           GORELEASER_CURRENT_TAG: ${{ github.ref_name }}
 
+      - name: Download signed Darwin release binaries
+        if: steps.release-state.outputs.published != 'true'
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: release-signed-darwin-binaries
+          path: dist
+
+      - name: Upload signed Darwin binaries and complete checksums
+        if: steps.release-state.outputs.published != 'true'
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          for asset in dist/ha-nova-darwin-amd64 dist/ha-nova-darwin-arm64; do
+            test -f "$asset"
+            digest="$(sha256sum "$asset" | awk '{print $1}')"
+            printf '%s  %s\n' "$digest" "$(basename "$asset")"
+          done >> dist/checksums.txt
+          LC_ALL=C sort -k2,2 -u dist/checksums.txt -o dist/checksums.txt
+          gh release upload "$GITHUB_REF_NAME" \
+            dist/ha-nova-darwin-amd64 \
+            dist/ha-nova-darwin-arm64 \
+            dist/checksums.txt \
+            --clobber
+
       - name: Build install bundles
+        if: steps.release-state.outputs.published != 'true'
+        env:
+          HA_NOVA_CLOUD_RELEASE_SIGNING_KEY_PEM: ${{ secrets.HA_NOVA_CLOUD_RELEASE_SIGNING_KEY_PEM }}
         run: bash scripts/release/build-install-bundle.sh "${GITHUB_REF_NAME#v}"
 
       - name: Upload install bundles
+        if: steps.release-state.outputs.published != 'true'
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: gh release upload "$GITHUB_REF_NAME" dist/install-bundles/* --clobber
 
+  smoke-release-bundles:
+    name: Smoke uploaded release bundles (${{ matrix.os }})
+    needs: release
+    runs-on: ${{ matrix.os }}
+    permissions:
+      # Draft releases are visible only to tokens with write access; this job
+      # downloads the still-draft assets before publication, so read is not
+      # enough ("release not found" on every runner otherwise).
+      contents: write
+    strategy:
+      fail-fast: false
+      matrix:
+        os:
+          - ubuntu-latest
+          - macos-latest
+          - windows-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          # The downloaded bundle binaries run below; keep git credentials
+          # out of the workspace they can read.
+          persist-credentials: false
+
+      - name: Download Unix release assets
+        if: runner.os != 'Windows'
+        shell: bash
+        env:
+          # Draft releases are invisible to read tokens. The write token
+          # lives only in this download step's shell; the smoke step below
+          # runs the downloaded binaries in a fresh process without it, so
+          # not even /proc/<ppid>/environ can leak it to them.
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          case "${RUNNER_OS}" in
+            macOS)
+              arch="$(uname -m | sed 's/x86_64/amd64/;s/arm64/arm64/')"
+              archive="ha-nova-installer-bundle-macos-${arch}.tar.gz"
+              ;;
+            Linux)
+              archive="ha-nova-installer-bundle-linux-$(uname -m | sed 's/x86_64/amd64/;s/aarch64/arm64/;s/arm64/arm64/').tar.gz"
+              ;;
+            *) exit 1 ;;
+          esac
+          workdir="${RUNNER_TEMP}/ha-nova-release-smoke"
+          rm -rf "$workdir"
+          mkdir -p "$workdir"
+          gh release download "$GITHUB_REF_NAME" \
+            --repo "$GITHUB_REPOSITORY" \
+            --pattern "$archive" \
+            --dir "$workdir"
+          if [[ "${RUNNER_OS}" == "macOS" ]]; then
+            gh release download "$GITHUB_REF_NAME" \
+              --repo "$GITHUB_REPOSITORY" \
+              --pattern "ha-nova-darwin-${arch}" \
+              --dir "$workdir"
+          fi
+
+      - name: Smoke Unix release bundle
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          set -euo pipefail
+          case "${RUNNER_OS}" in
+            macOS)
+              platform="darwin"
+              arch="$(uname -m | sed 's/x86_64/amd64/;s/arm64/arm64/')"
+              archive="ha-nova-installer-bundle-macos-${arch}.tar.gz"
+              ;;
+            Linux)
+              platform="linux"
+              archive="ha-nova-installer-bundle-linux-$(uname -m | sed 's/x86_64/amd64/;s/aarch64/arm64/;s/arm64/arm64/').tar.gz"
+              ;;
+            *) exit 1 ;;
+          esac
+          workdir="${RUNNER_TEMP}/ha-nova-release-smoke"
+          test -f "$workdir/$archive"
+          tar -xzf "$workdir/$archive" -C "$workdir"
+          # Unix builds resolve their install root from HOME only (no
+          # executable-directory fallback like Windows), so the provenance
+          # check requires the bundle to sit in a real installed layout.
+          smoke_home="$workdir/home"
+          install_root="$smoke_home/.local/share/ha-nova"
+          mkdir -p "$smoke_home/.local/share"
+          mv "$workdir/ha-nova" "$install_root"
+          root="$install_root"
+          test -f "$root/bundle.json"
+          test -x "$root/ha-nova"
+          node -e '
+            const bundle = require(process.argv[1]);
+            if (bundle.version !== process.argv[2].replace(/^v/, "")) {
+              throw new Error("release bundle version does not match tag");
+            }
+          ' "$root/bundle.json" "$GITHUB_REF_NAME"
+          HOME="$smoke_home" "$root/ha-nova" version
+          if [[ "${RUNNER_OS}" == "macOS" ]]; then
+            raw_binary="$workdir/ha-nova-darwin-${arch}"
+            test -f "$raw_binary"
+            cmp "$root/ha-nova" "$raw_binary"
+            bash scripts/release/verify-macos-signature.sh "$root/ha-nova"
+          fi
+          listed="$(
+            node -e '
+              const metadata = require(process.argv[1]);
+              process.stdout.write(String(
+                metadata.cloud_remote_enabled === true
+                && metadata.cloud_remote_platforms.includes(process.argv[2])
+              ));
+            ' "$root/version.json" "$platform"
+          )"
+          if [[ "$listed" == "true" ]]; then
+            HOME="$smoke_home" "$root/ha-nova" internal-cloud-release-check
+          elif HOME="$smoke_home" "$root/ha-nova" internal-cloud-release-check; then
+            echo "::error::Unlisted $platform runtime accepted Cloud release provenance."
+            exit 1
+          fi
+
+      - name: Download Windows release bundle
+        if: runner.os == 'Windows'
+        shell: pwsh
+        env:
+          # Draft releases are invisible to read tokens. The write token
+          # lives only in this download step's shell; the smoke step below
+          # runs the downloaded binary in a fresh process without it.
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $archive = "ha-nova-installer-bundle-windows-amd64.zip"
+          $workdir = Join-Path $env:RUNNER_TEMP "ha-nova-release"
+          Remove-Item -LiteralPath $workdir -Recurse -Force -ErrorAction SilentlyContinue
+          New-Item -ItemType Directory -Path $workdir | Out-Null
+          gh release download "$env:GITHUB_REF_NAME" `
+            --repo "$env:GITHUB_REPOSITORY" `
+            --pattern $archive `
+            --dir $workdir
+          if (-not (Test-Path -LiteralPath (Join-Path $workdir $archive))) {
+            throw "Exact Windows release bundle was not downloaded"
+          }
+
+      - name: Smoke Windows release bundle
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $archive = "ha-nova-installer-bundle-windows-amd64.zip"
+          $workdir = Join-Path $env:RUNNER_TEMP "ha-nova-release"
+          $archivePath = Join-Path $workdir $archive
+          if (-not (Test-Path -LiteralPath $archivePath)) {
+            throw "Exact Windows release bundle was not downloaded"
+          }
+          Expand-Archive -LiteralPath $archivePath -DestinationPath $workdir -Force
+          $root = Join-Path $workdir "ha-nova"
+          $binary = Join-Path $root "ha-nova.exe"
+          $bundlePath = Join-Path $root "bundle.json"
+          if (-not (Test-Path -LiteralPath $bundlePath)) {
+            throw "bundle.json missing from Windows release bundle"
+          }
+          $bundle = Get-Content -LiteralPath $bundlePath -Raw | ConvertFrom-Json
+          $expectedVersion = $env:GITHUB_REF_NAME.Substring(1)
+          if ($bundle.version -ne $expectedVersion) {
+            throw "Windows release bundle version does not match tag"
+          }
+          & $binary version
+          if ($LASTEXITCODE -ne 0) {
+            throw "Windows release binary version check failed"
+          }
+          $metadata = Get-Content -LiteralPath (Join-Path $root "version.json") -Raw | ConvertFrom-Json
+          $listed = (
+            $metadata.cloud_remote_enabled -eq $true -and
+            @($metadata.cloud_remote_platforms) -contains "windows"
+          )
+          if ($listed) {
+            & $binary internal-cloud-release-check
+            if ($LASTEXITCODE -ne 0) {
+              throw "enabled Windows Cloud release provenance check failed"
+            }
+          } else {
+            $provenanceOutput = (& $binary internal-cloud-release-check 2>&1 | Out-String).Trim()
+            $provenanceExitCode = $LASTEXITCODE
+            if (
+              $provenanceExitCode -ne 1 -or
+              $provenanceOutput -ne "[ha-nova] ERROR: official Cloud release provenance is not enabled"
+            ) {
+              throw "unlisted Windows runtime returned an unexpected provenance result"
+            }
+            $global:LASTEXITCODE = 0
+          }
+
+  publish-release:
+    name: Publish complete release
+    needs: smoke-release-bundles
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    environment:
+      name: production
+      url: ${{ github.server_url }}/${{ github.repository }}/releases/tag/${{ github.ref_name }}
+    steps:
+      - name: Checkout release gate
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Verify complete draft and publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          release_json="$(gh release view "$GITHUB_REF_NAME" --json tagName,isDraft,isPrerelease)"
+          jq -e --arg tag "$GITHUB_REF_NAME" '.tagName == $tag' <<<"$release_json" >/dev/null
+
+          expected_prerelease=false
+          if [[ "$GITHUB_REF_NAME" == *-* ]]; then
+            expected_prerelease=true
+          fi
+          jq -e --argjson expected "$expected_prerelease" '.isPrerelease == $expected' <<<"$release_json" >/dev/null
+
+          bash scripts/release/verify-release-assets.sh "$GITHUB_REF_NAME"
+
+          if [[ "$expected_prerelease" == "true" ]]; then
+            if [[ "$(jq -r '.isDraft' <<<"$release_json")" == "true" ]]; then
+              gh release edit "$GITHUB_REF_NAME" --draft=false --verify-tag
+            else
+              echo "Prerelease is already published; verifying idempotent final state."
+            fi
+          else
+            # Re-assert Latest even for a published retry. A prior interrupted or
+            # manual recovery must not leave /releases/latest on the old stable.
+            gh release edit "$GITHUB_REF_NAME" --draft=false --latest --verify-tag
+          fi
+
+          published_json="$(gh release view "$GITHUB_REF_NAME" --json tagName,isDraft,isPrerelease)"
+          jq -e \
+            --arg tag "$GITHUB_REF_NAME" \
+            --argjson expected "$expected_prerelease" \
+            '.tagName == $tag and .isDraft == false and .isPrerelease == $expected' \
+            <<<"$published_json" >/dev/null
+
+          if [[ "$expected_prerelease" == "false" ]]; then
+            latest_tag="$(gh api 'repos/markusleben/ha-nova/releases/latest' --jq '.tag_name')"
+            if [[ "$latest_tag" != "$GITHUB_REF_NAME" ]]; then
+              echo "::error::Latest stable is $latest_tag, expected $GITHUB_REF_NAME."
+              exit 1
+            fi
+          fi
+
   smoke-installers:
     name: Post-publish smoke installers (${{ matrix.os }})
-    needs: release
+    needs: publish-release
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
@@ -90,7 +463,11 @@ jobs:
       HA_NOVA_NO_SETUP: "1"
     steps:
       - name: Checkout
-        uses: actions/checkout@v7
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          # The installed binaries run below; keep git credentials out of
+          # the workspace they can read.
+          persist-credentials: false
 
       - name: Smoke Unix installer
         if: runner.os != 'Windows'

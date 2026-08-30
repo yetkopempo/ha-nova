@@ -9,7 +9,7 @@ For the stable installer, lifecycle commands, and general troubleshooting, use [
 ## Setup Choice
 
 - Desktop terminal path: run `ha-nova setup hermes`.
-- Service, headless, SSH, systemd user service, or gateway path: run `ha-nova setup --service hermes`.
+- Service, headless, SSH, systemd user service, or gateway path: run `ha-nova setup --service hermes`. It pairs exactly like the desktop path and keeps the device credential in a protected file — no unlocked desktop keyring needed.
 - If you run `ha-nova setup hermes` and HA NOVA detects that the desktop keyring is locked or unavailable, setup asks whether to switch to the service/gateway token file.
 - Install Hermes separately; HA NOVA handles the skills and onboarding, not the Hermes app itself.
 
@@ -41,16 +41,18 @@ Current support/evidence truth lives in [docs/reference/hermes-platform-validati
 - The simple path today is to run Hermes on a machine you control with direct private reachability to Home Assistant and the HA NOVA Relay.
 - In practice, that usually means the same home network or a private VPN/overlay route.
 - A generic public VPS is not the intended beginner path today. It changes the trust and networking model, and it is not the current maintainer-validated Hermes story.
-- If you want remote access later, the clean model is still local execution: a future remote entrypoint can forward requests into your trusted local Hermes + HA NOVA flow instead of moving execution onto a public server.
-- Do not expose the HA NOVA Relay directly to the public internet. If you need remote reachability, use a private tunnel or VPN path you control.
+- On a supported native desktop session, the optional Home Assistant Cloud Beta can provide local-first remote fallback through `ha-nova cloud add`; this overlay's platform evidence limits still apply.
+- Service, headless, SSH, WSL2, and generic VPS sessions stay local-only. Use a private VPN or overlay when they need remote reachability.
+- Do not expose the HA NOVA Relay directly to the public internet.
 
 ## Linux Notes
 
 - On Linux desktop sessions, HA NOVA uses the OS Secret Service / keyring for secure local token storage.
-- For Hermes sessions that run without an unlocked desktop keyring, use `ha-nova setup --service hermes`. This stores only the Relay Auth Token in `~/.config/ha-nova/relay-token` with strict local file permissions.
+- For Hermes sessions that run without an unlocked desktop keyring, use `ha-nova setup --service hermes`. This stores only HA NOVA's local credential — the paired device credential (or, on standalone/legacy setups, the Relay Auth Token) — in a protected file under `~/.config/ha-nova/` with strict local file permissions.
 - If HA NOVA asks for a local Linux keyring password, it stays on this machine. HA NOVA only uses it to unlock or create local secure storage. It is not your Relay token, not your Home Assistant token, and it is not sent to the Relay, Home Assistant, Hermes, or any AI provider.
 - If no Secret Service provider is running, setup fails early with an explicit prerequisite message instead of raw `org.freedesktop.secrets` D-Bus errors.
 - If Linux is using GNOME Keyring and the default collection is locked or uninitialized, `ha-nova setup hermes` can guide recovery inline.
+- If the keyring exists but is never unlocked on this machine (headless VM, autologin box, systemd user service — nobody ever types a login password), do not chase per-boot unlocking: run `ha-nova setup --service hermes`, or `ha-nova pair --credential-store=file`.
 - If Linux uses another Secret Service backend, keep the backend working first; HA NOVA does not pretend inline GNOME-only recovery exists there.
 - If you run setup or repair over SSH and want desktop keyring storage, use the same logged-in desktop user session that owns the user D-Bus / Secret Service session. If that is not available, use the service path instead.
 
@@ -63,7 +65,8 @@ Current support/evidence truth lives in [docs/reference/hermes-platform-validati
 - On Windows with WSL2, run update and repair commands from the same WSL shell where Hermes is installed.
 - Validate the current route and proof status in [docs/reference/hermes-platform-validation.md](../docs/reference/hermes-platform-validation.md).
 - Validate the install with `ha-nova doctor`.
-- Hermes surfaces HA NOVA update notices during normal skill use (relay calls check a local cache; silence them with `HA_NOVA_NO_UPDATE_NUDGE=1`). `ha-nova check-update` still works for a manual check.
+- Before the first Home Assistant task, the first HA NOVA skill used runs one quiet update check for both HA NOVA and the NOVA Relay App. Relay calls keep a cache-only nudge as fallback; silence only that fallback with `HA_NOVA_NO_UPDATE_NUDGE=1`. `ha-nova check-update` still works manually.
+- After `ha-nova update` succeeds, start a new AI client session to load the updated HA NOVA skills.
 
 ## Hermes-Specific Skill Layout
 

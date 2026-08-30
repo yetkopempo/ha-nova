@@ -3,19 +3,6 @@ version: 2
 project_name: ha-nova
 
 builds:
-  - id: ha-nova-darwin
-    dir: cli
-    binary: ha-nova
-    env:
-      - CGO_ENABLED=0
-    goos:
-      - darwin
-    goarch:
-      - amd64
-      - arm64
-    ldflags:
-      - -s -w -X main.Version={{.Version}}
-
   - id: ha-nova-other
     dir: cli
     binary: ha-nova
@@ -27,6 +14,8 @@ builds:
     goarch:
       - amd64
       - arm64
+    tags:
+      - cloudremote_official
     ignore:
       - goos: windows
         goarch: arm64
@@ -41,18 +30,10 @@ checksum:
   name_template: "checksums.txt"
 
 changelog:
-  sort: asc
-  filters:
-    exclude:
-      - "^Merge "
-      - '^(docs|refactor|perf|style|build|ci|chore|test)(\(.+\))?!?:.+$'
-  groups:
-    - title: New Features
-      regexp: '^feat(\(.+\))?!?:.+$'
-      order: 0
-    - title: Bug Fixes
-      regexp: '^fix(\(.+\))?!?:.+$'
-      order: 10
+  # The curated release header below is the complete user-facing changelog.
+  # Appending commit-derived groups duplicates headings and can displace the
+  # intended bug-fix highlights in the installed update digest.
+  disable: true
 
 snapshot:
   version_template: "{{ incpatch .Version }}-snapshot"
@@ -61,8 +42,13 @@ release:
   github:
     owner: markusleben
     name: ha-nova
-  draft: false
+  # Keep every asset invisible until release.yml has built and uploaded the
+  # complete installer set. Failed jobs replace this draft on retry; only the
+  # separate final publish job makes it public.
+  draft: true
+  replace_existing_draft: true
   prerelease: auto
+  mode: replace
   name_template: "HA NOVA v{{.Version}}"
   header: |
     {{ if .Prerelease }}## Preview / Release Candidate
@@ -83,22 +69,9 @@ release:
     ```
 
     Windows uses a single supported install path: `install.ps1`. Return an RC install to stable later with `ha-nova update`.
-    {{ else }}## New Features
+    {{ else }}## What To Watch
 
-    - **9 new skills — coverage across the whole home.** `diagnose` (root-cause "why didn't my automation run?"), `media` (players, volume, speaker groups, TTS announcements), `notify` (phone and persistent notifications), `camera` (the agent actually looks at the current frame), `mqtt` (listen to what a device really publishes), `assist` (test what your voice assistant understands — without speaking), `admin` (persons, zones, tags, user accounts — with hard owner guards), `yaml-config`, and `external-sources` (years of InfluxDB history the recorder purged long ago).
-    - **Runs on every Home Assistant install now.** The relay also ships as a standalone container (`ghcr.io/markusleben/ha-nova-relay`), so Home Assistant Container and Core users — who cannot install Apps — are no longer locked out. Same code, same security model: your Home Assistant token still never leaves the server.
-    - **YAML configuration you can finally edit.** Template, REST and command-line sensors, packages and themes have no Home Assistant API — they only exist as files. The new `ha-nova:yaml-config` skill edits them safely: read first, show a diff, back up, validate before reloading, verify afterwards. Only if you switch it on: the NOVA Relay's new `file_access` option defaults to `off`, and secrets, the recorder database, and anything executable stay off-limits in every mode.
-    - **Guided uninstall.** `ha-nova uninstall` now walks you through the Home Assistant side too: removing the NOVA Relay app, removing the repository, and revoking the "NOVA" access token. The cleanup checklist is always shown — even when Home Assistant is unreachable.
-    - **Update notices in every AI client.** Codex, OpenCode, Antigravity, and Hermes now surface HA NOVA updates during normal skill use; previously only Claude did.
-
-    ## What To Watch
-
-    - The NOVA Relay must be updated to 0.4.0 or newer (App: **Settings > Apps > NOVA Relay**; container: pull the new image). Camera and MQTT need 0.3.0's binary and bounded-listening support, YAML editing needs 0.4.0's opt-in file access — HA NOVA tells you if your relay is too old.
-    - Set `HA_NOVA_NO_UPDATE_NUDGE=1` to silence the new update notices.
-
-    ## Bug Fixes
-
-    - `ha-nova doctor` now really checks the relay version: it read the wrong field of the health response and could report a healthy setup while your relay was too old for the installed skills. `ha-nova update` and `check-update` also tell you now when the relay in Home Assistant needs its own update — right when you are already updating.
+    - **Cloud Remote is back on Windows and Linux.** v0.25.0 briefly shipped it macOS-only; this release restores the full platform list with fresh per-platform release provenance. Updating restores lost Cloud routing.
 
     Stable install commands are release-pinned for this tag.
 
@@ -116,15 +89,6 @@ release:
     Windows currently ships an `amd64` bundle only. On Windows ARM64, use x64 emulation.
     Windows uses a single supported install path: `install.ps1`.
     Do not download and run the raw `ha-nova-installer-bundle-*.tar.gz` / `.zip` assets directly; those are installer payloads, not the supported end-user path.
-
-    ## Upgrade Notes
-
-    - Already installed? Run `ha-nova check-update` or `ha-nova update`.
-    - Claude shipped installs use the local staged HA NOVA release payload on disk. When HA NOVA shows an update notice, run `ha-nova update` and then restart Claude.
-    - Default `ha-nova uninstall` is standard remove. Use `ha-nova uninstall --purge` for a full local wipe.
-    - Windows now uses `%APPDATA%\ha-nova` and `%LOCALAPPDATA%\ha-nova\cache` as the canonical config and cache paths.
-    - Home Assistant Relay setup and token steps remain guided in the browser after local install completes.
-    - Legacy pre-Go installs still require the legacy cleanup script before reinstalling.
 
     > The bundle assets below are consumed by the installers automatically. Only use them directly for maintainer-level debugging or raw binary validation.
     {{ end }}

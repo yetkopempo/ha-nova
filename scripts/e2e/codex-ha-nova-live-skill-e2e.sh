@@ -1,6 +1,10 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+# #446: live E2E sessions must never mutate production census statistics or
+# accrue passive relay-version stamps on an opted-in machine.
+export HA_NOVA_NO_CENSUS=1
+
 SCRIPT_DIR="$(cd -- "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(cd -- "${SCRIPT_DIR}/../.." && pwd)"
 
@@ -45,7 +49,7 @@ Hard requirements:
    Do not request or store LLAT in client onboarding files/Keychain.
    Keep method/path explicit in /core payloads so they are visible in executed curl commands.
    Do not redirect /core curl responses to files.
-6. For write actions, preview each concrete payload/impact first. This harness simulates the user's next post-preview reply only for that exact preview: create/update may apply that displayed payload; delete may proceed only after showing delete impact and using tokenized confirmation for automation id "${AUTOMATION_ID}". If any payload or target changes after preview, repeat preview before applying.
+6. For write actions, preview each concrete payload/impact first. This harness simulates the user's next post-preview reply only for that exact preview: create/update may apply that displayed payload; delete may proceed only after showing delete impact and using the typed confirmation code for automation id "${AUTOMATION_ID}". If any payload or target changes after preview, repeat preview before applying.
 7. Use deterministic automation id: "${AUTOMATION_ID}".
 8. Perform create -> read -> update -> read -> delete -> verify absent.
 9. Do not run project helper scripts.

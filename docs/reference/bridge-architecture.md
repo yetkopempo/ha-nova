@@ -1,49 +1,34 @@
 # NOVA Relay: Architecture Reference
 
-> **Implementation status:** Phase 1a is implemented (`/health`, `/ws`, `/core`), and
-> the Phase 3 filesystem endpoint (`/files`) shipped with relay 0.4.0 — opt-in and
-> off by default. Phases 1c (streaming subscriptions) and 2 (backups) remain planned.
-> Phase 1b was folded into 1a during development (the `/core` REST proxy was
-> originally scoped as a separate phase but shipped together with `/ws` and `/health`).
+> **Implementation status:** Seven bounded local endpoint families are implemented.
+> The Cloud remote Beta adds a Supervisor-ingress-only machine surface.
+> Filesystem access is opt-in/off by default; streaming remains unimplemented.
 
 ## Overview
 
-The Relay is a lean App that runs on the HA host and provides three capabilities
-that a remote Skill cannot: WebSocket proxy (implemented), REST core proxy (implemented),
-filesystem access (planned). Backup lifecycle (status/create/inspect/delete) needs no
-dedicated endpoint — `ha-nova:backup` rides the existing `/ws` proxy (`backup/*`).
+The Relay is a lean transport App on the HA host. It proxies WebSocket and REST,
+offers contained opt-in file access, stores generic config snapshots, and
+performs credential exchange. HA NOVA operates no public tunnel or broker;
+optional remote traffic uses Home Assistant Cloud and Supervisor Ingress.
 
 ## Endpoints
 
-### Phase 1a (MVP) — IMPLEMENTED
+### Implemented locally
 
 ```
 GET  /health
+GET  /home
+POST /pair
 POST /ws
 POST /core
+POST /files
+POST /backups
 ```
 
 ### Phase 1c (+ Subscriptions) — PLANNED, NOT IMPLEMENTED
 
 ```
 POST /ws/subscribe
-```
-
-### Phase 2 (config-snapshot store) — PLANNED, NOT IMPLEMENTED
-
-HA SYSTEM backups (status/create/inspect/delete) are covered today via `/ws`
-(`ha-nova:backup`) and need no relay endpoint. This planned endpoint is a
-different thing: a relay-side store for CONFIG snapshots (see the
-`POST /backups` — Backup Management spec below):
-
-```
-POST /backups
-```
-
-### Phase 3 (+ Filesystem) — IMPLEMENTED in relay 0.4.0 (opt-in, default off)
-
-```
-POST /files
 ```
 
 ---
@@ -62,11 +47,54 @@ Response 200:
   "data": {
     "status": "ok",
     "ha_ws_connected": true,
-    "version": "0.2.5",
-    "uptime_s": 3600
+    "ha_ws_disconnect_reason": null,
+    "version": "0.5.0",
+    "uptime_s": 3600,
+    "file_access": "off",
+    "snapshots": { "files": 3, "bytes": 4096 }
   }
 }
 ```
+
+Connection status is observed state, not a probe. `GET /health` and `/core`
+requests do not open the upstream Home Assistant WebSocket. A fresh Relay
+therefore reports `ha_ws_connected: false` with
+`ha_ws_disconnect_reason: "never_connected"` until the first real `/ws`
+request; that pre-request state is not a connection failure. To prove
+WebSocket readiness, issue `POST /ws` with `{"type":"ping"}` and then re-read
+health. Require both a successful Relay envelope and
+`ha_ws_connected: true`.
+
+### `POST /pair` — Pairing Credential Exchange
+
+This is the only route that does not accept the relay bearer token. Its
+six-digit, ten-minute, single-use pairing code is the credential.
+
+```json
+Request:  { "code": "123456" }
+Response: { "ok": true, "data": { "relay_token": "<opaque token>" } }
+```
+
+Malformed shapes return `400 VALIDATION_ERROR`. Wrong, expired, and replayed
+codes share `401 PAIRING_FAILED`. Five failures per socket peer per minute or
+30 globally per five minutes block further attempts with
+`429 PAIRING_RATE_LIMITED` and `Retry-After`. The Relay ignores forwarded IP
+headers, compares fixed digests in constant time, and sets
+`Cache-Control: no-store` on every `/pair` response. Pairing contains no Home
+Assistant call or domain logic.
+
+### `GET /home` — Home Base
+
+Home Base is a read-only HTML rendering of the same snapshot as `/health`, plus
+the current pairing code, expiry, compatibility floor, and latest-stable
+installer commands. It is bearer-exempt because Home Assistant Supervisor
+ingress supplies the authenticated browser session instead.
+
+The handler still requires the exact Supervisor ingress socket peer
+(`172.30.32.2`, including IPv4-mapped IPv6 forms) plus `X-Ingress-Path` and
+`X-Remote-User-Id`. Direct port access returns `403 INGRESS_REQUIRED` even when
+the headers are spoofed. The response is non-cacheable, script-free, and ships
+a restrictive CSP plus `nosniff`; the App sidebar panel is admin-only.
 
 ### `POST /ws` — Generic WS Proxy
 ```json
@@ -123,23 +151,10 @@ A *bare* subscription (no envelope) is still rejected with
 `400 UNSUPPORTED_WS_TYPE`, because the relay could neither deliver its events
 nor bound its lifetime.
 
-Optional: Batch mode
-```json
-Request (Array):
-[
-  { "type": "config/area_registry/list" },
-  { "type": "config/floor_registry/list" }
-]
-
-Response 200:
-{
-  "ok": true,
-  "data": [
-    { "ok": true, "data": [...] },
-    { "ok": true, "data": [...] }
-  ]
-}
-```
+Batch mode (array request bodies) is NOT supported: the WS proxy validates a
+single object with a string `type` and rejects arrays with
+`400 VALIDATION_ERROR` (`nova/src/http/handlers/ws-proxy.ts`). Callers loop
+client-side, one command per request.
 
 ### `POST /core` — REST Core Proxy
 
@@ -188,10 +203,10 @@ Security:
 
 ---
 
-## Endpoint Specifications — Planned (NOT IMPLEMENTED)
+## Additional Endpoint Specifications
 
-> The following endpoints are designed but have no implementation yet.
-> Specifications may change before implementation.
+Only the streaming endpoint below remains planned. `/files` and `/backups` are
+implemented and covered by their handler tests.
 
 ### `POST /ws/subscribe` — Event Subscription
 ```json
@@ -209,28 +224,28 @@ data: {"event_type":"state_changed","data":{...}}
 
 Limits: max 300s duration, max 5 concurrent subscriptions.
 
-### `POST /files` — Filesystem Operations
+### `POST /files` — Filesystem Operations (implemented)
 ```json
 // list_dir
-{ "action": "list_dir", "path": "/config/ha_mcp", "limit": 200 }
+{ "action": "list_dir", "path": "/config/ha_nova", "limit": 200 }
 
 // read_file
-{ "action": "read_file", "path": "/config/ha_mcp/templates/my_sensor.yaml", "max_bytes": 200000 }
+{ "action": "read_file", "path": "/config/ha_nova/templates/my_sensor.yaml", "max_bytes": 200000 }
 
 // write_file
-{ "action": "write_file", "path": "/config/ha_mcp/templates/my_sensor.yaml", "content": "..." }
+{ "action": "write_file", "path": "/config/ha_nova/templates/my_sensor.yaml", "content": "..." }
 
 // delete_file
-{ "action": "delete_file", "path": "/config/ha_mcp/sensors/rest/old.yaml" }
+{ "action": "delete_file", "path": "/config/ha_nova/sensors/rest/old.yaml" }
 ```
 
 Security:
 - Paths must be within `/config` (HA config root)
-- Blocked: `.storage`, `.cloud`, `.ssh`, `.git`, `deps`, `ssl`, `secrets.yaml`
+- Deny-list segments: `.storage`, `.cloud`, `.ssh`, `.git`, `deps`, `ssl`, `tts`, `backups`, `custom_components`, `python_scripts`, `www` — plus secret/db/env/log filename patterns
 - Symlink traversal check
-- Writes only in whitelisted directories (`/config/ha_mcp/`)
+- Writes gated by extension (`.yaml`, `.yml`, `.conf`, `.json`, `.txt`, `.md`); there is no directory whitelist — keeping HA NOVA files under `/config/ha_nova/` is skill convention, not relay enforcement
 
-### `POST /backups` — Backup Management (Phase 2, planned config-snapshot store)
+### `POST /backups` — Config-snapshot store (implemented)
 
 Relay-side storage for CONFIG snapshots (automation JSON, etc.) — distinct from
 HA system backups, which `ha-nova:backup` manages via `/ws` `backup/*` today.
@@ -254,28 +269,56 @@ HA system backups, which `ha-nova:backup` manages via `/ws` `backup/*` today.
 
 ---
 
-## Auth — Dual-Token Model
+## Auth — Separate Inbound and Upstream Credentials
 
-The Relay uses two separate tokens for inbound and upstream authentication:
+The Relay keeps inbound client authentication separate from upstream Home Assistant authentication:
 
-| Token | Env Var | Purpose |
-|-------|---------|---------|
-| Relay auth token | `RELAY_AUTH_TOKEN` | Authenticates inbound client requests to the Relay |
-| HA Long-Lived Access Token | `HA_LLAT` | Authenticates Relay requests upstream to Home Assistant (WS + REST) |
+| Distribution/path | Credential | Purpose |
+|--------------|------------|---------|
+| Legacy/standalone inbound | `RELAY_AUTH_TOKEN` | Authenticates direct client requests to the Relay |
+| App paired-device inbound | Per-device credential | Authenticates direct TLS requests on the pinned device listener |
+| App Cloud Ingress inbound | User- and Relay-bound per-device credential | Authenticates functional requests after the Supervisor Ingress identity gate |
+| Home Assistant App upstream | `SUPERVISOR_TOKEN` | Authenticates upstream REST and WebSocket requests through the Supervisor Core proxies |
+| Standalone Container/Core upstream | `HA_LLAT` | Authenticates upstream requests directly with Home Assistant |
 
-**Inbound (client -> Relay):**
+**Legacy/standalone inbound (client -> Relay):**
 ```
 Authorization: Bearer {RELAY_AUTH_TOKEN}
 ```
-Validated via timing-safe comparison (`node:crypto.timingSafeEqual`). On failure: `401 UNAUTHORIZED`.
+Validated via a constant-time fixed-digest comparison. On failure:
+`401 UNAUTHORIZED`. Exact `POST /pair` uses the one-time pairing code instead
+and returns the same relay token after a successful exchange.
+
+The normal App path uses an OPAQUE-derived per-device credential over SPKI-pinned
+TLS. Cloud sends it through a process-local Supervisor Ingress session. Pairing
+v2 atomically activates a user-bound device; existing devices bind only when the
+Relay instance matches. Legacy shared tokens are rejected on Ingress routes.
 
 **Upstream (Relay -> HA):**
-The Relay uses `HA_LLAT` to authenticate with Home Assistant. For WebSocket it creates a
-long-lived token auth via `home-assistant-js-websocket`. For REST calls (`/core` proxy)
-it adds `Authorization: Bearer {HA_LLAT}` to upstream `fetch()` requests.
+The Home Assistant App prefers its process-local `SUPERVISOR_TOKEN` and sends it
+only to the official `http://supervisor/core/api` and
+`ws://supervisor/core/websocket` proxies. Standalone Container/Core uses
+`HA_LLAT` against its configured Home Assistant URL. When both variables exist,
+Supervisor auth wins so an obsolete legacy App LLAT cannot break the App.
 
-The two tokens are independent. `RELAY_AUTH_TOKEN` is chosen by the operator;
-`HA_LLAT` is generated inside Home Assistant.
+Inbound and upstream credentials are independent. New App installs create and
+persist a random 32-byte relay token under `/data` with owner-only permissions.
+Existing App relay-token option values remain authoritative. The App
+configuration still ships an `ha_llat` field, but only as a one-time
+legacy-migration source: a normal App install leaves it empty and authenticates
+upstream with its Supervisor token. Standalone Container/Core installs must
+provide both `RELAY_AUTH_TOKEN` and `HA_LLAT` server-side.
+
+The interactive CLI's normal App path never asks the user to copy the relay
+token. It asks for the current Home Base code, sends it only in the JSON body of
+`POST /pair`, stores the returned token in the existing OS credential backend,
+and verifies both `/health` and `/ws`. Pairing requests do not follow redirects;
+the code is not accepted through argv and is not persisted in normal config.
+Saved credentials, `--relay-token`, service token files, and standalone
+Container/Core setups retain their explicit-token paths.
+
+The Cloud Beta contract is
+`docs/work/2026-07-25-home-assistant-cloud-remote-spec.md`.
 
 ## WS Forwarding Policy
 
@@ -288,26 +331,34 @@ All configuration is via environment variables. The `run` entrypoint script
 resolves values from HA app options and sets them before starting Node.
 
 ```yaml
-# Required (both must be non-empty)
-RELAY_AUTH_TOKEN: "<operator-chosen-secret>"   # Inbound client auth
-HA_LLAT: "<ha-long-lived-access-token>"        # Upstream HA auth
+# App: set RELAY_AUTH_TOKEN_FILE; RELAY_AUTH_TOKEN remains a legacy override.
+# Standalone: RELAY_AUTH_TOKEN is required.
+RELAY_AUTH_TOKEN: "<operator-chosen-secret>"   # Inbound client auth override
+RELAY_AUTH_TOKEN_FILE: "/data/relay_auth_token" # App-owned persistent token
+SUPERVISOR_TOKEN: "<injected-by-supervisor>"   # App upstream auth; never configured by the user
+HA_LLAT: "<ha-long-lived-access-token>"        # Standalone upstream auth fallback
+MIN_RELAY_VERSION: "<from nova/version.json>" # Required Relay floor shown in Home Base
 
 # Optional (with defaults)
-HA_URL: "http://homeassistant:8123"            # Default: http://homeassistant:8123
+HA_URL: "http://supervisor/core"               # App default; standalone default: http://homeassistant:8123
 RELAY_PORT: 8791                               # Default: 8791
 LOG_LEVEL: "info"                              # trace|debug|info|warn|error, default: info
 RELAY_VERSION: "dev"                           # Injected by run script from bashio
 APP_OPTIONS_PATH: "/data/options.json"         # HA app options file path
 ```
 
+`MIN_RELAY_VERSION` is loaded from `nova/version.json`, a generated mirror of
+the root `version.json` SSOT. The bump script and its contract keep the mirror
+in sync; Relay and product versions must not be substituted for each other.
+
 ## Tech Stack
 
 - TypeScript / Node.js >=20
 - No HTTP framework (Node.js `http.createServer`)
 - REST client uses native `fetch()` (no axios at runtime)
-- WS client uses `home-assistant-js-websocket` (the only directly imported production dependency)
-- `ws`, `yaml` are listed in `package.json` but not directly imported by relay source code; they are transitive or reserved for future phases (`axios` was removed as dead weight — REST stays on native `fetch()`)
-- Current scope: ~1,500 lines across ~20 `.ts` files (Phase 1a)
+- WS orchestration uses `home-assistant-js-websocket`
+- `ws` supplies the authenticated Node WebSocket transport; REST stays on native `fetch()`
+- Current scope is contract-capped at 3,900 TypeScript source lines
 
 ## Standard Envelope
 
@@ -321,14 +372,15 @@ All responses follow the same JSON envelope (defined in `types/api.ts`):
 { ok: false, error: { code: string, message: string } }
 ```
 
-HTTP status is 200 for success. Error status codes: 400 (validation), 401 (auth),
-404 (route not found), 502 (upstream failure), 500 (internal).
+HTTP status is 200 for success. Error status codes include 400 (validation),
+401 (auth), 404 (route not found), 413 (body cap), 429 (pairing rate limit),
+502 (upstream failure), and 500 (internal).
 
 ## What the Relay does NOT do
 
 - No business logic
 - No validation rules (beyond request format and path safety)
-- No state caching
+- No Home Assistant domain-state caching
 - No consent gating
 - No session management
 - No metrics (structured JSON logging only)

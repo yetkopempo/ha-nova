@@ -55,6 +55,51 @@ describe("review contract", () => {
     expect(reviewChecks).toContain("within `1 × step`");
   });
 
+  it("keeps scene color and helper-source rules aligned with their evidence", () => {
+    expect(reviewChecks).toContain(
+      "`color_temp_kelvin`/`hs_color`/`rgb_color`/`xy_color`/`rgbw_color`/`rgbww_color`",
+    );
+    expect(reviewChecks).toContain(
+      "entry resolves in NEITHER the entity registry NOR `/api/states`",
+    );
+  });
+
+  it("guards orphan hints against dashboard-only consumers", () => {
+    expect(reviewChecks).toContain(
+      "Scan card actions across ALL storage dashboards before emitting the hint",
+    );
+    expect(reviewChecks).toContain(
+      "custom dashboard/view strategy, or custom view type",
+    );
+    expect(reviewChecks).toContain(
+      "card `type`, view `type`, and dashboard/view `strategy.type`",
+    );
+    expect(reviewSkill).toContain(
+      "cross-item HX rules run in aggregate/bulk mode OR whenever their required registry/state context is already loaded",
+    );
+    expect(reviewSkill).toContain(
+      "apply HX-05 to visible card actions without expanding the workset",
+    );
+    expect(reviewChecks).toContain(
+      "D-06 [LOW]: Card references a registry-disabled entity (`disabled_by` is non-null)",
+    );
+    expect(reviewChecks).toContain("never flag `hidden_by` alone");
+    expect(reviewSkill).toContain(
+      "A scene without registry `unique_id` is YAML-backed",
+    );
+    expect(reviewSkill).toContain(
+      "run SC checks only when that scene's exact YAML is already in context",
+    );
+    expect(reviewSkill).toContain("never emit an empty or inferred review");
+    expect(reviewChecks).toContain(
+      "All dashboard D/HX scans traverse the full dashboard object recursively",
+    );
+    expect(reviewChecks).toContain(
+      "`cards[]`, singular `card`, `elements[]`, `badges[]`, `sections[]`, and header-card structures",
+    );
+    expect(reviewChecks).toContain("A top-level-only scan is invalid");
+  });
+
   it("documents live helper evidence for threshold checks in the catalog", () => {
     expect(reviewChecks).toContain("Helper Threshold Evidence");
     expect(reviewChecks).toContain('/api/states/<helper_entity_id>');
@@ -65,11 +110,11 @@ describe("review contract", () => {
     expect(reviewChecks).toContain("Do not emit R-10 just because H-09 matched");
   });
 
-  it("keeps shared references aligned to H-01..H-10", () => {
-    expect(writeSkill).toContain("H-01..H-10");
-    expect(helperSkill).toContain("H-01..H-10");
-    expect(reviewChecks).toContain("Helper (storage-based family): H-01..H-10");
-    expect(architectureDoc).toContain("H-01..H-10");
+  it("keeps shared references aligned to the helper check ranges", () => {
+    expect(writeSkill).toContain("H-01..H-11");
+    expect(helperSkill).toContain("H-01..H-11");
+    expect(reviewChecks).toContain("Helper (storage-based family): H-01..H-11");
+    expect(architectureDoc).toContain("H-01..H-15");
   });
 
   it("keeps live-evidence helper checks staged in write/helper flows", () => {
@@ -78,10 +123,10 @@ describe("review contract", () => {
     expect(helperSkill).toContain("Apply H-01..H-08 directly");
     expect(helperSkill).toContain("Only evaluate H-09/H-10");
     expect(helperSkill).toContain("direct helper-backed threshold");
-    expect(helperSkill).toContain("Do not pretend H-01..H-10 apply here");
+    expect(helperSkill).toContain("Do not pretend H-01..H-11 apply here");
     expect(helperSkill).toContain("minimal config-entry post-write contract");
     expect(reviewChecks).toContain("Helper (config-entry family): minimal config-entry review");
-    expect(reviewChecks).toContain("do not apply H-01..H-10");
+    expect(reviewChecks).toContain("do not apply H-01..H-11");
   });
 
   it("documents config-entry helper target resolution before minimal review", () => {
@@ -102,7 +147,12 @@ describe("review contract", () => {
 
   it("documents contributor-facing taxonomy entry points", () => {
     expect(architectureDoc).toContain("## Review Check Taxonomy");
+    expect(architectureDoc).toContain("(S/R/P/M/F/H/SC/D/HX/TS)");
     expect(architectureDoc).toContain("`H` = Helper-specific");
+    expect(architectureDoc).toContain("`SC` = Scene-specific");
+    expect(architectureDoc).toContain("`D` = Dashboard-specific");
+    expect(architectureDoc).toContain("`HX` = Cross-item");
+    expect(architectureDoc).toContain("`TS` = YAML-sensor-specific");
     expect(architectureDoc).toContain("`R` = Reliability");
     expect(contributingDoc).toContain("Review Check Taxonomy");
     expect(contributingDoc).toContain("docs/reference/skill-architecture.md");
@@ -114,8 +164,8 @@ describe("review contract", () => {
     expect(reviewChecks).toContain("R-16 [HIGH]");
     expect(reviewChecks).toContain("Templated event name");
     expect(reviewChecks).toContain("`event_type:` does not evaluate templates");
-    expect(reviewChecks).toContain("R-01..R-29");
-    expect(architectureDoc).toContain("R-01..R-29");
+    expect(reviewChecks).toContain("R-01..R-31");
+    expect(architectureDoc).toContain("R-01..R-31");
     expect(templateGuidelines).toContain("Event trigger names must be literal strings");
     expect(templateGuidelines).toContain("do not template `event_type:`");
   });
@@ -168,17 +218,17 @@ describe("review contract", () => {
     expect(reviewChecks).toContain("`unknown`, `unavailable`, or stale-restored");
   });
 
-  it("documents contradictory conjunction state checks as R-29", () => {
-    expect(reviewChecks).toContain("R-29 [HIGH]");
+  it("documents contradictory conjunction state checks as R-31", () => {
+    expect(reviewChecks).toContain("R-31 [HIGH]");
     expect(reviewChecks).toContain("Contradictory fixed state conditions in one conjunction");
     expect(reviewChecks).toContain("same `entity_id`");
     expect(reviewChecks).toContain("both `on` and `off`");
-    expect(reviewChecks).toContain("## R-29 Evidence Boundary");
+    expect(reviewChecks).toContain("## R-31 Evidence Boundary");
     expect(reviewChecks).toContain("root `conditions:` list");
     expect(reviewChecks).toContain("explicit `condition: and` block");
     expect(reviewChecks).toContain("Skip `condition: or` scopes");
     expect(templateGuidelines).toContain("Contradictory fixed `condition: state` checks");
-    expect(architectureDoc).toContain("`R-29` detects mutually exclusive fixed state requirements");
+    expect(architectureDoc).toContain("`R-31` detects mutually exclusive fixed state requirements");
   });
 
   it("documents boolean-string template comparisons as R-23", () => {
@@ -227,7 +277,11 @@ describe("review contract", () => {
   });
 
   it("keeps raw trace internals optional and defensive during review", () => {
-    expect(reviewSkill).toContain("ha-nova trace latest/list/get --json");
+    expect(reviewSkill).toContain("Trace Evidence (automation/script reviews only)");
+    expect(reviewSkill).toMatch(/only when the user asked for an automation or\s+script review/);
+    expect(reviewSkill).toContain("ha-nova trace latest <automation_or_script_entity_id> --json");
+    expect(reviewSkill).toContain("ha-nova trace list <automation_or_script_entity_id> --json");
+    expect(reviewSkill).toContain("ha-nova trace get <automation_or_script_entity_id> <run_id> --json");
     expect(reviewSkill).toContain("they are enough for run selection, result status, timestamp, item binding, and most review findings");
     expect(reviewSkill).toContain("Inspect raw trace internals only when step-level evidence is required");
     expect(reviewSkill).toContain("Raw trace nodes can be arrays of event records");

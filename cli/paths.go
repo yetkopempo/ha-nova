@@ -9,7 +9,10 @@ import (
 )
 
 const (
-	configSchemaVersion = 1
+	// v3: named profiles gain immutable identities, route policy, and non-secret
+	// Cloud lifecycle metadata. v1/v2 configs migrate on their first save; only
+	// legacy local fields remain mirrored for older binaries.
+	configSchemaVersion = 3
 	stateSchemaVersion  = 1
 	bundleFormatVersion = 1
 	keyringServiceName  = "ha-nova.relay-auth-token"
@@ -22,6 +25,7 @@ const (
 	updateCacheTTLSeconds      = 60 * 60
 	windowsInstallRootEnv      = "HA_NOVA_INSTALL_ROOT"
 	windowsInstallRootAllowEnv = "HA_NOVA_ALLOW_INSTALL_ROOT_OVERRIDE"
+	configDirEnv               = "HA_NOVA_CONFIG_DIR"
 )
 
 type runtimePaths struct {
@@ -34,6 +38,7 @@ type runtimePaths struct {
 	PublicBinary        string
 	ConfigFile          string
 	StateFile           string
+	CensusFile          string
 	VersionFile         string
 	BundleFile          string
 	UpdateCacheFile     string
@@ -52,12 +57,16 @@ func detectPaths() (runtimePaths, error) {
 	installRoot := filepath.Join(home, ".local", "share", "ha-nova")
 	binDir := filepath.Join(home, ".local", "bin")
 	publicBinary := filepath.Join(binDir, publicCommandName())
+	censusDir := configDir
 	if runtime.GOOS == "windows" {
 		appData := windowsAppDataDir(home)
 		localAppData := windowsLocalAppDataDir(home)
 		configDir = filepath.Join(appData, "ha-nova")
 		localDataDir = filepath.Join(localAppData, "ha-nova")
 		cacheDir = filepath.Join(localDataDir, "cache")
+		// Consent is device-local. APPDATA may roam between Windows hosts;
+		// LOCALAPPDATA must not carry one machine's answer to another.
+		censusDir = localDataDir
 		installRoot = filepath.Join(localAppData, "Programs", "ha-nova")
 		if override := strings.TrimSpace(os.Getenv(windowsInstallRootEnv)); override != "" && allowWindowsInstallRootOverride() {
 			installRoot = filepath.Clean(override)
@@ -70,6 +79,22 @@ func detectPaths() (runtimePaths, error) {
 		binDir = installRoot
 		publicBinary = filepath.Join(installRoot, publicCommandName())
 	}
+	if override := strings.TrimSpace(os.Getenv(configDirEnv)); override != "" {
+		configDir = filepath.Clean(override)
+		if !filepath.IsAbs(configDir) {
+			return runtimePaths{}, fmt.Errorf(
+				"%s must be an absolute path",
+				configDirEnv,
+			)
+		}
+		if filepath.Dir(configDir) == configDir {
+			return runtimePaths{}, fmt.Errorf(
+				"%s must not be a filesystem root",
+				configDirEnv,
+			)
+		}
+		censusDir = configDir
+	}
 
 	paths := runtimePaths{
 		Home:                home,
@@ -81,6 +106,7 @@ func detectPaths() (runtimePaths, error) {
 		PublicBinary:        publicBinary,
 		ConfigFile:          filepath.Join(configDir, "config.json"),
 		StateFile:           filepath.Join(configDir, "state.json"),
+		CensusFile:          filepath.Join(censusDir, "census.json"),
 		VersionFile:         filepath.Join(installRoot, "version.json"),
 		BundleFile:          filepath.Join(installRoot, "bundle.json"),
 		UpdateCacheFile:     filepath.Join(cacheDir, "latest-release.json"),

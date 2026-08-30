@@ -23,10 +23,11 @@ Not in scope:
 - calendar queries (use `ha-nova:calendar`)
 - giant raw exports
 
-Use `ha-nova:read` for traces, `ha-nova:calendar` for calendars, and `ha-nova:fallback` for subscriptions.
+Use `ha-nova:diagnose` for traces (it owns trace analysis; `ha-nova:read` only surfaces raw trace data when the user explicitly asks for it with no failure question attached), `ha-nova:calendar` for calendars, and `ha-nova:fallback` for subscriptions.
 
 ## Bootstrap (once per session)
 
+Read and follow `../ha-nova/session-bootstrap.md`.
 Verify relay CLI: `ha-nova relay health`
 If this fails: `ha-nova setup`
 
@@ -42,7 +43,11 @@ For `ha-nova relay jq`, the filter is positional unless `--jq-file` is used. Do 
 
 Canonical paths:
 - `/api/history/period/<start>?filter_entity_id=<entity_id>&end_time=<end>`
-- `/api/logbook/<start>?entity=<entity_id>&end_time=<end>`
+- `/api/logbook/<start>?entity=<entity_id>&end_time=<end>` — `entity` takes a
+  comma-separated LIST for several entities (verified on 2026.8.0: the endpoint
+  splits on commas and ignores unknown ids), and omitting it entirely returns
+  the whole home for that window. `filter_entity_id` belongs to the HISTORY
+  endpoint; using it here silently returns everything.
 - `recorder/statistics_during_period`
 
 Prefer `minimal_response` and `no_attributes` on large history queries when the task only needs state transitions.
@@ -51,6 +56,13 @@ Envelope parsing follows `skills/ha-nova/relay-api.md` → Standard Envelope; re
 - logbook entries: `.data.body`
 - do not probe `.[0]` or `.[0][0]` against the relay envelope
 Recorder statistics response stays under WS `.data`.
+
+Statistics semantics (`recorder/statistics_during_period`) — check which keys the response actually carries before summarizing:
+- Measurement stats (temperature, humidity) carry `mean`/`min`/`max`. Metered `total_increasing` stats (energy, water, gas) are consumption: request `change` in the `types` list and SUM the per-bucket `change` values over the window (the pattern `skills/energy/energy-reference.md` uses) — never an average, and never `last sum − first sum`, which drops the first bucket's consumption and reads 0 for a single bucket.
+- Long-term statistics carry their own unit, which can differ from the entity's current unit after a unit change (the exact trap `ha-nova:maintenance` repairs) — report the unit from the statistics metadata, and flag a mismatch instead of mixing units.
+- `statistic_id` is not always an `entity_id`: external statistics use `domain:object_id` (colon) and have no entity — resolve via `recorder/list_statistic_ids` when unsure.
+- Daily/monthly buckets follow the HA server's local timezone including DST shifts — a "day" is not a fixed 24 h; name the bucket timezone when precision matters.
+- The queried window is what was REQUESTED, not what was observed: report the actual first-to-last sample span and material gaps alongside the requested window, and never phrase a result as covering "the last N days" when the evidence spans less (`skills/ha-nova/write-safety.md` → Time-Window Evidence — applies to raw history summaries too). For `recorder/statistics_during_period` the response carries aggregated period BUCKETS, not sample timestamps: report the first-to-last bucket span and NAME it as bucket coverage — sample density claims come only from raw state history, never from LTS buckets.
 
 ## Flow
 
@@ -85,7 +97,7 @@ Apply `skills/ha-nova/output-rules.md` to all user-facing output.
 - `Key events`, `Key transitions`, or `Key periods`
 - `Next step`
 
-Keep default output compact. Raw payload dumps are opt-in only.
+These slots render the Report shape (output-rules.md). Keep default output compact. Raw payload dumps are opt-in only.
 
 ## Safety
 
@@ -97,9 +109,19 @@ Keep default output compact. Raw payload dumps are opt-in only.
 - If more than one entity could match, ask one blocking question.
 - If the data is incomplete for the requested conclusion, say so explicitly.
 
+Whole-home and multi-entity windows: omitting `entity` from the logbook path
+returns everything that happened ("what happened overnight?") — allowed for
+windows up to 24 hours, summary-first, never a raw dump. For a small explicit
+set, pass the ids as a comma-separated `entity` value on that LOGBOOK path —
+verified against 2026.8.0: the endpoint splits on commas, and an unknown id in
+the list is ignored rather than failing the query.
+`filter_entity_id` belongs to the history endpoint, and using it here silently
+returns the whole home instead. That is how you compare two people's arrival
+times in one call.
+
 ## Guardrails
 
 - Never run an unbounded history/logbook/statistics query.
-- Cap default investigative windows at 24 hours unless the user asked for more.
+- Cap default history/logbook windows at 24 hours unless the user asked for more; statistics/trend questions keep the Flow's 30-day default.
 - If the user asks for a very large export, narrow the request first.
 - Prefer a short summary over dumping a long raw timeline.

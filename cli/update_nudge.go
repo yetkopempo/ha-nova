@@ -91,32 +91,53 @@ func skillUpdateNudgeNotice(paths runtimePaths, throttled bool) humanNotice {
 	return humanNotice{
 		level:   humanNoticeWarning,
 		kind:    humanNoticeKindUpdateAvailable,
-		message: skillUpdateNudgeMessage(lead, current, cached.Version, source),
+		message: skillUpdateNudgeMessage(lead, current, cached.Version, source, cached.ReleaseHighlights, cached.HTMLURL),
 	}
 }
 
 // skillUpdateNudgeMessage keeps the surfaced action aligned with what the
 // detected install source actually supports: legacy Windows package installs
 // reject `ha-nova update`, so they get the same uninstall/reinstall guidance
-// the explicit check-update path uses.
-func skillUpdateNudgeMessage(lead, current, latest, installSource string) string {
-	return fmt.Sprintf("%s: v%s -> v%s. Inform the user: %s (new session required after update).", lead, current, latest, updateGuidanceForInstallSource(installSource))
+// the explicit check-update path uses. Highlights and release URL come from
+// the cache only (hot path stays network-free) and compose AROUND the pinned
+// guidance via the shared formatter.
+func skillUpdateNudgeMessage(lead, current, latest, installSource string, highlights []releaseHighlight, htmlURL string) string {
+	return fmt.Sprintf("%s: v%s -> v%s. Inform the user: %s (new session required after update).%s", lead, current, latest, updateGuidanceForInstallSource(installSource), releaseHighlightNoticeSuffix(highlights, htmlURL))
 }
 
 // passesNudgeThrottle reports whether the marker is older than the given
 // interval and stamps it when it passes — the same marker-file pattern as
-// shouldWarnRelayOutdated. Failures degrade to "allow" so a broken cache dir
-// never suppresses notices.
+// shouldWarnRelayOutdated. Lifecycle or lock refusal fails closed so uninstall
+// and another active mutation never spawn background work.
 func passesNudgeThrottle(paths runtimePaths, markerName string, interval time.Duration) bool {
-	marker := filepath.Join(paths.CacheDir, markerName)
-	if info, err := os.Stat(marker); err == nil && time.Since(info.ModTime()) < interval {
+	allowed := true
+	mutated := mutateActiveInstallCache(paths, func() {
+		marker := filepath.Join(paths.CacheDir, markerName)
+		if info, err := os.Stat(marker); err == nil && time.Since(info.ModTime()) < interval {
+			allowed = false
+			return
+		}
+		if err := os.MkdirAll(paths.CacheDir, 0o755); err != nil {
+			return
+		}
+		_ = os.WriteFile(marker, []byte(time.Now().UTC().Format(time.RFC3339)+"\n"), 0o644)
+	})
+	return mutated && allowed
+}
+
+func mutateActiveInstallCache(paths runtimePaths, mutate func()) bool {
+	lifecycleGeneration, err := readInstallLifecycleGeneration(paths)
+	if err != nil || censusLifecycleStopped(paths) {
 		return false
 	}
-	if err := os.MkdirAll(paths.CacheDir, 0o755); err != nil {
-		return true
+	release, acquired := acquireAutoRepairLock(paths)
+	if !acquired {
+		return false
 	}
-	if err := os.WriteFile(marker, []byte(time.Now().UTC().Format(time.RFC3339)+"\n"), 0o644); err != nil {
-		return true
+	defer release()
+	if ensureUpdateLifecycleCurrent(paths, lifecycleGeneration) != nil {
+		return false
 	}
+	mutate()
 	return true
 }

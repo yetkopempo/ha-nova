@@ -125,10 +125,10 @@ Return exactly these sections:
 - numbered errors or `none`
 
 `SUGGESTED_ENHANCEMENTS:`
-- concrete optional improvements based on entity capabilities and common HA patterns
-- each item: short title, what it does, why it helps
-- or `none` if basic intent is fully covered
-- use both the examples below AND your general HA knowledge to suggest relevant improvements
+- at most 2 concrete optional improvements, each directly relevant to the stated goal and backed by observed evidence (entity capabilities, current config) — smallest intervention first (`skills/ha-nova/smallest-solution.md`)
+- each item: short title, what it does, why it helps (the main thread renders these as the Suggestion Block — output-rules.md)
+- or `none` if the requested intent is fully covered — never invent suggestions to fill the list
+- use both the examples below AND your general HA knowledge, but only where the evidence in THIS home supports the improvement
 
 Common patterns to check (non-exhaustive):
 - motion sensor: re-trigger grace period (restart timer on new motion)
@@ -139,6 +139,7 @@ Common patterns to check (non-exhaustive):
 - time-based: add condition to skip weekends/holidays
 - climate: add hysteresis/deadband to avoid rapid cycling
 - notification: add cooldown to prevent spam
+- high-consequence action (lock, valve, heating): outcome alert — a follow-up state check (wait/condition on the target) that notifies when the intended state is NOT observed; service errors are not observable from inside the sequence
 - any automation: consider appropriate `mode` (single, restart, queued, parallel)
 
 `NEXT_STEP:`

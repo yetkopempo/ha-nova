@@ -17,23 +17,36 @@ describe("app config contract", () => {
     expect(parsed.homeassistant_api).toBe(true);
     expect(parsed.hassio_api).toBe(true);
     expect(parsed.hassio_role).toBe("default");
-    expect(parsed.ingress).toBe(false);
+    expect(parsed.ingress).toBe(true);
+    // Ingress moves to an internal, unmapped port so the owner console is never
+    // LAN-reachable; the public transport ports are 8791 (bootstrap) + 8792 (TLS).
+    expect(parsed.ingress_port).toBe(8793);
+    expect(parsed.ingress_entry).toBe("/home");
+    expect(parsed.panel_admin).toBe(true);
+    expect(parsed.panel_title).toBe("NOVA");
+    expect(parsed.panel_icon).toBe("mdi:star-four-points");
     expect(parsed.ports).toMatchObject({
-      "8791/tcp": 8791
+      "8791/tcp": 8791,
+      "8792/tcp": 8792
     });
     expect(parsed.ports_description).toMatchObject({
-      "8791/tcp": "Relay HTTP API"
+      "8791/tcp": "Relay pairing + legacy HTTP",
+      "8792/tcp": "Relay secure device API (TLS)"
     });
 
     expect(parsed.options).toEqual({
-      relay_auth_token: null,
+      // MUST stay "" and never null: a null default marks the option as
+      // REQUIRED in Supervisor, so a fresh install refuses to start until the
+      // user fills a token — breaking passwordless onboarding (proven live:
+      // "Missing required option 'relay_auth_token'").
+      relay_auth_token: "",
       ha_llat: "",
       // File access is a capability, not a default: the App ships it OFF.
       file_access: "off"
     });
 
     expect(parsed.schema).toEqual({
-      relay_auth_token: "password",
+      relay_auth_token: "password?",
       ha_llat: "password?",
       file_access: "list(off|read|readwrite)?"
     });
@@ -68,6 +81,10 @@ describe("app config contract", () => {
     const fileAccess = translations.configuration.file_access?.description ?? "";
     expect(fileAccess).toContain("off");
     expect(fileAccess).toContain("Secrets");
+
+    const relayToken = translations.configuration.relay_auth_token?.description ?? "";
+    expect(relayToken).toContain("leave this empty");
+    expect(relayToken).toContain("persists");
   });
 
   it("has relay version >= min_relay_version from version.json", () => {

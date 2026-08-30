@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
 	"flag"
 	"fmt"
@@ -8,11 +9,20 @@ import (
 	"net/http"
 	"os"
 	"strings"
+	"time"
 )
 
-var readRelayAuthTokenForDoctor = readRelayAuthToken
+var (
+	readRelayAuthTokenForDoctor = readRelayAuthToken
+	probePairingV1ForDoctor     = probePairingV1
+	firstUseRelayNoticeTimeout  = 4 * time.Second
+)
 
 func runDoctor(paths runtimePaths, args []string) int {
+	return runDoctorWithCensusAsk(paths, args, true)
+}
+
+func runDoctorWithCensusAsk(paths runtimePaths, args []string, allowCensusAsk bool) int {
 	fs := flag.NewFlagSet("doctor", flag.ContinueOnError)
 	fs.SetOutput(io.Discard)
 	autoRepair := fs.Bool("auto-repair", false, "silently reattach drifted clients before reporting")
@@ -22,6 +32,16 @@ func runDoctor(paths runtimePaths, args []string) int {
 			return 0
 		}
 		printHumanErr("%s", err)
+		return 1
+	}
+	doctorLifecycleGeneration, lifecycleErr := readInstallLifecycleGeneration(paths)
+	if lifecycleErr != nil {
+		printHumanErr("cannot inspect install lifecycle: %s", lifecycleErr)
+		return 1
+	}
+	doctorConfigSnapshot, doctorHadConfigSnapshot, snapshotErr := readOptionalFile(paths.ConfigFile)
+	if snapshotErr != nil {
+		printHumanErr("cannot inspect server configuration: %s", snapshotErr)
 		return 1
 	}
 	doctorInfo := func(format string, parts ...any) {
@@ -44,12 +64,7 @@ func runDoctor(paths runtimePaths, args []string) int {
 		}
 	}
 
-	// Self-heal client integrations once after a version change (complements
-	// --auto-repair below, which only re-attaches drifted clients). Best-effort.
-	ensureClientsVerifiedForCurrentVersion(paths)
-
 	cfg, cfgErr := loadConfig(paths)
-	token, tokenErr := readRelayAuthTokenForDoctor()
 	state, stateErr := loadStateOrDefaultChecked(paths)
 	if stateErr != nil {
 		printHumanErr("%s", stateErr)
@@ -63,52 +78,234 @@ func runDoctor(paths runtimePaths, args []string) int {
 		printHumanErr("%s", cfgErr)
 		return 1
 	}
-
-	if tokenErr == nil && token != "" {
-		doctorInfo("Relay auth token present in %s", relayAuthTokenStorageLabel())
-	} else {
-		printHumanErr("%s", relayAuthTokenProblemMessage(tokenErr))
-		if hint := doctorServiceCredentialRecoveryHint(paths, state, tokenErr); hint != "" {
-			printHumanWarn("%s", hint)
-		}
-		if hint := setupSecureStorageRecoveryHint(tokenErr); hint != "" {
-			printHumanWarn("%s", hint)
-		}
-		return 1
+	// Multi-server installs: name the checked profile so per-server doctor runs
+	// (HA_NOVA_SERVER=<name> ha-nova doctor) are unambiguous.
+	if profileName, profileCount := selectedServerProfileStatus(paths); profileCount > 1 || profileName != defaultServerProfileName {
+		doctorInfo("Server profile: %s", profileName)
 	}
 
-	if err := probeHTTP(cfg.HAURL); err != nil {
+	// Finish a pairing interrupted between activation and promotion (crash or
+	// lost response) before any client self-heal mutation.
+	resumed, resumeErr := resumeInterruptedPairingForDoctor(
+		paths,
+		&cfg,
+		doctorLifecycleGeneration,
+		doctorConfigSnapshot,
+		doctorHadConfigSnapshot,
+	)
+	if resumeErr != nil {
+		printPendingActivationResumeError(resumeErr)
+		return 1
+	}
+	if resumed {
+		doctorInfo("Resumed the interrupted pairing — this device is connected.")
+	}
+	// Self-heal client integrations once after a version change (complements
+	// --auto-repair below, which only re-attaches drifted clients). Best-effort.
+	ensureClientsVerifiedForCurrentVersion(paths)
+
+	// Doctor uses the same route policy as functional commands. Automatic may
+	// therefore verify over Cloud while away, but still fails closed on local
+	// authentication, pin, or protocol errors.
+	doctorRelayCtx, cancelDoctorRelay := context.WithTimeout(
+		context.Background(),
+		time.Duration(defaultRelayMaxTimeSeconds*float64(time.Second)),
+	)
+	defer cancelDoctorRelay()
+	transport, transportErr := selectRelayTransport(
+		doctorRelayCtx,
+		cfg,
+		"",
+		false,
+	)
+	transportBase, transportClient, transportCred, deviceMode :=
+		transport.BaseURL, transport.Client, transport.Credential, transport.DeviceMode
+	pairedConfig := cfg.RelaySecureBaseURL != "" && cfg.RelaySpkiPin != ""
+	var token string
+	if transportErr == nil && deviceMode {
+		token = transportCred
+		doctorInfo("Device credential present (paired securely)")
+	} else if pairedConfig {
+		// A paired config whose device transport failed must NOT be masked by a
+		// leftover legacy token: report the device problem so the user re-pairs.
+		// The direct slot read distinguishes unreadable storage from an absent
+		// credential (re-pairing cannot store anything in broken storage).
+		if _, exists, credErr := readDeviceCredential(); credErr != nil {
+			printHumanErr("This device is paired, but its device credential could not be read from secure storage: %s", credErr)
+			if hint := setupSecureStorageRecoveryHint(credErr); hint != "" {
+				printHumanWarn("%s", hint)
+			} else {
+				printHumanWarn("Unlock or repair secure storage on this machine, then run 'ha-nova doctor' again.")
+			}
+			return 1
+		} else if exists {
+			printHumanErr("%s", relayTransportErrorMessage(transportErr))
+			return 1
+		}
+		printHumanErr("This device was paired, but its device credential is missing from secure storage.")
+		printHumanErr(
+			"Pair again: run '%s' and enter a fresh code from the NOVA page.",
+			localRelayRepairCommand(
+				activeServerProfile(),
+				cfg.RelayBaseURL,
+			),
+		)
+		return 1
+	} else if transportErr != nil &&
+		effectiveRoutePolicy(cfg.RoutePolicy) != routePolicyLocal {
+		printHumanErr("%s", relayTransportErrorMessage(transportErr))
+		return 1
+	} else if activeServerProfile() != defaultServerProfileName {
+		// Non-default profiles are device-credential-only: never check them with
+		// the machine-wide legacy token (it belongs to the default profile).
+		if transportErr == nil {
+			transportErr = fmt.Errorf(
+				"server profile %q has no completed device pairing; run: %s",
+				activeServerProfile(),
+				localRelayRepairCommand(
+					activeServerProfile(),
+					cfg.RelayBaseURL,
+				),
+			)
+		}
+		printHumanErr("%s", transportErr)
+		return 1
+	} else {
+		tokenErr := transportErr
+		if tokenErr == nil {
+			token = transportCred
+		} else {
+			token, tokenErr = readRelayAuthTokenForDoctor()
+		}
+		if tokenErr == nil && token != "" {
+			doctorInfo("Relay auth token present in %s", relayAuthTokenStorageLabel())
+		} else {
+			printHumanErr("%s", relayAuthTokenProblemMessage(tokenErr))
+			if hint := doctorServiceCredentialRecoveryHint(paths, state, tokenErr); hint != "" {
+				printHumanWarn("%s", hint)
+			}
+			if hint := setupSecureStorageRecoveryHint(tokenErr); hint != "" {
+				printHumanWarn("%s", hint)
+			}
+			return 1
+		}
+	}
+
+	usingCloud := transport.Via == relayViaCloud
+	haReachable := false
+	haURLKnown := strings.TrimSpace(cfg.HAURL) != ""
+	if usingCloud {
+		doctorInfo("Cloud route selected; skipping the local Home Assistant address probe")
+		haReachable = true
+	} else if !haURLKnown {
+		// A pair-only setup (`ha-nova pair --relay-url ...`) has no saved HA
+		// address yet. The relay's WS state still proves the connection; the
+		// direct HA probe is just skipped instead of failing on an empty URL.
+		if activeServerProfile() == defaultServerProfileName {
+			printHumanWarn("No Home Assistant address saved yet; skipping the direct HA check. Run 'ha-nova setup' to complete this device's setup.")
+		} else {
+			printHumanWarn("No Home Assistant address saved for this profile; skipping the direct HA check.")
+		}
+	} else if err := probeHTTP(cfg.HAURL); err != nil {
 		printHumanErr("Home Assistant unreachable: %s", err)
 		status = 1
 	} else {
 		doctorInfo("Home Assistant reachable: %s", cfg.HAURL)
+		haReachable = true
 	}
-	haReachable := status == 0
+	// WS state is judged when HA answered directly, or when no address is
+	// saved (then the relay's own upstream state is the only — and sufficient —
+	// signal). Only a KNOWN-down HA suppresses it: blaming tokens while HA
+	// itself is offline would mislead.
+	judgeWS := haReachable || !haURLKnown
 
-	readiness := checkRelayReadiness(cfg.RelayBaseURL, token)
+	healthBase := transportBase
+	runReadiness := func() relayReadiness {
+		if deviceMode || usingCloud {
+			return checkRelayReadinessOverTransportContext(
+				doctorRelayCtx,
+				transportBase,
+				transportClient,
+				token,
+			)
+		}
+		return checkRelayReadiness(cfg.RelayBaseURL, token)
+	}
+	readiness := runReadiness()
 	if readiness.HealthErr != nil {
 		printHumanErr("Relay health failed: %s", readiness.HealthErr)
+		if deviceMode && relayHealthIssueLooksLikeRelayAuth(readiness.HealthErr) {
+			printHumanErr(
+				"This device's pairing was not accepted (revoked or unknown). Pair again: run '%s'.",
+				localRelayRepairCommand(
+					activeServerProfile(),
+					cfg.RelayBaseURL,
+				),
+			)
+		}
 		status = 1
 	} else {
-		doctorInfo("Relay health reachable: %s/health", cfg.RelayBaseURL)
+		doctorInfo("Relay health reachable: %s/health", healthBase)
 		if notice := checkRelayVersion(paths, readiness.HealthBody); !notice.empty() {
 			printHumanNotice(notice)
-			status = 1
+			// --quiet is a machine/diagnostic contract: warning-only, never
+			// an interactive question that could block or trigger a restart.
+			// A guided update that ends verified clears THIS failure — doctor
+			// must not exit 1 over a problem the user just fixed.
+			fixed := false
+			if !*quiet && !usingCloud {
+				fixed = maybeOfferGuidedRelayUpdate(paths, notice)
+			}
+			if !fixed {
+				status = 1
+			} else {
+				// The relay just restarted: the readiness captured before the
+				// update is stale (its WS may still be reconnecting, or fail
+				// on the new version) — the checks below must judge the relay
+				// that is running NOW.
+				readiness = runReadiness()
+			}
+		} else if !*quiet && !usingCloud {
+			// A newer App may be available even while the running Relay remains
+			// compatible with min_relay_version. That is an optional update, not
+			// a failed doctor check; decline/non-TTY keeps status unchanged.
+			if notice := relayAvailableUpdateNotice(cfg, token); !notice.empty() {
+				printHumanNotice(notice)
+				if maybeOfferGuidedRelayUpdate(paths, notice) {
+					readiness = runReadiness()
+				}
+			}
 		}
-		if haReachable {
+		if judgeWS {
 			switch {
 			case readiness.WSReady:
 				if readiness.UsedWSPing {
 					doctorInfo("Relay /ws ping succeeded")
 				}
 				doctorInfo("Connected to Home Assistant")
-			case readiness.LLATIssue:
+				// Working legacy install against a pairing-capable relay: point
+				// at the passwordless upgrade once, as information — never a
+				// failure, and skipped in --quiet's machine contract.
+				if !deviceMode && !usingCloud && !*quiet && probePairingV1ForDoctor(cfg.RelayBaseURL) {
+					printHumanInfo("This relay supports passwordless device pairing. Run 'ha-nova pair' and enter a fresh code from the NOVA page to switch this device to its own secure credential.")
+				}
+			case readiness.UpstreamAuthIssue:
 				printHumanErr("Relay reports degraded upstream WS capability")
-				printHumanErr(`The Home Assistant Access Token field ("ha_llat") in NOVA Relay is missing or invalid`)
+				printHumanErr("Relay upstream authentication was rejected; update/restart the App, or replace HA_LLAT for standalone Container/Core")
 				status = 1
 			case readiness.RelayAuthIssue:
 				printHumanErr("Relay reports degraded upstream WS capability")
-				printHumanErr(`The Relay Auth Token field ("relay_auth_token") in NOVA Relay is missing or invalid`)
+				if deviceMode {
+					printHumanErr(
+						"This device's pairing was not accepted (revoked or unknown). Pair again: run '%s'.",
+						localRelayRepairCommand(
+							activeServerProfile(),
+							cfg.RelayBaseURL,
+						),
+					)
+				} else {
+					printHumanErr(`The Relay Auth Token field ("relay_auth_token") in NOVA Relay is missing or invalid`)
+				}
 				status = 1
 			default:
 				printHumanErr("Relay reports degraded upstream WS capability")
@@ -186,19 +383,43 @@ func runDoctor(paths runtimePaths, args []string) int {
 	}
 	if status == 0 {
 		doctorInfo("Doctor checks passed")
+		// One-time census ask on the healthy interactive tail only — never in
+		// --quiet's machine contract, never after a failed run.
+		if !*quiet && allowCensusAsk {
+			maybeAskCensus(paths, "doctor")
+		}
 	}
 	return status
 }
 
 func doctorClientRepairHint(client clientStatus, installSource string) string {
+	setupCommand := doctorClientSetupCommand(client.ID)
 	switch {
 	case !client.RuntimeDetected:
-		return fmt.Sprintf("Repair: install or reopen %s, then run `ha-nova setup %s`.", client.Label, client.ID)
+		return fmt.Sprintf(
+			"Repair: install or reopen %s, then run `%s`.",
+			client.Label,
+			setupCommand,
+		)
 	case installSource == installSourceDev:
-		return fmt.Sprintf("Repair: run `npm run dev:sync` or `ha-nova setup %s`.", client.ID)
+		return fmt.Sprintf(
+			"Repair: run `npm run dev:sync` or `%s`.",
+			setupCommand,
+		)
 	default:
-		return fmt.Sprintf("Repair: run `ha-nova setup %s`.", client.ID)
+		return fmt.Sprintf("Repair: run `%s`.", setupCommand)
 	}
+}
+
+func doctorClientSetupCommand(clientID string) string {
+	if activeServerProfile() != defaultServerProfileName {
+		return fmt.Sprintf(
+			"ha-nova setup --server %s %s",
+			activeServerProfile(),
+			clientID,
+		)
+	}
+	return fmt.Sprintf("ha-nova setup %s", clientID)
 }
 
 func runCheckUpdate(paths runtimePaths, args []string) int {
@@ -222,6 +443,11 @@ func runCheckUpdate(paths runtimePaths, args []string) int {
 			printHumanErr("%s", err)
 			return 1
 		}
+		// AFTER the machine output is complete: the opt-in census ping rides
+		// every check-update path — including --quiet --json and thus the
+		// detached refresh child — but a hanging endpoint may never delay or
+		// alter a byte of it (cli/census.go).
+		maybeCensusPing(paths)
 		return updateCheckExitCode(result)
 	}
 
@@ -229,7 +455,12 @@ func runCheckUpdate(paths runtimePaths, args []string) int {
 	// client runs `check-update` on first skill use per session, so this is the
 	// universal point to self-heal client integrations once after a version change.
 	// Best-effort; never blocks the update check.
+	migrationContended := false
+	if *quiet {
+		_, migrationContended = repairMissingSessionBootstrapWithContention(paths)
+	}
 	ensureClientsVerifiedForCurrentVersion(paths)
+	defer markSessionBootstrapLayoutVerified(paths)
 
 	notice := humanNoticeFromUpdateCheckResult(result, *quiet)
 	if !notice.empty() {
@@ -237,16 +468,39 @@ func runCheckUpdate(paths runtimePaths, args []string) int {
 	}
 	// CLI/skills freshness is only half the answer: the relay in Home
 	// Assistant has its own version, and "up to date" would be misleading
-	// while it sits below min_relay_version. Human path only: --quiet is the
-	// skill self-update channel whose contract is "UPDATE AVAILABLE or
-	// silence" — skill sessions already get the relay warning through the
-	// proxy version header. Stderr-only, exit code unchanged, --json above
-	// stays machine-clean.
-	if !*quiet {
-		if relayNotice := relayFloorNotice(paths); !relayNotice.empty() {
-			printHumanNotice(relayNotice)
-		}
+	// below min_relay_version or while an App update is pending. The quiet
+	// first-skill-use path must include this exact check too: relay response
+	// headers prove only the compatibility floor and cannot expose a compatible
+	// above-floor App update. Stderr-only, exit code unchanged; --json returned
+	// above and stays machine-clean.
+	var relayNotice humanNotice
+	if *quiet {
+		relayNotice = relayUpdateNoticeWithTimeout(paths, firstUseRelayNoticeTimeout)
+	} else {
+		relayNotice = relayUpdateNotice(paths)
 	}
+	if !relayNotice.empty() {
+		printHumanNotice(relayNotice)
+	}
+	// Census delivery is split by channel: --quiet is what skill sessions
+	// read, so the pending ask rides there as the capped machine-directed
+	// block; the plain human path is a person at a terminal, who gets the
+	// direct TTY question instead (no-op when stdin/stdout are not TTYs).
+	if *quiet {
+		censusHandled := maybeEmitCensusSkillNoticeTo(paths, os.Stdout)
+		if censusHandled {
+			deadline := time.Now()
+			if migrationContended {
+				deadline = deadline.Add(sessionBootstrapCarrierContentionWait)
+			}
+			finalizePendingSessionBootstrapCarrierUntil(paths, deadline)
+		}
+	} else {
+		maybeAskCensus(paths, "check-update")
+	}
+	// The weekly ping goes out last — all human output above is already
+	// printed, so a slow census endpoint never delays it.
+	maybeCensusPing(paths)
 	if notice.empty() {
 		return 0
 	}
@@ -254,19 +508,34 @@ func runCheckUpdate(paths runtimePaths, args []string) int {
 }
 
 func fetchRelayHealth(relayBaseURL, token string) ([]byte, error) {
+	return fetchRelayHealthWith(httpClient, relayBaseURL, token)
+}
+
+func fetchRelayHealthWith(client *http.Client, relayBaseURL, token string) ([]byte, error) {
+	return fetchRelayHealthWithContext(context.Background(), client, relayBaseURL, token)
+}
+
+func fetchRelayHealthWithContext(ctx context.Context, client *http.Client, relayBaseURL, token string) ([]byte, error) {
 	url := strings.TrimRight(relayBaseURL, "/") + "/health"
-	req, err := http.NewRequest("GET", url, nil)
+	req, err := http.NewRequestWithContext(ctx, "GET", url, nil)
 	if err != nil {
 		return nil, err
 	}
 	req.Header.Set("Authorization", "Bearer "+token)
 	req.Header.Set("Content-Type", "application/json")
-	resp, err := httpClient.Do(req)
+	resp, err := client.Do(req)
 	if err != nil {
 		return nil, err
 	}
 	defer resp.Body.Close()
-	body, err := io.ReadAll(resp.Body)
+	if resp.StatusCode == http.StatusUnauthorized ||
+		resp.StatusCode == http.StatusForbidden {
+		return nil, fmt.Errorf("HTTP %d", resp.StatusCode)
+	}
+	body, err := readAllLimited(
+		resp.Body,
+		maxRelayDiagnosticResponseBytes,
+	)
 	if err != nil {
 		return nil, err
 	}

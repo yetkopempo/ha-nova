@@ -25,9 +25,18 @@ describe("updates contract", () => {
     expect(updatesSkill).toContain("offer a full safety backup first via `ha-nova:backup`");
     expect(updatesSkill).toContain("HA restarts during the update");
     expect(updatesSkill).toContain('include `"backup": true`');
-    // Updating the NOVA Relay add-on kills the transport mid-flight.
-    expect(updatesSkill).toContain("Updating the NOVA Relay App restarts the relay itself");
-    expect(updatesSkill).toContain("verify afterwards via `ha-nova relay health`");
+    // Updating the NOVA Relay App kills the transport mid-flight.
+    expect(updatesSkill).toContain("NOVA Relay restarts mid-call");
+    expect(updatesSkill).toContain(
+      "poll health every ~5 s for 3 minutes",
+    );
+    expect(updatesSkill).toContain("never route to `ha-nova setup` mid-update");
+    expect(updatesSkill).toContain("observed version reaches the offered target and skills' minimum");
+    expect(updatesSkill).toContain("Immediately before POST, re-read state and registry");
+    expect(updatesSkill).toContain("with `in_progress` false");
+    expect(updatesSkill).toContain("Any drift invalidates confirmation");
+    expect(updatesSkill).toContain('the confirmed `"version": "<v>"` only with bit 2');
+    expect(updatesSkill).not.toContain("verify afterwards via `ha-nova relay health`");
     // Firmware caution.
     expect(updatesSkill).toContain("must not be interrupted");
   });
@@ -37,6 +46,28 @@ describe("updates contract", () => {
     expect(updatesSkill).toContain("an explicitly requested older version may legitimately leave the entity pending");
     expect(updatesSkill).toContain("never claim success from the call alone");
     expect(updatesSkill).toContain("a running update (`in_progress`) blocks a second install");
+  });
+
+  it("orders target, entity, ping, and post-health readiness verification", () => {
+    const target = updatesSkill.indexOf("observed version reaches the offered target and skills' minimum");
+    const complete = updatesSkill.indexOf("Then require the update entity complete");
+    const ping = updatesSkill.indexOf('send WS `{"type":"ping"}`');
+    const postHealth = updatesSkill.indexOf("re-read health");
+    const success = updatesSkill.indexOf(
+      "Success requires ping `ok: true` and post-ping `ha_ws_connected: true`",
+    );
+
+    expect(target).toBeGreaterThan(-1);
+    expect(complete).toBeGreaterThan(target);
+    expect(ping).toBeGreaterThan(complete);
+    expect(postHealth).toBeGreaterThan(ping);
+    expect(success).toBeGreaterThan(postHealth);
+    expect(updatesSkill).toContain(
+      "Timeout means not verified: do not probe or claim readiness.",
+    );
+    expect(updatesSkill).toContain(
+      "Pre-ping `false`/`never_connected`/`network` is passive or stale",
+    );
   });
 
   it("survives the restart window it warns about (red-team blockers)", () => {
@@ -58,6 +89,26 @@ describe("updates contract", () => {
   it("keeps installs consent-bound — one per confirmation, batches need a confirmed plan", () => {
     expect(updatesSkill).toContain("One update per confirmation");
     expect(updatesSkill).toContain("confirm the batch explicitly, then install sequentially, verifying each before the next");
+    // HA 2026.7 "Update all" is one concurrent multi-target update.install
+    // with no backup flag and first-failure-only reporting — the skill keeps
+    // sequential per-item gates and mirrors only the UI guardrails.
+    expect(updatesSkill).toContain(
+      "ONE multi-target `update.install`",
+    );
+    expect(updatesSkill).toContain(
+      "deliberately does NOT mirror that call shape",
+    );
+    expect(updatesSkill).toContain(
+      "never part of the one batch confirmation",
+    );
+    expect(updatesSkill).toContain("offer ONE restart at the end");
+    // Pinned HACS repos keep reporting pending — a batch never overrides a pin.
+    expect(updatesSkill).toContain(
+      "EXCLUDE repositories with a `selected_tag`",
+    );
+    expect(updatesSkill).toContain(
+      "before ANY install — single or batched",
+    );
     expect(updatesSkill).toContain("Never install anything the user did not ask about or confirm");
     expect(updatesSkill).toContain("say so instead of installing them unprompted; an explicit, confirmed user request may still install");
   });
@@ -68,6 +119,12 @@ describe("updates contract", () => {
     // platform: hassio covers stack AND add-ons — unique_id is the live-verified
     // second discriminator (home_assistant_{core,os,supervisor}_version_latest).
     expect(updatesSkill).toContain("`platform: hassio` splits by `unique_id`");
+    expect(updatesSkill).toContain(
+      "NOVA Relay requires exactly `platform: hassio` plus `unique_id: 2368fcfa_ha_nova_relay_version_latest`",
+    );
+    expect(updatesSkill).toContain(
+      "For NOVA Relay, re-require that exact pair.",
+    );
     expect(updatesSkill).toContain("`home_assistant_{core,os,supervisor}_version_latest` = HA stack");
     // backup:true is never unconditional for core/OS (would bypass the offer).
     expect(updatesSkill).toContain('`"backup": true` for App updates');

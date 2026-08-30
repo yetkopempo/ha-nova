@@ -4,6 +4,7 @@ import (
 	"reflect"
 	"strings"
 	"testing"
+	"unicode/utf8"
 )
 
 func diffLines(t *testing.T, beforeJSON, afterJSON string) []string {
@@ -33,7 +34,7 @@ func assertLines(t *testing.T, got, want []string) {
 
 func TestDiffScalarChange(t *testing.T) {
 	got := diffLines(t, `{"mode":"single"}`, `{"mode":"restart"}`)
-	assertLines(t, got, []string{"- Mode: single → restart"})
+	assertLines(t, got, []string{"| Mode | single | restart |"})
 }
 
 func TestDiffMissingVsEmptyIsNotAChange(t *testing.T) {
@@ -48,14 +49,134 @@ func TestDiffMissingVsEmptyIsNotAChange(t *testing.T) {
 
 func TestDiffEscapesMultilineStringValues(t *testing.T) {
 	// A multiline string value (automation description/template) must not embed a
-	// raw newline/tab that splits the `## Changes` bullet into unprefixed lines —
-	// the skill prints `ha-nova diff` stdout verbatim.
+	// raw newline/tab: it would structurally break the GFM table the skill prints
+	// verbatim, not just one line.
 	got := diffLines(t, `{"description":"old\nline"}`, `{"description":"new\tval"}`)
 	if len(got) != 1 {
 		t.Fatalf("expected 1 change, got %#v", got)
 	}
 	if strings.ContainsAny(got[0], "\n\r\t") {
 		t.Fatalf("diff line must not contain a raw control char: %q", got[0])
+	}
+	if n := unescapedPipes(got[0]); n != 4 {
+		t.Fatalf("row must keep exactly 4 unescaped pipes, got %d: %q", n, got[0])
+	}
+}
+
+// unescapedPipes counts the structural pipes of a table row (escaped `\|`
+// sequences inside cell content do not count).
+func unescapedPipes(line string) int {
+	return strings.Count(line, "|") - strings.Count(line, `\|`)
+}
+
+func TestDiffEscapesPipesInCells(t *testing.T) {
+	// Jinja templates love pipes; an unescaped `|` inside a cell would add a
+	// phantom column and shift Before/After.
+	got := diffLines(t,
+		`{"value_template":"{{ states('sensor.x') }}"}`,
+		`{"value_template":"{{ states('sensor.x') | float }}"}`)
+	if len(got) != 1 {
+		t.Fatalf("expected 1 change, got %#v", got)
+	}
+	if !strings.Contains(got[0], `\| float`) {
+		t.Fatalf("pipe in cell content must be escaped: %q", got[0])
+	}
+	if n := unescapedPipes(got[0]); n != 4 {
+		t.Fatalf("row must keep exactly 4 unescaped pipes, got %d: %q", n, got[0])
+	}
+}
+
+func TestDiffCellTruncationIsRuneSafe(t *testing.T) {
+	// 79 ASCII bytes + a two-byte umlaut straddling the 80-byte boundary: the cut
+	// must land on the rune start, keep valid UTF-8, and mark the cut with `…`.
+	long := strings.Repeat("a", 79) + "ä-und-noch-mehr-text"
+	got := diffLines(t, `{"description":"short"}`, `{"description":"`+long+`"}`)
+	if len(got) != 1 {
+		t.Fatalf("expected 1 change, got %#v", got)
+	}
+	if !utf8.ValidString(got[0]) {
+		t.Fatalf("truncated row must stay valid UTF-8: %q", got[0])
+	}
+	if !strings.Contains(got[0], strings.Repeat("a", 79)+"…") {
+		t.Fatalf("expected rune-safe cut before the umlaut plus …, got %q", got[0])
+	}
+	// A value of exactly 80 bytes passes through whole.
+	exact := strings.Repeat("b", 80)
+	got = diffLines(t, `{"description":"short"}`, `{"description":"`+exact+`"}`)
+	if !strings.Contains(got[0], exact+" |") || strings.Contains(got[0], "…") {
+		t.Fatalf("80-byte value must not be truncated: %q", got[0])
+	}
+}
+
+func TestDiffLiteralEmDashValueIsQuoted(t *testing.T) {
+	// A user value that IS the em dash must not render identical to the
+	// absence marker — `| Note | — | — |` would show no visible difference.
+	assertLines(t, diffLines(t, `{"alias":"X"}`, `{"alias":"X","note":"—"}`),
+		[]string{`| Note | — | "—" |`})
+	assertLines(t, diffLines(t, `{"note":"—"}`, `{"note":"real text"}`),
+		[]string{`| Note | "—" | real text |`})
+}
+
+func TestDiffTypeSuffixSurvivesLongValues(t *testing.T) {
+	// A string that contains compact JSON vs the equivalent object renders
+	// identically; when that shared text is longer than a cell, the type
+	// suffix must survive the cap — it is the only visible change.
+	inner := `{"a":"` + strings.Repeat("x", 90) + `"}`
+	before := `{"payload":` + `"` + strings.ReplaceAll(inner, `"`, `\"`) + `"` + `}`
+	after := `{"payload":` + inner + `}`
+	got := diffLines(t, before, after)
+	if len(got) != 1 {
+		t.Fatalf("expected 1 change, got %#v", got)
+	}
+	if !strings.Contains(got[0], "… (string) |") || !strings.Contains(got[0], "… (object) |") {
+		t.Fatalf("type suffixes must survive truncation: %q", got[0])
+	}
+}
+
+func TestDiffLateDivergenceStaysVisible(t *testing.T) {
+	// Two long notification texts sharing their first >80 bytes must NOT render
+	// as two identical `<prefix>…` cells — the first difference has to be
+	// visible, or the user confirms copy they never saw (write-safety:
+	// changed notification text must show old and new).
+	shared := strings.Repeat("Der Plan wurde erstellt und geprüft. ", 3) // 111 bytes shared prefix
+	before := `{"actions":[{"action":"notify.phone","data":{"message":"` + shared + `Start um 06:30."}}]}`
+	after := `{"actions":[{"action":"notify.phone","data":{"message":"` + shared + `Start um 06:00."}}]}`
+	got := diffLines(t, before, after)
+	if len(got) != 1 {
+		t.Fatalf("expected 1 change, got %#v", got)
+	}
+	if !strings.Contains(got[0], "06:30") || !strings.Contains(got[0], "06:00") {
+		t.Fatalf("divergence must stay visible in both cells: %q", got[0])
+	}
+	if !strings.Contains(got[0], "| …") {
+		t.Fatalf("trimmed shared prefix must be marked with a leading …: %q", got[0])
+	}
+	// Short values keep their full text — no divergence trimming below the cap.
+	got = diffLines(t, `{"mode":"single"}`, `{"mode":"restart"}`)
+	assertLines(t, got, []string{"| Mode | single | restart |"})
+}
+
+func TestDiffEveryLineIsATableRow(t *testing.T) {
+	// The structural invariant that keeps the whole output one continuous GFM
+	// table: every emitted line — scalar, count, aligned item, honest cap,
+	// notification copy — is a 3-cell data row.
+	afterItems := make([]string, 0, 12)
+	for _, id := range []string{"a", "b", "c", "d", "e", "f", "g", "h", "i", "j", "k", "l"} {
+		afterItems = append(afterItems, `{"action":"script.`+id+`"}`)
+	}
+	before := `{"mode":"single","description":"x","actions":[{"action":"notify.phone","data":{"message":"Plan erstellt"}}]}`
+	after := `{"mode":"restart","actions":[{"action":"notify.phone","data":{"message":"Plan ist bereit"}},` + strings.Join(afterItems, ",") + `]}`
+	got := diffLines(t, before, after)
+	if len(got) < 5 {
+		t.Fatalf("expected a mixed multi-row diff, got %#v", got)
+	}
+	for _, line := range got {
+		if !strings.HasPrefix(line, "| ") || !strings.HasSuffix(line, " |") {
+			t.Fatalf("not a table row: %q", line)
+		}
+		if n := unescapedPipes(line); n != 4 {
+			t.Fatalf("row must have exactly 4 unescaped pipes, got %d: %q", n, line)
+		}
 	}
 }
 
@@ -65,7 +186,7 @@ func TestDiffKeepsNormalNotificationMessagesUntruncated(t *testing.T) {
 
 	got := diffLines(t, before, after)
 	assertLines(t, got, []string{
-		"- Step 1 (data › message): Das Script-Preview-Format wurde getestet. → Das geänderte Script-Preview-Format wurde wirklich final getestet.",
+		"| Step 1 (data › message) | Das Script-Preview-Format wurde getestet. | Das geänderte Script-Preview-Format wurde wirklich final getestet. |",
 	})
 }
 
@@ -112,15 +233,15 @@ func TestDiffTypeOnlyChangeShowsType(t *testing.T) {
 	// A number→string (or bool→string) change must not render a confusing "5 → 5";
 	// the type disambiguates it.
 	assertLines(t, diffLines(t, `{"max":5}`, `{"max":"5"}`),
-		[]string{"- Max: 5 (number) → 5 (string)"})
+		[]string{"| Max | 5 (number) | 5 (string) |"})
 	assertLines(t, diffLines(t, `{"on":true}`, `{"on":"true"}`),
-		[]string{"- On: true (boolean) → true (string)"})
+		[]string{"| On | true (boolean) | true (string) |"})
 }
 
 func TestDiffMissingVsNonEmptyIsAChange(t *testing.T) {
 	// A non-empty field appearing or disappearing IS a real change (not over-suppressed).
 	assertLines(t, diffLines(t, `{"alias":"X"}`, `{"alias":"X","description":"real"}`),
-		[]string{"- Description: added (real)"})
+		[]string{"| Description | — | real |"})
 	if lines := diffLines(t, `{"alias":"X","triggers":[{"trigger":"time"}]}`, `{"alias":"X"}`); len(lines) != 1 {
 		t.Fatalf("removed non-empty triggers should be one change, got %#v", lines)
 	}
@@ -130,7 +251,7 @@ func TestDiffDurationChange(t *testing.T) {
 	before := `{"mode":"single","actions":[{"action":"light.turn_on"},{"delay":{"minutes":5}},{"action":"light.turn_off"}]}`
 	after := `{"mode":"single","actions":[{"action":"light.turn_on"},{"delay":{"minutes":2}},{"action":"light.turn_off"}]}`
 	got := diffLines(t, before, after)
-	assertLines(t, got, []string{"- Action 2 (delay): 5 min → 2 min"})
+	assertLines(t, got, []string{"| Action 2 (delay) | 5 min | 2 min |"})
 }
 
 // Reproduces the live demo: a mode change AND a delay change, in stable order.
@@ -139,16 +260,16 @@ func TestDiffModeAndDelayInStableOrder(t *testing.T) {
 	after := `{"mode":"restart","actions":[{"action":"light.turn_on"},{"delay":{"minutes":2}},{"action":"light.turn_off"}]}`
 	got := diffLines(t, before, after)
 	assertLines(t, got, []string{
-		"- Mode: single → restart",
-		"- Action 2 (delay): 5 min → 2 min",
+		"| Mode | single | restart |",
+		"| Action 2 (delay) | 5 min | 2 min |",
 	})
 }
 
 func TestDiffArrayLengthChange(t *testing.T) {
 	got := diffLines(t, `{"triggers":[{"a":1}]}`, `{"triggers":[{"a":1},{"b":2}]}`)
 	assertLines(t, got, []string{
-		"- Triggers: 1 → 2 items",
-		`- Trigger 2: added ({"b":2})`,
+		"| Triggers | 1 item | 2 items |",
+		"| Trigger 2 | — | {\"b\":2} |",
 	})
 }
 
@@ -160,11 +281,11 @@ func TestDiffNestingActionsIntoIfBlockShowsWhatMoved(t *testing.T) {
 	after := `{"actions":[{"action":"script.a"},{"if":[{"condition":"state"}],"then":[{"action":"script.b"},{"action":"script.c"},{"action":"script.d"}]},{"action":"script.e"}]}`
 	got := diffLines(t, before, after)
 	assertLines(t, got, []string{
-		"- Actions: 5 → 3 items",
-		"- Action 2: removed (was action script.b)",
-		"- Action 2: added (if/then block (3 actions))",
-		"- Action 3: removed (was action script.c)",
-		"- Action 4: removed (was action script.d)",
+		"| Actions | 5 items | 3 items |",
+		"| Action 2 | action script.b | — |",
+		"| Action 2 | — | if/then block (3 actions) |",
+		"| Action 3 | action script.c | — |",
+		"| Action 4 | action script.d | — |",
 	})
 }
 
@@ -177,7 +298,7 @@ func TestDiffAlignedItemsCapIsHonest(t *testing.T) {
 	if len(got) != 1+maxAlignedItemsPerSide+1 {
 		t.Fatalf("expected header + %d items + honesty line, got %d lines: %#v", maxAlignedItemsPerSide, len(got), got)
 	}
-	if got[len(got)-1] != "- Actions: … and 4 more added" {
+	if got[len(got)-1] != "| Actions | — | … and 4 more added |" {
 		t.Fatalf("expected honest remainder line, got %q", got[len(got)-1])
 	}
 }
@@ -189,9 +310,9 @@ func TestDiffAlignedPairingKeepsFieldDiffForSameKind(t *testing.T) {
 	after := `{"actions":[{"action":"light.turn_on","data":{"brightness":50}},{"action":"script.extra"}]}`
 	got := diffLines(t, before, after)
 	assertLines(t, got, []string{
-		"- Actions: 1 → 2 items",
-		"- Action 1 (data › brightness): 100 → 50",
-		"- Action 2: added (action script.extra)",
+		"| Actions | 1 item | 2 items |",
+		"| Action 1 (data › brightness) | 100 | 50 |",
+		"| Action 2 | — | action script.extra |",
 	})
 }
 
@@ -200,9 +321,9 @@ func TestDiffShowsNotificationCopyChangeEvenWhenActionsLengthChanges(t *testing.
 	after := `{"actions":[{"action":"notify.mobile_app_phone","data":{"title":"Nachtladung","message":"Plan ist bereit","data":{"tag":"nachtladung"}}},{"action":"input_boolean.turn_on","target":{"entity_id":"input_boolean.nachtladung_plan_valid"}}]}`
 	got := diffLines(t, before, after)
 	assertLines(t, got, []string{
-		"- Actions: 1 → 2 items",
-		"- Action 1 (data › message): Plan erstellt → Plan ist bereit",
-		"- Action 2: added (action input_boolean.turn_on)",
+		"| Actions | 1 item | 2 items |",
+		"| Action 1 (data › message) | Plan erstellt | Plan ist bereit |",
+		"| Action 2 | — | action input_boolean.turn_on |",
 	})
 }
 
@@ -211,25 +332,25 @@ func TestDiffShowsMovedNotificationCopyChangeWhenActionsLengthChanges(t *testing
 	after := `{"actions":[{"action":"input_boolean.turn_on","target":{"entity_id":"input_boolean.nachtladung_plan_valid"}},{"action":"notify.mobile_app_phone","data":{"message":"Plan ist bereit"}}]}`
 	got := diffLines(t, before, after)
 	assertLines(t, got, []string{
-		"- Actions: 1 → 2 items",
-		"- Action 1: removed (was action notify.mobile_app_phone)",
-		"- Action 1: added (action input_boolean.turn_on)",
-		"- Action 2: added (action notify.mobile_app_phone)",
-		"- Action 2 (data › message): Plan erstellt → Plan ist bereit",
+		"| Actions | 1 item | 2 items |",
+		"| Action 1 | action notify.mobile_app_phone | — |",
+		"| Action 1 | — | action input_boolean.turn_on |",
+		"| Action 2 | — | action notify.mobile_app_phone |",
+		"| Action 2 (data › message) | Plan erstellt | Plan ist bereit |",
 	})
 }
 
 func TestDiffAddAndRemoveKey(t *testing.T) {
 	added := diffLines(t, `{"mode":"single"}`, `{"mode":"single","max":3}`)
-	assertLines(t, added, []string{"- Max: added (3)"})
+	assertLines(t, added, []string{"| Max | — | 3 |"})
 
 	removed := diffLines(t, `{"mode":"single","max":3}`, `{"mode":"single"}`)
-	assertLines(t, removed, []string{"- Max: removed (was 3)"})
+	assertLines(t, removed, []string{"| Max | 3 | — |"})
 }
 
 func TestDiffBooleanChange(t *testing.T) {
 	got := diffLines(t, `{"enabled":true}`, `{"enabled":false}`)
-	assertLines(t, got, []string{"- Enabled: true → false"})
+	assertLines(t, got, []string{"| Enabled | true | false |"})
 }
 
 func TestDiffPluralAliasIsNotAChange(t *testing.T) {
@@ -242,7 +363,7 @@ func TestDiffPluralAliasIsNotAChange(t *testing.T) {
 
 func TestDiffPluralAliasStillDetectsRealChange(t *testing.T) {
 	got := diffLines(t, `{"trigger":[{"to":"on"}]}`, `{"triggers":[{"to":"off"}]}`)
-	assertLines(t, got, []string{"- Trigger 1 (to): on → off"})
+	assertLines(t, got, []string{"| Trigger 1 (to) | on | off |"})
 }
 
 func TestDiffSingularObjectVsPluralListIsNotAChange(t *testing.T) {
@@ -280,9 +401,196 @@ func TestDiffStableTopLevelOrdering(t *testing.T) {
 	after := `{"mode":"restart","alias":"New","zone":"away"}`
 	got := diffLines(t, before, after)
 	assertLines(t, got, []string{
-		"- Alias: Old → New",
-		"- Mode: single → restart",
-		"- Zone: home → away",
+		"| Alias | Old | New |",
+		"| Mode | single | restart |",
+		"| Zone | home | away |",
+	})
+}
+
+func TestDiffAnchorsDeepNestingOnTheRecognizableItem(t *testing.T) {
+	// The real-world case that motivated anchors: a threshold buried in
+	// choose -> or -> and -> numeric_state. The label must name the entity,
+	// not the index walk "choose 1 › condition 2 › condition 2 › below".
+	before := `{"actions":[{"choose":[{"conditions":[{"condition":"trigger","id":"x"},{"condition":"or","conditions":[{"condition":"state","entity_id":"input_boolean.darkness","state":"on"},{"condition":"and","conditions":[{"condition":"state","entity_id":"light.diele","state":"off"},{"below":10,"condition":"numeric_state","entity_id":"sensor.diele_illumination"}]}]}],"sequence":[{"action":"light.turn_on"}]}]}]}`
+	after := strings.Replace(before, `"below":10`, `"below":20`, 1)
+	got := diffLines(t, before, after)
+	assertLines(t, got, []string{
+		"| Action 1 (choose 1 › condition sensor.diele_illumination › below) | 10 | 20 |",
+	})
+}
+
+func TestDiffAnchorPrefersAliasAndKeepsIndexFallback(t *testing.T) {
+	// A user-named step anchors on its alias.
+	before := `{"actions":[{"choose":[{"conditions":[{"condition":"state","entity_id":"x","state":"on"}],"sequence":[{"alias":"Lampe an","action":"light.turn_on","data":{"brightness":100}}]}]}]}`
+	after := strings.Replace(before, `"brightness":100`, `"brightness":50`, 1)
+	got := diffLines(t, before, after)
+	assertLines(t, got, []string{
+		`| Action 1 (choose 1 › "Lampe an" › data › brightness) | 100 | 50 |`,
+	})
+	// Unknown shapes keep today's deterministic index fallback.
+	before = `{"actions":[{"custom":[{"weird":1},{"weird":2}]}]}`
+	after = `{"actions":[{"custom":[{"weird":1},{"weird":3}]}]}`
+	got = diffLines(t, before, after)
+	assertLines(t, got, []string{
+		"| Action 1 (custom 2 › weird) | 2 | 3 |",
+	})
+}
+
+func TestDiffNestedNotificationCopyDedupsWithAnchoredLabel(t *testing.T) {
+	// The aligned pass and the notification-copy pass must build IDENTICAL
+	// anchored labels, or the dedup (path+text) silently stops working for
+	// nested sequences and one copy change renders twice.
+	before := `{"actions":[{"choose":[{"conditions":[{"condition":"state","entity_id":"x","state":"on"}],"sequence":[{"action":"notify.phone","data":{"message":"Plan erstellt"}}]}]}]}`
+	after := `{"actions":[{"choose":[{"conditions":[{"condition":"state","entity_id":"x","state":"on"}],"sequence":[{"action":"notify.phone","data":{"message":"Plan ist bereit"}},{"action":"script.extra"}]}]}]}`
+	got := diffLines(t, before, after)
+	assertLines(t, got, []string{
+		"| Action 1 (choose 1 › sequence) | 1 item | 2 items |",
+		"| Action 1 (choose 1 › action notify.phone › data › message) | Plan erstellt | Plan ist bereit |",
+		"| Action 1 (choose 1 › step 2) | — | action script.extra |",
+	})
+}
+
+func TestDiffFieldColumnHasItsOwnWiderCap(t *testing.T) {
+	// An anchored label (branch + entity + field) may exceed the 80-byte value
+	// cap; cutting the FIELD mid-name would lose what identifies the row, so
+	// the field column caps at 120 — and beyond that still cuts rune-safe.
+	entity := "sensor." + strings.Repeat("diele_praesenzmelder_", 2) + "illumination" // label ~100 bytes: over the 80 value cap, under the 120 field cap
+	before := `{"actions":[{"choose":[{"conditions":[{"below":10,"condition":"numeric_state","entity_id":"` + entity + `"}],"sequence":[{"action":"script.a"}]}]}]}`
+	after := strings.Replace(before, `"below":10`, `"below":20`, 1)
+	got := diffLines(t, before, after)
+	if len(got) != 1 {
+		t.Fatalf("expected 1 change, got %#v", got)
+	}
+	if !strings.Contains(got[0], "› below) | 10 | 20 |") {
+		t.Fatalf("field name must survive whole under the wider field cap: %q", got[0])
+	}
+}
+
+func TestDiffAnchorCollisionsKeepBranchContext(t *testing.T) {
+	// Two identical conditions in two choose branches must stay
+	// distinguishable — the branch token survives the anchor reset.
+	before := `{"actions":[{"choose":[{"conditions":[{"below":10,"condition":"numeric_state","entity_id":"sensor.x"}],"sequence":[{"action":"script.a"}]},{"conditions":[{"below":30,"condition":"numeric_state","entity_id":"sensor.x"}],"sequence":[{"action":"script.b"}]}]}]}`
+	after := strings.Replace(strings.Replace(before, `"below":10`, `"below":15`, 1), `"below":30`, `"below":35`, 1)
+	got := diffLines(t, before, after)
+	assertLines(t, got, []string{
+		"| Action 1 (choose 1 › condition sensor.x › below) | 10 | 15 |",
+		"| Action 1 (choose 2 › condition sensor.x › below) | 30 | 35 |",
+	})
+}
+
+func TestDiffIfBranchCollisionsKeepThenElseContext(t *testing.T) {
+	// The same service inside an if action's then AND else sequences must not
+	// collapse into two identical rows — then/else are branch tokens too.
+	before := `{"actions":[{"if":[{"condition":"state","entity_id":"binary_sensor.day","state":"on"}],"then":[{"action":"light.turn_on","data":{"brightness_pct":80}}],"else":[{"action":"light.turn_on","data":{"brightness_pct":20}}]}]}`
+	after := strings.Replace(strings.Replace(before, `"brightness_pct":80`, `"brightness_pct":100`, 1), `"brightness_pct":20`, `"brightness_pct":10`, 1)
+	got := diffLines(t, before, after)
+	assertLines(t, got, []string{
+		"| Action 1 (else 1 › data › brightness_pct) | 20 | 10 |",
+		"| Action 1 (then 1 › data › brightness_pct) | 80 | 100 |",
+	})
+}
+
+func TestDiffSameServiceSiblingsKeepPositionalContext(t *testing.T) {
+	// Two same-service steps in ONE sequence cannot be told apart by their
+	// anchor — the positional step token must survive, or both rows render
+	// identically.
+	before := `{"actions":[{"choose":[{"conditions":[{"condition":"state","entity_id":"binary_sensor.day","state":"on"}],"sequence":[{"action":"light.turn_on","data":{"brightness_pct":80,"entity_id":"light.desk"}},{"action":"light.turn_on","data":{"brightness_pct":20,"entity_id":"light.shelf"}}]}]}]}`
+	after := strings.Replace(strings.Replace(before, `"brightness_pct":80`, `"brightness_pct":100`, 1), `"brightness_pct":20`, `"brightness_pct":10`, 1)
+	got := diffLines(t, before, after)
+	assertLines(t, got, []string{
+		"| Action 1 (choose 1 › step 1 › data › brightness_pct) | 80 | 100 |",
+		"| Action 1 (choose 1 › step 2 › data › brightness_pct) | 20 | 10 |",
+	})
+}
+
+func TestDiffRepeatGuardAndBodyStayDistinguishable(t *testing.T) {
+	// A repeat block whose loop guard (while) and body step reference the
+	// same entity: the anchor must not wipe the collected repeat/while
+	// context, or guard and body render identically.
+	before := `{"actions":[{"repeat":{"while":[{"below":22,"condition":"numeric_state","entity_id":"sensor.temp"}],"sequence":[{"below":25,"condition":"numeric_state","entity_id":"sensor.temp"},{"action":"climate.set_temperature"}]}}]}`
+	after := strings.Replace(strings.Replace(before, `"below":22`, `"below":21`, 1), `"below":25`, `"below":24`, 1)
+	got := diffLines(t, before, after)
+	assertLines(t, got, []string{
+		"| Action 1 (repeat › condition sensor.temp › below) | 25 | 24 |",
+		"| Action 1 (repeat › while 1 › below) | 22 | 21 |",
+	})
+}
+
+func TestDiffAnchorCollisionsAcrossGroupsFallBackToFullPath(t *testing.T) {
+	// The same entity in two separate and-groups: per-array uniqueness cannot
+	// see the collision, so the global fallback restores the positional
+	// tokens for exactly those rows.
+	before := `{"actions":[{"choose":[{"conditions":[{"condition":"or","conditions":[{"condition":"and","conditions":[{"below":10,"condition":"numeric_state","entity_id":"sensor.x"}]},{"condition":"and","conditions":[{"below":30,"condition":"numeric_state","entity_id":"sensor.x"}]}]}],"sequence":[{"action":"script.a"}]}]}]}`
+	after := strings.Replace(strings.Replace(before, `"below":10`, `"below":15`, 1), `"below":30`, `"below":35`, 1)
+	got := diffLines(t, before, after)
+	assertLines(t, got, []string{
+		"| Action 1 (choose 1 › condition 1 › condition 1 › condition 1 › condition sensor.x › below) | 10 | 15 |",
+		"| Action 1 (choose 1 › condition 1 › condition 2 › condition 1 › condition sensor.x › below) | 30 | 35 |",
+	})
+}
+
+func TestDiffLabelCollisionsBeyondTheFieldCapAreCaught(t *testing.T) {
+	// Two anchored labels differing only beyond the 120-byte field cell
+	// truncate to identical visible text; the collision check compares the
+	// RENDERED labels, and the full-path fallback carries the index early
+	// enough in the string to survive the cap.
+	longPrefix := strings.Repeat("verylongarea_", 9)
+	before := `{"actions":[{"choose":[{"conditions":[` +
+		`{"below":10,"condition":"numeric_state","entity_id":"sensor.` + longPrefix + `temperature"},` +
+		`{"below":30,"condition":"numeric_state","entity_id":"sensor.` + longPrefix + `humidity"}` +
+		`],"sequence":[{"action":"script.a"}]}]}]}`
+	after := strings.Replace(strings.Replace(before, `"below":10`, `"below":15`, 1), `"below":30`, `"below":35`, 1)
+	got := diffLines(t, before, after)
+	if len(got) != 2 {
+		t.Fatalf("expected 2 changes, got %#v", got)
+	}
+	f0 := strings.SplitN(got[0], " | ", 2)[0]
+	f1 := strings.SplitN(got[1], " | ", 2)[0]
+	if f0 == f1 {
+		t.Fatalf("field cells must stay distinguishable after the cap: %q", f0)
+	}
+	if !strings.Contains(got[0], "condition 1 ›") || !strings.Contains(got[1], "condition 2 ›") {
+		t.Fatalf("full-path fallback must surface the positional tokens: %#v", got)
+	}
+}
+
+func TestDiffChooseDefaultBranchStaysVisible(t *testing.T) {
+	// A changed step in choose's fallback branch must say so — hiding
+	// "default" would let the user approve behavior for the wrong branch.
+	before := `{"actions":[{"choose":[{"conditions":[{"condition":"state","entity_id":"binary_sensor.day","state":"on"}],"sequence":[{"action":"light.turn_on","data":{"brightness_pct":80}}]}],"default":[{"action":"light.turn_on","data":{"brightness_pct":20}}]}]}`
+	after := strings.Replace(strings.Replace(before, `"brightness_pct":80`, `"brightness_pct":100`, 1), `"brightness_pct":20`, `"brightness_pct":10`, 1)
+	got := diffLines(t, before, after)
+	assertLines(t, got, []string{
+		"| Action 1 (choose 1 › action light.turn_on › data › brightness_pct) | 80 | 100 |",
+		"| Action 1 (default 1 › data › brightness_pct) | 20 | 10 |",
+	})
+}
+
+func TestDiffNotWrapperStaysVisible(t *testing.T) {
+	// `condition: not` inverts the inner condition — unlike or/and it is
+	// behavior, not structure, and must survive in the label. Both at the
+	// head position and nested below another wrapper.
+	before := `{"conditions":[{"condition":"not","conditions":[{"below":10,"condition":"numeric_state","entity_id":"sensor.x"}]}]}`
+	after := strings.Replace(before, `"below":10`, `"below":20`, 1)
+	assertLines(t, diffLines(t, before, after), []string{
+		"| Condition 1 (not › condition sensor.x › below) | 10 | 20 |",
+	})
+	before = `{"conditions":[{"condition":"or","conditions":[{"condition":"state","entity_id":"light.a","state":"on"},{"condition":"not","conditions":[{"below":10,"condition":"numeric_state","entity_id":"sensor.x"}]}]}]}`
+	after = strings.Replace(before, `"below":10`, `"below":20`, 1)
+	assertLines(t, diffLines(t, before, after), []string{
+		"| Condition 1 (not › condition sensor.x › below) | 10 | 20 |",
+	})
+}
+
+func TestDiffPayloadArraysNeverAnchor(t *testing.T) {
+	// Actionable-notification buttons live in data.actions[] and carry their
+	// own action/title keys — anchoring them would mislabel a button as a
+	// service call. Payload subtrees keep the index fallback.
+	before := `{"actions":[{"action":"notify.phone","data":{"message":"Tür","actions":[{"action":"OPEN","title":"Öffnen"},{"action":"IGNORE","title":"Ignorieren"}]}}]}`
+	after := strings.Replace(before, `"title":"Ignorieren"`, `"title":"Später"`, 1)
+	got := diffLines(t, before, after)
+	assertLines(t, got, []string{
+		"| Action 1 (data › action 2 › title) | Ignorieren | Später |",
 	})
 }
 
@@ -290,12 +598,12 @@ func TestDiffNestedConditionChange(t *testing.T) {
 	before := `{"conditions":[{"condition":"numeric_state","above":60}]}`
 	after := `{"conditions":[{"condition":"numeric_state","above":40}]}`
 	got := diffLines(t, before, after)
-	assertLines(t, got, []string{"- Condition 1 (above): 60 → 40"})
+	assertLines(t, got, []string{"| Condition 1 (above) | 60 | 40 |"})
 }
 
 func TestDiffMultiUnitDuration(t *testing.T) {
 	before := `{"actions":[{"delay":{"hours":1,"minutes":30}}]}`
 	after := `{"actions":[{"delay":{"minutes":45}}]}`
 	got := diffLines(t, before, after)
-	assertLines(t, got, []string{"- Action 1 (delay): 1 h 30 min → 45 min"})
+	assertLines(t, got, []string{"| Action 1 (delay) | 1 h 30 min | 45 min |"})
 }

@@ -2,6 +2,11 @@ import { readFileSync } from "node:fs";
 
 import { describe, expect, it } from "vitest";
 
+
+// The -- RELAY-READY sections live in fallback's split file, which fallback
+// loads. A negative assertion must cover both, or it cannot fail.
+const relayReadySplit = readFileSync("skills/fallback/relay-ready.md", "utf-8");
+
 const backupSkill = readFileSync("skills/backup/SKILL.md", "utf8");
 const contextSkill = readFileSync("skills/ha-nova/SKILL.md", "utf8");
 const fallbackSkill = readFileSync("skills/fallback/SKILL.md", "utf8");
@@ -37,7 +42,8 @@ describe("backup contract", () => {
 
   it("guards deletion and surfaces silent agent failures", () => {
     expect(backupSkill).toContain("deletion removes it from ALL listed locations, irreversibly");
-    expect(backupSkill).toContain("Never delete the only backup or the newest automatic backup without saying exactly that");
+    expect(backupSkill).toContain("Never delete the only backup or the newest completed backup — manual or automatic — refuse outright");
+    expect(backupSkill).toContain("this skill does not carry a bypass");
     expect(backupSkill).toContain("`confirm:<token>`");
     expect(backupSkill).toContain("proceed only when the user types it back exactly");
     // A failing backup location is silent data-loss risk.
@@ -69,7 +75,7 @@ describe("backup contract", () => {
   it("is wired into dispatch, capability map, and architecture doc — roadmap entry retired", () => {
     expect(contextSkill).toContain("| check backup status, create a backup (also as a safety net before risky changes), inspect a backup's contents, delete backups | `ha-nova:backup` |");
     expect(fallbackSkill).toContain("| Backups (status, create, inspect, delete) | Covered | backup |");
-    expect(fallbackSkill).not.toContain("Configuration Backups -- ROADMAP");
+    expect(fallbackSkill + relayReadySplit).not.toContain("Configuration Backups -- ROADMAP");
     expect(architectureDoc).toContain("backup/SKILL.md");
   });
 

@@ -12,6 +12,7 @@ const (
 	setupIssueRelayUnreachable = "relay_unreachable"
 	setupIssueWSDegraded       = "ws_degraded"
 	setupIssueSkillsInstall    = "skills_install"
+	setupIssueCloudAccess      = "cloud_access"
 )
 
 func promptSetupClient(in io.Reader, out io.Writer, choices []setupClientChoice, defaultClient string) (string, error) {
@@ -33,7 +34,9 @@ func promptSetupClientFromReader(reader *bufio.Reader, out io.Writer, choices []
 			}
 		}
 		fmt.Fprintln(out)
-		return "", fmt.Errorf("no supported AI clients detected on this machine yet")
+		fmt.Fprintln(out, "  No supported AI client is ready on this machine yet.")
+		fmt.Fprintln(out, "  Install one supported client first, then rerun: ha-nova setup")
+		return "", errSetupClientPrerequisite
 	}
 	defaultChoice := firstAvailableSetupClientChoice(choices)
 	for _, choice := range choices {
@@ -171,7 +174,7 @@ func renderSetupDiscoveryResult(out io.Writer, host, via string, discovered bool
 	session := resolveSetupUISession(out)
 	if discovered && via != "" {
 		fmt.Fprintf(out, "  %s Found Home Assistant at %s (discovered via %s)\n", session.style("success", session.successMarker()), host, via)
-	} else if discovered && strings.HasSuffix(strings.ToLower(host), ".local") {
+	} else if discovered && isLocalDiscoveryHost(host) {
 		fmt.Fprintf(out, "  %s Found Home Assistant via the network name %s\n", session.style("warning", session.warningMarker()), host)
 		fmt.Fprintln(out, "    Heads-up: this name can stop working (especially on Windows).")
 		fmt.Fprintln(out, "    If you know the IP address, enter it below instead — you can find it in your")
@@ -204,11 +207,35 @@ func renderSetupCompleteBanner(out io.Writer, clients []string) {
 	fmt.Fprintln(out)
 }
 
-func renderSetupAlreadyDoneBanner(out io.Writer) {
+func renderSetupAlreadyDoneBanner(out io.Writer, legacyToken bool) {
 	session := resolveSetupUISession(out)
 	renderSetupHeader(out)
 	fmt.Fprintln(out)
 	fmt.Fprintf(out, "  %s Everything is already set up!\n", session.style("success", session.successMarker()))
+	fmt.Fprintln(out)
+	if legacyToken {
+		// The upgrade path must not dead-end here (issue #419): a working
+		// legacy-token install passes every completeness check, so this screen
+		// is exactly where the pairing switch has to be offered.
+		fmt.Fprintln(out, "  This device still connects with the shared legacy token.")
+		fmt.Fprintln(out, "  Switch to its own revocable credential: run 'ha-nova pair' and")
+		fmt.Fprintln(out, "  enter a fresh code from the NOVA page (\"Connect a device\").")
+		fmt.Fprintln(out)
+	}
+	fmt.Fprintln(out, "  Run 'ha-nova doctor' for full diagnostics.")
+	fmt.Fprintln(out)
+}
+
+func renderSetupCloudFallbackReadyBanner(out io.Writer) {
+	session := resolveSetupUISession(out)
+	renderSetupHeader(out)
+	fmt.Fprintln(out)
+	fmt.Fprintf(out, "  %s Setup complete!\n", session.style("success", session.successMarker()))
+	fmt.Fprintln(out)
+	fmt.Fprintln(out, "  Connections:")
+	fmt.Fprintln(out, "    Local:          Ready — preferred")
+	fmt.Fprintln(out, "    Away from home: Ready — Home Assistant Cloud")
+	fmt.Fprintln(out, "    Routing:        Automatic — Cloud is used only when local access is unavailable")
 	fmt.Fprintln(out)
 	fmt.Fprintln(out, "  Run 'ha-nova doctor' for full diagnostics.")
 	fmt.Fprintln(out)
@@ -229,10 +256,14 @@ func renderSetupIncompleteBanner(out io.Writer, issue string) {
 	case setupIssueSkillsInstall:
 		fmt.Fprintln(out, "  The Home Assistant connection is configured, but local skill installation still needs another run.")
 		fmt.Fprintln(out, "  Re-run setup or install the HA NOVA skills again for your client.")
+	case setupIssueCloudAccess:
+		fmt.Fprintln(out, "  Local access and skills are ready, but the selected Home Assistant Cloud connection is not.")
+		fmt.Fprintln(out, "  Re-run setup to resume Cloud authorization; local access remains available.")
 	default:
 		fmt.Fprintln(out, "  HA NOVA saved your local setup, but the system is not fully ready yet.")
 	}
-	if issue != setupIssueSkillsInstall {
+	if issue != setupIssueSkillsInstall &&
+		issue != setupIssueCloudAccess {
 		fmt.Fprintln(out, `  Then run "ha-nova setup" again — it continues where you left off.`)
 	}
 	fmt.Fprintln(out)

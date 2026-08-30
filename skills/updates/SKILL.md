@@ -17,11 +17,12 @@ Lifecycle:
 
 Not in scope:
 - auto-update settings: HA UI
-- HACS store operations beyond `update.*` entities (`ha-nova:fallback`)
-- rollbacks: not downgradable; recovery is a Home Assistant Backup
+- HACS store operations beyond `update.*` entities (`ha-nova:hacs`)
+- rollbacks: not downgradable (HACS downgrades: `ha-nova:hacs`); recovery is a Home Assistant Backup
 
 ## Bootstrap (once per session)
 
+Read and follow `../ha-nova/session-bootstrap.md`.
 Verify relay CLI: `ha-nova relay health`
 If this fails: `ha-nova setup`
 
@@ -51,22 +52,28 @@ Never call a bitmask-backed service (install/version/backup/release-notes) the m
 - Home Assistant stack: core, operating system, supervisor
 - Apps; integrations (HACS components); device firmware (everything else)
 Group deterministically: `platform: hacs` = integrations; `platform: hassio` splits by `unique_id` — `home_assistant_{core,os,supervisor}_version_latest` = HA stack, `<addon_slug>_version_latest` = App; everything else = device firmware/other. Never guess from names.
+NOVA Relay requires exactly `platform: hassio` plus `unique_id: 2368fcfa_ha_nova_relay_version_latest`; names insufficient.
 Per pending item: name, `installed_version` → `latest_version`, `auto_update`, `skipped_version`. Fleets: counts per group + pending list only — never dump 200 firmware rows.
 
 ### Release notes
 Bit 16 set: WS `{"type":"update/release_notes","entity_id":"update.<id>"}` → markdown in `.data`; summarize, never dump. Without bit 16, do not call it (it fails with `not_supported`) — use the entity's `release_summary`/`release_url` instead; when both are empty, say no notes are available.
 
 ### Install
-1. Feature Gate: bit 1 required. Preview exactly one update: name, versions, release-notes summary or link.
+1. Feature Gate: bit 1 required. Preview one update: name, versions, release-notes summary or link.
 2. Safety gates by kind:
-   - **core / operating system**: far-reaching — offer a full safety backup first via `ha-nova:backup` (see `skills/ha-nova/write-safety.md` → Safety-Mechanism Availability) and say that HA restarts during the update. Surface breaking-changes sections first in the notes summary; on skipped-version jumps the notes cover only the target — link the intermediate releases via `release_url`.
-   - **Apps**: when bit 8 is set, include `"backup": true` (partial App backup). Updating the NOVA Relay App restarts the relay itself — the install call may drop mid-flight; verify afterwards via `ha-nova relay health`.
+   - **core / operating system**: far-reaching — offer a full safety backup first via `ha-nova:backup` and say that HA restarts during the update. Surface breaking-changes sections first; for skipped-version jumps link intermediate releases via `release_url`. Honor named OS/Supervisor prerequisites first.
+   - **Apps**: with bit 8, include `"backup": true`. NOVA Relay restarts mid-call; use step 6's target/entity/ping/post-health verification. Its entity lacks bit 2: preview latest and omit `version`.
    - **supervisor**: usually updates itself (`auto_update`); an explicit install restarts the Supervisor — expect a brief entity dropout during the poll, no HA restart.
-   - **integrations (HACS components)**: the new version loads only after a Home Assistant restart — after a verified install, report it as installed but not yet active, and offer the restart as a separate confirmed step via `ha-nova:service-call`.
+   - **integrations (HACS components)**: before ANY install — single or batched — read the HACS repository info: a set `selected_tag` (pin/downgrade) STOPS the install here; pin overrides are explicit per-item decisions in `ha-nova:hacs`, never an `update.install` side effect. The same stop applies to any EXPLICIT version target on a `platform: hacs` entity (older or specific version, pinned or not): hand it to `ha-nova:hacs` — a generic `update.install` with `"version"` would download once without the HACS preview/read-back and without the persistent-pin step. This skill installs only the latest for HACS entities. Surface breaking-changes sections from their release notes like core — HACS components break often, a one-line summary is not enough. The new version loads only after a Home Assistant restart — after a verified install, report it as installed but not yet active, and offer the restart as a separate confirmed step via `ha-nova:service-call`.
    - **device firmware**: warn that firmware updates can take long, must not be interrupted, and rarely have release notes — confirm the exact device.
-3. Natural confirmation bound to this exact preview (see context skill → Active Preview Confirmation). One update per confirmation — for "update everything", list the plan and confirm the batch explicitly, then install sequentially, verifying each before the next. Order Apps and firmware before core/OS — a core/OS restart pauses everything after it until the relay is reachable again.
-4. POST `/api/services/update/install` with `{"entity_id":"update.<id>"}` (+ `"backup": true` for App updates; for core/OS pass it ONLY when the confirmed preview explicitly included that built-in backup — the offered `ha-nova:backup` flow is the safety net, never an unconditional flag; + `"version": "<v>"` only with bit 2).
-5. The call returns before the update finishes. Poll the entity: `in_progress`/`update_percentage` while running; done when `installed_version` equals the target — for latest-version installs additionally `state: off`; an explicitly requested older version may legitimately leave the entity pending. For core/OS installs, connection and `UPSTREAM_*` errors during the poll ARE the expected restart window, not failure: keep polling every ~30 s (core up to ~15 min; OS longer — the host reboots and the relay itself is unreachable) and never route to `ha-nova setup` mid-update. If still `in_progress` after ~10 minutes (device firmware: 30+ minutes and a temporarily `unavailable` device are normal), say it continues in the background and how to check later. Report failure when `state` stays `on` without progress — never claim success from the call alone.
+3. Natural confirmation bound to this preview (context skill → Active Preview Confirmation). One update per confirmation. For "update everything", confirm the batch explicitly, then install sequentially, verifying each before the next. Order Apps and firmware before core/OS because a restart pauses later work.
+   Since HA 2026.7 the Updates page groups pending updates with per-group "Update all" buttons — that is ONE multi-target `update.install` (an entity_id list; no new API), which runs all installs CONCURRENTLY, sets NO backup flag, surfaces only the FIRST failure, and never includes core/OS/Supervisor. This skill deliberately does NOT mirror that call shape — sequential installs with per-item verification and backup gates stay. Mirror its guardrails instead: the HA system stack is never part of the one batch confirmation (each of those stays its own confirmed step with its own gates), and skipped or `in_progress` entities never ride along. HACS integrations in a batch all stay installed-but-not-active — collect them and offer ONE restart at the end instead of one per item. Pinned HACS repositories still report as pending (`selected_tag` never suppresses update signaling): before batching any `platform: hacs` entity, read its HACS repository info and EXCLUDE repositories with a `selected_tag` — a pin override is an explicit per-item decision through `ha-nova:hacs`, never a batch side effect.
+4. Immediately before POST, re-read state and registry. Require the confirmed `entity_id`, `platform`, `unique_id`, `installed_version`, `latest_version`, and `supported_features`, with `in_progress` false. For NOVA Relay, re-require that exact pair. Any drift invalidates confirmation: stop, show the new preview, and reconfirm.
+5. POST `/api/services/update/install` with `{"entity_id":"update.<id>"}` (+ `"backup": true` for App updates; for core/OS pass it ONLY when the confirmed preview explicitly included that built-in backup — the offered `ha-nova:backup` flow is the safety net, never an unconditional flag; + the confirmed `"version": "<v>"` only with bit 2).
+6. The call returns before the update finishes. Poll the entity: `in_progress`/`update_percentage` while running; done when `installed_version` equals the target — for latest-version installs additionally `state: off`; an explicitly requested older version may legitimately leave the entity pending.
+   - **NOVA Relay**: poll health every ~5 s for 3 minutes until its observed version reaches the offered target and skills' minimum. Timeout means not verified: do not probe or claim readiness. Then require the update entity complete (`installed_version` reaches target, `state: off`, `in_progress: false`), send WS `{"type":"ping"}`, and re-read health. Pre-ping `false`/`never_connected`/`network` is passive or stale — never diagnose it alone. Success requires ping `ok: true` and post-ping `ha_ws_connected: true`; otherwise classify the WS error and post-health reason.
+   - **core / operating system**: connection and `UPSTREAM_*` errors during the poll ARE the expected restart window, not failure. Keep polling every ~30 s (core up to ~15 min; OS longer — the host reboots and the relay itself is unreachable) and never route to `ha-nova setup` mid-update.
+   - **long-running updates**: if still `in_progress` after ~10 minutes (device firmware: 30+ minutes and a temporarily `unavailable` device are normal), say it continues in the background and how to check later. Report failure when `state` stays `on` without progress — never claim success from the call alone.
 
 ### Skip / unskip
 - Skip a pending version: POST `/api/services/update/skip` with `{"entity_id":"update.<id>"}` — preview which version gets skipped; natural confirmation; verify by re-reading the entity (`skipped_version` set, `state: off`). Reversible. HA rejects skip/clear_skipped on `auto_update: true` entities — say so instead of calling.
@@ -76,12 +83,12 @@ Bit 16 set: WS `{"type":"update/release_notes","entity_id":"update.<id>"}` → m
 
 - `not_supported` on release notes: expected without bit 16 — use `release_url`.
 - Install rejected: report HA's error, no blind retry — a running update (`in_progress`) blocks a second install.
-- Entity vanished mid-poll (relay/App restart): re-read once before reporting failure.
+- Entity vanished mid-poll: re-read once; NOVA Relay uses the health-poll window above.
 - Full relay error taxonomy: `skills/ha-nova/relay-api.md` → Error Handling.
 
 ## Output Format
 
-Apply `skills/ha-nova/output-rules.md`.
+Apply `skills/ha-nova/output-rules.md`. Write previews, delete confirmations, and results render as the Cards defined there.
 
 - `Updates` / `Status`
 - `Planned change`
@@ -89,17 +96,19 @@ Apply `skills/ha-nova/output-rules.md`.
 - `Verification`
 - `Next step`
 
-Use stable localized slot labels in this order; omit empty slots. Group counts + pending list — never raw JSON.
+Use stable localized slot labels in this order; omit empty slots. The overview renders the Report shape; pending lists render the List Frame (group counts + capped pending list) — never raw JSON.
 
 ## Safety
 
 - Preview before write: nothing is saved until the user confirms the shown preview.
 - Confirmation binds to the displayed preview and expires on any change to target, payload, endpoint, or scope (context skill → Active Preview Confirmation).
 - Pre-preview phrases ("do it", "go ahead", "implement the plan") authorize drafting and preview only — never the write itself.
-- Delete and destructive operations require the typed token `confirm:<token>` verbatim; "yes" or any natural-language reply is invalid.
+- Delete and destructive operations require the typed confirmation code `confirm:<token>` verbatim; "yes" or any natural-language reply is invalid.
 - Never guess entity, service, or config IDs — resolve them or ask.
 - Home Assistant is reached exclusively through `ha-nova relay`.
 - For any HA write this skill does not cover, STOP and invoke `ha-nova:fallback` first — never probe unfamiliar write endpoints.
+
+- Drafts follow `skills/ha-nova/smallest-solution.md`: the complete requested outcome in the simplest safe design, nothing for hypothetical future needs.
 
 - Installs: natural confirmation per update after preview; batches need an explicitly confirmed plan.
 - Updates are effectively irreversible — for core/OS name the safety-backup offer before, not after.

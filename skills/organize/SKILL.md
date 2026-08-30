@@ -15,21 +15,23 @@ Organization and registry metadata only:
 - floors: list/create/update/delete
 - labels: list/create/update/delete
 - categories: list/create/update/delete
-- entity metadata updates: rename, move to area, assign/clear/add/remove labels, assign/remove categories, disable, hide, aliases
+- entity metadata updates: rename, move to area, assign/clear/add/remove labels, assign/remove categories, disable AND re-enable, hide, aliases
 - entity category assignment/removal per scope
 - device metadata updates: rename, move to area, assign/clear/add/remove labels, disable
 
+Device categories do not exist; offer entity categories instead.
+
 Not in scope:
 - entity removal (`ha-nova:maintenance` — dead registry entries only)
-- removing config entries from devices
-- device category assignment
-- zones, persons, tags
+- removing config entries from devices (`ha-nova:fallback`)
+- zones, persons, tags (`ha-nova:admin`)
 - energy management (`ha-nova:energy`) or calendar management (`ha-nova:calendar`)
 
 Hand off to the skill named per line; surfaces without one go to `ha-nova:fallback`.
 
 ## Bootstrap (once per session)
 
+Read and follow `../ha-nova/session-bootstrap.md`.
 Verify relay CLI: `ha-nova relay health`
 If this fails: `ha-nova setup`
 
@@ -78,16 +80,21 @@ Use `search/related` when a delete needs a quick impact preview on linked items.
      - clear labels
 4. For delete:
    - preview impact first
-   - areas/floors: show linked areas or assignments that will lose placement
-   - labels: show linked items when quickly resolvable
+   - areas/floors: show linked areas or assignments that will lose placement; run WS `search/related` with the matching item type (`"area"` for an area, `"floor"` for a floor) and name automations/scripts/scenes that target it — the delete leaves those targets dangling
+   - labels: run WS `search/related` (`item_type: "label"`) and name the automations/scripts that reference the label; show other linked items when quickly resolvable
    - categories: show affected entity count and a small example set when resolvable
-   - require token confirmation `confirm:<token>`
-5. Execute exactly one mutation.
+   - require typed confirmation code `confirm:<token>`
+   - same-family batch deletes follow `skills/ha-nova/batch-safety.md`, only when related-item impact is complete for every target
+5. Execute exactly one mutation (or the confirmed batch manifest, sequentially; or a confirmed grouped change set per `skills/ha-nova/grouped-change-set.md`, sequentially).
 6. Read back and verify the requested fields:
    - area/floor/label/category: re-list and match by canonical id
    - entity/device: re-read the updated registry entry
    - category delete: also verify affected entity categories are cleared for that scope
 7. Report the final state in plain language.
+
+## Bulk Target Resolution
+
+When a metadata update targets a SET selected by prefix, domain, area, or label rather than named items, resolve the shortlist per `skills/ha-nova/bulk-patterns.md` (Selector Semantics + Discovery Pipeline) and save it before previewing. The pipeline yields ENTITY ids; device shortlists use `config/device_registry/list` or the area's devices, not `.data.entity`. The batch or grouped manifest then binds to that exact saved id list — never to the raw selector.
 
 ## Entity / Device Update Fields
 
@@ -97,39 +104,47 @@ Use only exposed metadata fields:
 
 Do not guess unsupported fields.
 
+Re-ENABLING a registry-disabled item depends on WHO disabled it (`disabled_by`): `"user"` → the write `{"disabled_by": null}` on the entity record; `"device"` → the entity follows its parent — re-enable the DEVICE record (`{"disabled_by": null}` on the device registry entry, same preview/consumer rules as a device-level disable), never the entity alone; `"integration"` or `"config_entry"` → not writable from any HA NOVA skill (entry enable/disable is External in the capability map): say so and point at **Settings > Devices & services**. The user-case write is — the operation `ha-nova:entity-discovery`'s sibling-capability handoff arrives with. It is lower-risk than disabling (nothing loses state), still previewed and confirmed; after the write read the response: `require_restart: true` → the entity appears only after a restart; `reload_delay: <seconds>` → it appears by itself after ~that delay; never actuate the freshly enabled entity from this skill.
+
+`new_entity_id` and `disabled_by` are NOT low-risk metadata: a rename breaks every automation, scene, script, dashboard, and template that references the old id, and disabling removes the entity from the state machine with the same effect on consumers. Before either, run WS `search/related` on the entity — for a DEVICE-level `disabled_by`, expand the device to its entities first (entity registry by `device_id`) and run `search/related` per entity, because the device relation itself does not collect the child entities' consumers — and name the union of consumers in the preview — and say plainly that it covers automations, scripts, groups, persons, and scenes only: template references and dashboards (storage AND YAML mode) are NOT indexed and cannot be ruled out this way (a storage-dashboard scan via `ha-nova:dashboard` is the thorough follow-up). After a rename, offer to update the found consumers through their owning skills. Before either write, capture the auto config snapshot of the record actually being mutated — the entity's registry fields for a rename/entity disable, the DEVICE registry record for a device-level `disabled_by` (category `metadata`, `skills/ha-nova/config-snapshots.md`; on capture failure follow its capture-failure stop). For a RENAME, store the target `new_entity_id` alongside the old record — after the write the live record sits under the new id, so restore addresses it there and renames it back; restore is otherwise an in-place field write-back on the same record.
+
 ## Output Format
 
-Apply `skills/ha-nova/output-rules.md` to all user-facing output.
+Apply `skills/ha-nova/output-rules.md` to all user-facing output. Write previews, delete confirmations, and results render as the Cards defined there.
 
 - `Target`
 - `Current metadata`
 - `Requested change`
 - `Impact` for deletes
 - `Save status` / `Delete status` before confirmation
-- `Options` / confirmation token
+- `Options` / confirmation-code prompt
 - `Verification`
 - `Next step`
 
 Use stable localized slot labels in this order for previews; omit empty slots, but do not invent ad-hoc headings.
 
-Default to a compact field summary, not raw registry JSON.
+Metadata reads render the Report shape; registry inventories render the List Frame (output-rules.md). Default to a compact field summary, not raw registry JSON.
 
 ## Safety
 
 - Preview before write: nothing is saved until the user confirms the shown preview.
 - Confirmation binds to the displayed preview and expires on any change to target, payload, endpoint, or scope (context skill → Active Preview Confirmation).
 - Pre-preview phrases ("do it", "go ahead", "implement the plan") authorize drafting and preview only — never the write itself.
-- Delete and destructive operations require the typed token `confirm:<token>` verbatim; "yes" or any natural-language reply is invalid.
+- Delete and destructive operations require the typed confirmation code `confirm:<token>` verbatim; "yes" or any natural-language reply is invalid.
 - Never guess entity, service, or config IDs — resolve them or ask.
 - Home Assistant is reached exclusively through `ha-nova relay`.
 - For any HA write this skill does not cover, STOP and invoke `ha-nova:fallback` first — never probe unfamiliar write endpoints.
 
-- Delete uses token confirmation only, even for cleanup of items created earlier in the same session.
-- If the user asks for entity removal, stop and hand off to `ha-nova:maintenance` (dead registry entries only — for live entities offer disable here instead). For device category assignment or config-entry detachment, hand off to `ha-nova:fallback`.
+- Drafts follow `skills/ha-nova/smallest-solution.md`: the complete requested outcome in the simplest safe design, nothing for hypothetical future needs.
+- `search/related` verdicts fail closed: verify `ok=true` and `data` is an object before projecting family keys (`skills/ha-nova/relay-api.md` → Parsing rule); a failed or unexecuted scan is inconclusive — never a no-consumer result.
+
+- Delete uses the typed confirmation code only, even for cleanup of items created earlier in the same session.
+- Registry deletes (areas, floors, labels, categories) are irreversible and a recreate mints a new id — inbound references stay broken. Offer a safety backup via `ha-nova:backup` before them (never for metadata edits).
+- Entity removal goes to `ha-nova:maintenance` (dead registry entries only; offer disable for live entities). Config-entry detachment goes to `ha-nova:fallback`.
 
 ## Guardrails
 
-- One resource at a time.
+- One resource at a time — except a confirmed batch manifest per `skills/ha-nova/batch-safety.md` (its `confirm:batch-...` code replaces the single-target confirmation code for that batch), a non-destructive grouped change set (max 10 registry updates), or this skill's items inside a cross-family destructive cleanup manifest — both per `skills/ha-nova/grouped-change-set.md`.
 - One category scope at a time.
 - Metadata updates only; no destructive registry admin beyond area/floor/label/category delete.
 - Verify the changed field values, not just the WS success response.

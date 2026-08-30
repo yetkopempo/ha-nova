@@ -188,10 +188,127 @@ else
   fail "file access should be disabled by default, got HTTP $files_off"
 fi
 
+# The opted-in side of the same guarantee: a second relay mounts the real HA
+# config directory with FILE_ACCESS=readwrite and must serve the full
+# write -> read-back -> deny -> delete roundtrip the yaml-config skill uses.
+echo "--- file access: readwrite roundtrip (second relay on :8792)"
+( cd "$HERE" && docker compose up -d --build relay-files > /dev/null 2>&1 )
+FILES_URL="http://127.0.0.1:8792"
+for i in $(seq 1 30); do
+  code="$(curl -s -o /dev/null -w '%{http_code}' "$FILES_URL/health" || true)"
+  if [[ "$code" == "401" ]]; then break; fi
+  if [[ "$i" == "30" ]]; then echo "relay-files did not start (last: ${code:-none})" >&2; ( cd "$HERE" && docker compose logs relay-files ); exit 1; fi
+  sleep 2
+done
+
+files_call() {
+  curl -s -X POST "$FILES_URL/files" \
+    -H "Authorization: Bearer $RELAY_AUTH_TOKEN" -H 'Content-Type: application/json' -d "$1"
+}
+files_code() {
+  curl -s -o /dev/null -w '%{http_code}' -X POST "$FILES_URL/files" \
+    -H "Authorization: Bearer $RELAY_AUTH_TOKEN" -H 'Content-Type: application/json' -d "$1"
+}
+
+listing="$(files_call '{"action":"list_dir","path":"/config"}')"
+if echo "$listing" | grep -q 'configuration.yaml'; then
+  pass "list_dir sees the real Home Assistant config"
+else
+  fail "list_dir did not show configuration.yaml: $listing"
+fi
+
+wrote="$(files_call '{"action":"write_file","path":"/config/ha_nova/e2e-roundtrip.yaml","content":"e2e_marker: disposable-ha\n"}')"
+if echo "$wrote" | grep -q '"ok":true'; then
+  pass "write_file creates a file under /config/ha_nova/"
+else
+  fail "write_file failed: $wrote"
+fi
+
+readback="$(files_call '{"action":"read_file","path":"/config/ha_nova/e2e-roundtrip.yaml"}')"
+if echo "$readback" | grep -q 'e2e_marker: disposable-ha'; then
+  pass "read_file returns the written content verbatim"
+else
+  fail "read-back did not match: $readback"
+fi
+
+secrets_deny="$(files_code '{"action":"write_file","path":"/config/secrets.yaml","content":"x: y\n"}')"
+if [[ "$secrets_deny" == "403" ]]; then
+  pass "secrets.yaml stays unreachable even with readwrite (403)"
+else
+  fail "secrets.yaml write should be denied, got HTTP $secrets_deny"
+fi
+
+exec_deny="$(files_code '{"action":"write_file","path":"/config/ha_nova/evil.sh","content":"#!/bin/sh\n"}')"
+if [[ "$exec_deny" == "403" ]]; then
+  pass "non-configuration file types are refused (403)"
+else
+  fail ".sh write should be denied, got HTTP $exec_deny"
+fi
+
+deleted="$(files_call '{"action":"delete_file","path":"/config/ha_nova/e2e-roundtrip.yaml"}')"
+gone="$(files_code '{"action":"read_file","path":"/config/ha_nova/e2e-roundtrip.yaml"}')"
+if echo "$deleted" | grep -q '"ok":true' && [[ "$gone" == "404" ]]; then
+  pass "delete_file removes the file (read-back 404)"
+else
+  fail "delete roundtrip failed: delete=$deleted read-back=HTTP $gone"
+fi
+
+echo "--- app mode: the relay authenticates upstream with the supervisor token"
+# The passwordless onboarding path: SUPERVISOR_TOKEN present, no HA_LLAT. The
+# relay reaches Home Assistant with the supervisor token and serves the same
+# proxy routes; the client authenticates with the migrated legacy token.
+( cd "$HERE" && docker compose up -d --build relay-appmode )
+APPMODE_URL="http://127.0.0.1:8793"
+for i in $(seq 1 30); do
+  code="$(curl -s -o /dev/null -w '%{http_code}' "$APPMODE_URL/health" || true)"
+  if [[ "$code" == "200" || "$code" == "401" ]]; then break; fi
+  if [[ "$i" == "30" ]]; then fail "app-mode relay did not become reachable"; fi
+  sleep 2
+done
+
+am_health="$(curl -sf -H "Authorization: Bearer $RELAY_AUTH_TOKEN" "$APPMODE_URL/health" || true)"
+if echo "$am_health" | grep -q "\"version\":\"$RELAY_VERSION\""; then
+  pass "app-mode relay is healthy and reports its version"
+else
+  fail "app-mode /health unexpected: $am_health"
+fi
+
+# A real REST proxy call must return real Home Assistant data over the
+# supervisor-token upstream — this is the assertion the passwordless path exists
+# to guarantee.
+am_core="$(curl -sf -X POST "$APPMODE_URL/core" \
+  -H "Authorization: Bearer $RELAY_AUTH_TOKEN" -H 'Content-Type: application/json' \
+  -d '{"method":"GET","path":"/api/config"}' || true)"
+if echo "$am_core" | grep -q '"ok":true' && echo "$am_core" | grep -q '"version"'; then
+  pass "app-mode /core returns real Home Assistant config via the supervisor token"
+else
+  fail "app-mode /core unexpected: ${am_core:0:200}"
+fi
+
+am_ws="$(curl -sf -X POST "$APPMODE_URL/ws" \
+  -H "Authorization: Bearer $RELAY_AUTH_TOKEN" -H 'Content-Type: application/json' \
+  -d '{"type":"get_config"}' || true)"
+if echo "$am_ws" | grep -q '"ok":true'; then
+  pass "app-mode /ws proxies a Home Assistant WebSocket command via the supervisor token"
+else
+  fail "app-mode /ws unexpected: ${am_ws:0:200}"
+fi
+
+# A device credential must never be accepted over the plain bootstrap port, even
+# in app mode — the same fail-closed guarantee the pairing e2e proves in full.
+am_plain_device="$(curl -s -o /dev/null -w '%{http_code}' -X POST "$APPMODE_URL/ws" \
+  -H "Authorization: Bearer hanova-dev-v1.AAAAAAAAAAAAAAAAAAAAAA.BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB" \
+  -H 'Content-Type: application/json' -d '{"type":"get_config"}' || true)"
+if [[ "$am_plain_device" == "403" ]]; then
+  pass "a device credential is refused over the plain bootstrap port (403)"
+else
+  fail "device credential over plain HTTP should be 403, got $am_plain_device"
+fi
+
 echo
 if [[ "$FAILED" == "1" ]]; then
   echo "E2E FAILED" >&2
-  ( cd "$HERE" && docker compose logs relay | tail -30 )
+  ( cd "$HERE" && docker compose logs relay relay-files relay-appmode | tail -60 )
   exit 1
 fi
 echo "E2E PASSED — verified against a real Home Assistant $(date -u +%Y-%m-%d)"

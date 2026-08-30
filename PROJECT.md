@@ -4,7 +4,7 @@
 
 ha-nova is a Home Assistant AI integration. It replaces an 88,000-line MCP server with a lean API Relay plus LLM Skills.
 
-- **Relay:** Runs as a Home Assistant App, ~1,500 LOC, pure transport layer (WS proxy, REST forwarding, token storage)
+- **Relay:** Runs as a Home Assistant App, pure transport layer (WS proxy, REST forwarding, token storage)
 - **Skills:** Markdown files that instruct LLMs on Home Assistant control (best practices, workflows, API knowledge)
 - **Relay path:** Skills use HA NOVA Relay for Home Assistant REST/WS transport; business logic stays in Markdown skills, not in the Relay
 
@@ -16,13 +16,34 @@ Active doc ownership lives in `docs/reference/documentation-governance.md`.
 
 ## Current Phase
 
-**Phase 1: Infrastructure + skill-system consolidation**
+**Post-masterplan-2026 program** — backlog sequencing 2026-08 shipped in full as v0.23.0 (archived); the active roadmap is the 2026-08 skill-audit issue set #513–#522, sequenced in `docs/work/2026-08-09-skill-audit.md` (the report landed with the audit train).
 
-Deliverables:
-1. Relay MVP: `GET /health`, `POST /ws`, `POST /core`
-2. Context skill: `ha-nova` (auto-loaded via SessionStart hook; sub-skills discovered independently)
-3. Sub-skills (flat under `skills/`): write, read, review, dashboard, organize, history, helper, health, calendar, entity-discovery, service-call, fallback, onboarding
-4. Shared references under `skills/ha-nova/` (`relay-api.md`, `best-practices.md`, `payload-schemas.md`, `helper-schemas.md`, `template-guidelines.md`, `safe-refactoring.md`, `automation-patterns.md`, `agents/`)
+Shipped and current:
+1. Relay: `GET /health`, `POST /ws`, `POST /core`, `POST /files` (opt-in, default off), `POST /backups` (config-snapshot store), plus the human/machine surfaces `GET /home` and the pairing/device-auth endpoints; App + standalone container from one codebase
+2. Go CLI: install, setup wizard, doctor, update (incl. guided relay update), uninstall (incl. guided server-side teardown), relay proxy
+3. Context skill `ha-nova` plus 30 task skills, flat under `skills/` — the dispatch table in `skills/ha-nova/SKILL.md` is the authoritative inventory
+4. Shared references under `skills/ha-nova/` (relay API contract, output rules, write safety, batch safety, schemas, agent templates)
+
+HA NOVA also contains a release-gated, opt-in Home Assistant Cloud remote
+transport Beta for Home Assistant OS/Supervised. Release metadata enables it
+only for exact candidates that pass the real validation matrix:
+
+1. The wizard offers `Local + Home Assistant Cloud`, `Local only`, and
+   `Home Assistant Cloud only`. Service and headless setup stay local-only.
+2. Cloud setup uses Home Assistant OAuth, Supervisor WebSocket APIs, and a
+   process-local Ingress session. HA NOVA operates no public tunnel or broker.
+3. OAuth refresh tokens use a dedicated native OS credential store. Normal
+   Relay calls use no-UI reads and fail fast when secure storage is locked.
+4. Ingress functional calls require both the Home Assistant ingress user and a
+   device credential bound to that user and the persistent Relay instance.
+5. `automatic` routing prefers the pinned local device transport and selects
+   Cloud only after a bounded authenticated preflight ends in a pure network
+   failure. Security, identity, protocol, or authorization errors never fall
+   back.
+
+Publication stays fail-closed unless the exact candidate passes the real Nabu
+Casa parity, native-keyring, identity/role, lifecycle, and stress gates in
+`docs/work/2026-07-25-home-assistant-cloud-remote-spec.md`.
 
 ## Tech Stack
 

@@ -64,7 +64,7 @@ func TestSetupStateSkipSummaryListsCompletedPhases(t *testing.T) {
 	summary := state.SkipSummary()
 	for _, want := range []string{
 		"app installation",
-		"relay token",
+		"authentication",
 		"connection check",
 		"skill installation",
 	} {
@@ -72,8 +72,8 @@ func TestSetupStateSkipSummaryListsCompletedPhases(t *testing.T) {
 			t.Fatalf("skip summary missing %q: %s", want, summary)
 		}
 	}
-	if strings.Contains(summary, "access token") {
-		t.Fatalf("skip summary should not include access token when WS is not ready: %s", summary)
+	if strings.Contains(summary, "Home Assistant connection") {
+		t.Fatalf("skip summary should not include the Home Assistant connection when WS is not ready: %s", summary)
 	}
 }
 
@@ -132,11 +132,13 @@ func TestDetectSetupStateUsesWSPingFallbackForResume(t *testing.T) {
 		fetchRelayHealthForReadiness = originalHealth
 		probeRelayWSPingForReadiness = originalWSPing
 	}()
+	healthCalls := 0
 	fetchRelayHealthForReadiness = func(relayBaseURL, token string) ([]byte, error) {
-		return []byte(`{"status":"ok","data":{"ha_ws_connected":false}}`), nil
+		healthCalls++
+		return []byte(fmt.Sprintf(`{"status":"ok","data":{"ha_ws_connected":%t}}`, healthCalls > 1)), nil
 	}
 	probeRelayWSPingForReadiness = func(relayBaseURL, token string) (relayWSPingResponse, error) {
-		return relayWSPingResponse{StatusCode: 200, Body: []byte(`{"type":"pong"}`)}, nil
+		return relayWSPingResponse{StatusCode: 200, Body: []byte(`{"ok":true,"data":{"type":"pong"}}`)}, nil
 	}
 
 	state := loadStateOrDefault(paths)
