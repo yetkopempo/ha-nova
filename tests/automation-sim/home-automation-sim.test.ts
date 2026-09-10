@@ -8,6 +8,7 @@ import {
   computeDreameBudgetOnStop,
   computeDreameRemainingBudget,
   computeWeatherSupportsSunShadingGate,
+  computeWeatherUnsafeForShades,
   createBaseState,
   decideAwayOnlyShade,
   runEastVeluxFollowSun,
@@ -90,6 +91,68 @@ describe("home automation simulation", () => {
       expect(result.state.eastShades).toBe(state.eastShades);
       expect(result.state.westVeluxShades).toBe(state.westVeluxShades);
     }
+  });
+
+  it("treats live radar hail as unsafe without removing forecast and wind fallbacks", () => {
+    const calm = {
+      weatherSafetyEnabled: true,
+      weatherState: "sunny" as const,
+      radarHailState: "off" as const,
+      windSpeed: 10,
+      windGust: 15,
+      windLimit: 60,
+      previousUnsafe: false,
+    };
+
+    expect(computeWeatherUnsafeForShades({ ...calm, radarHailState: "on" })).toBe(true);
+    expect(computeWeatherUnsafeForShades({ ...calm, weatherState: "hail" })).toBe(true);
+    expect(computeWeatherUnsafeForShades({ ...calm, windSpeed: 60 })).toBe(true);
+    expect(
+      computeWeatherUnsafeForShades({ ...calm, radarHailState: "unavailable" }),
+    ).toBe(false);
+    expect(
+      computeWeatherUnsafeForShades({
+        ...calm,
+        weatherSafetyEnabled: false,
+        radarHailState: "on",
+      }),
+    ).toBe(false);
+  });
+
+  it("retracts every exterior shade on radar hail, including Somfy shades at night", () => {
+    const gateInput = {
+      weatherSafetyEnabled: true,
+      weatherState: "sunny" as const,
+      radarHailState: "on" as const,
+      windSpeed: 10,
+      windGust: 15,
+      windLimit: 60,
+      previousUnsafe: false,
+    };
+    const result = runWeatherSafetyRetractSensitive(
+      createBaseState({
+        weatherUnsafeForShades: computeWeatherUnsafeForShades(gateInput),
+        weatherUnsafeForSomfyAtNight: computeWeatherUnsafeForShades({
+          ...gateInput,
+          somfyAtNight: true,
+        }),
+        eastShades: "closed",
+        westVeluxShades: "closed",
+        southSomfyDownstairsShades: "closed",
+        southSomfyUpstairsShades: "closed",
+      }),
+    );
+
+    expect(result.actions).toEqual([
+      "cover.open_cover:cover.east_shades",
+      "cover.open_cover:cover.west_velux_shades",
+      "cover.open_cover:cover.south_somfy_downstairs_shades",
+      "cover.open_cover:cover.south_somfy_upstairs_shades",
+    ]);
+    expect(result.state.eastShades).toBe("open");
+    expect(result.state.westVeluxShades).toBe("open");
+    expect(result.state.southSomfyDownstairsShades).toBe("open");
+    expect(result.state.southSomfyUpstairsShades).toBe("open");
   });
 
   it("does not move west internal blinds when local guards block the automation", () => {

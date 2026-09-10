@@ -8,8 +8,10 @@ export type WeatherState =
   | "pouring"
   | "windy"
   | "lightning"
+  | "lightning-rainy"
   | "hail"
   | "snowy"
+  | "snowy-rainy"
   | "other";
 export type UnavailableState = "unknown" | "unavailable" | "none" | "None" | "";
 export type AwayShadeDecision = "open" | "close" | "hold";
@@ -26,6 +28,8 @@ export interface AutomationSimState {
   shadeEastEnabled: boolean;
   westInternalShadeEnabled: boolean;
   weatherSafetyEnabled: boolean;
+  isDaytime: boolean;
+  weatherUnsafeForSomfyAtNight: boolean;
   directSunEast: boolean;
   directSunWest: boolean;
   sunOnWestGeom: boolean;
@@ -34,6 +38,8 @@ export interface AutomationSimState {
   weatherState: WeatherState;
   eastShades: ShadeMode;
   westVeluxShades: ShadeMode;
+  southSomfyDownstairsShades: ShadeMode;
+  southSomfyUpstairsShades: ShadeMode;
   westInternalBlinds: ShadeMode;
   summerConditions: boolean;
   coolingNeeded: boolean;
@@ -95,6 +101,17 @@ export interface ShadeGroupCloseRetryInput {
   retryAttemptClosed: boolean;
 }
 
+export interface WeatherSafetyGateInput {
+  weatherSafetyEnabled: boolean;
+  weatherState: WeatherState;
+  radarHailState: "on" | "off" | UnavailableState;
+  windSpeed: number | UnavailableState;
+  windGust: number | UnavailableState;
+  windLimit: number;
+  previousUnsafe: boolean;
+  somfyAtNight?: boolean;
+}
+
 type WindowKey =
   | "officeWindow"
   | "bathroomWindow"
@@ -117,6 +134,8 @@ export function createBaseState(
     shadeEastEnabled: true,
     westInternalShadeEnabled: true,
     weatherSafetyEnabled: true,
+    isDaytime: false,
+    weatherUnsafeForSomfyAtNight: false,
     directSunEast: false,
     directSunWest: false,
     sunOnWestGeom: false,
@@ -125,6 +144,8 @@ export function createBaseState(
     weatherState: "sunny",
     eastShades: "open",
     westVeluxShades: "open",
+    southSomfyDownstairsShades: "open",
+    southSomfyUpstairsShades: "open",
     westInternalBlinds: "open",
     summerConditions: true,
     coolingNeeded: false,
@@ -198,7 +219,31 @@ export function runWeatherSafetyRetractSensitive(
   actions.push("cover.open_cover:cover.east_shades");
   actions.push("cover.open_cover:cover.west_velux_shades");
 
+  if (next.isDaytime || next.weatherUnsafeForSomfyAtNight) {
+    next.southSomfyDownstairsShades = "open";
+    next.southSomfyUpstairsShades = "open";
+    actions.push("cover.open_cover:cover.south_somfy_downstairs_shades");
+    actions.push("cover.open_cover:cover.south_somfy_upstairs_shades");
+  }
+
   return { state: next, actions };
+}
+
+export function computeWeatherUnsafeForShades(input: WeatherSafetyGateInput): boolean {
+  if (!input.weatherSafetyEnabled) return false;
+
+  const severeStates: WeatherState[] = input.somfyAtNight
+    ? ["hail", "lightning-rainy", "lightning"]
+    : ["hail", "lightning-rainy", "lightning", "pouring", "snowy-rainy", "snowy"];
+  if (severeStates.includes(input.weatherState) || input.radarHailState === "on") {
+    return true;
+  }
+
+  if (typeof input.windSpeed === "number" && typeof input.windGust === "number") {
+    return input.windSpeed >= input.windLimit || input.windGust >= input.windLimit + 10;
+  }
+
+  return input.previousUnsafe;
 }
 
 export function runWestInternalBlindFollowSun(
